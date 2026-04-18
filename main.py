@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import uuid
 import wave
 from pathlib import Path
@@ -86,9 +87,12 @@ def hal_respond(history: list[dict]) -> str:
 
 
 def synthesize_hal(text: str) -> bytes:
+    # Piper spells all-caps acronyms letter-by-letter. Rewrite "HAL" to a
+    # phonetic form so it is spoken as a word.
+    spoken = re.sub(r"\bHAL\b", "Hal", text)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav_file:
-        VOICE.synthesize_wav(text, wav_file)
+        VOICE.synthesize_wav(spoken, wav_file)
     return buf.getvalue()
 
 
