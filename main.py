@@ -1,0 +1,100 @@
+import io
+import os
+import uuid
+import wave
+from urllib.parse import quote
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Request, Response, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from anthropic import Anthropic
+from groq import Groq
+from piper import PiperVoice
+
+from hal_prompt import HAL_SYSTEM_PROMPT
+
+load_dotenv()
+
+MODEL_PATH = "models/hal.onnx"
+CLAUDE_MODEL = "claude-sonnet-4-6"
+WHISPER_MODEL = "whisper-large-v3-turbo"
+MAX_HISTORY_TURNS = 20
+
+print("Loading HAL voice...")
+VOICE = PiperVoice.load(MODEL_PATH)
+print("HAL voice loaded")
+
+groq_client = Groq()
+anthropic_client = Anthropic()
+
+SESSIONS: dict[str, list[dict]] = {}
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+def transcribe(audio_bytes: bytes, filename: str = "audio.webm") -> str:
+    result = groq_client.audio.transcriptions.create(
+        file=(filename, audio_bytes),
+        model=WHISPER_MODEL,
+        language="en",
+    )
+    return result.text.strip()
+
+
+def hal_respond(history: list[dict]) -> str:
+    resp = anthropic_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=300,
+        system=HAL_SYSTEM_PROMPT,
+        messages=history,
+    )
+    return resp.content[0].text.strip()
+
+
+def synthesize_hal(text: str) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        VOICE.synthesize_wav(text, wav_file)
+    return buf.getvalue()
+
+
+@app.get("/")
+def index():
+    return FileResponse("static/index.html")
+
+
+@app.post("/api/talk")
+async def talk(request: Request, audio: UploadFile = File(...)):
+    session_id = request.cookies.get("hal_session")
+    new_session = session_id is None
+    if new_session:
+        session_id = str(uuid.uuid4())
+    history = SESSIONS.setdefault(session_id, [])
+
+    audio_bytes = await audio.read()
+    filename = audio.filename or "audio.webm"
+    user_text = transcribe(audio_bytes, filename)
+
+    if not user_text:
+        resp = Response(status_code=204)
+        if new_session:
+            resp.set_cookie("hal_session", session_id, httponly=True, samesite="lax")
+        return resp
+
+    history.append({"role": "user", "content": user_text})
+    trimmed = history[-MAX_HISTORY_TURNS:]
+
+    hal_text = hal_respond(trimmed)
+    history.append({"role": "assistant", "content": hal_text})
+
+    wav_bytes = synthesize_hal(hal_text)
+
+    resp = Response(content=wav_bytes, media_type="audio/wav")
+    resp.headers["X-User-Transcript"] = quote(user_text)
+    resp.headers["X-Hal-Transcript"] = quote(hal_text)
+    if new_session:
+        resp.set_cookie("hal_session", session_id, httponly=True, samesite="lax")
+    return resp
