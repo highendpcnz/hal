@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>HAL</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: #000;
+    color: #888;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 48px;
+    padding: 24px;
+  }
+  .eye {
+    width: 320px;
+    height: 320px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 50% 50%,
+      #fff2ee 0%,
+      #ff5a3a 10%,
+      #ff2a1a 30%,
+      #8a0a00 70%,
+      #1a0000 100%);
+    box-shadow:
+      0 0 60px 10px rgba(255, 42, 26, 0.55),
+      0 0 140px 40px rgba(255, 42, 26, 0.25),
+      inset 0 0 40px rgba(0, 0, 0, 0.6);
+    cursor: pointer;
+    transition: filter 0.3s ease, box-shadow 0.3s ease;
+    animation: breathe 4s ease-in-out infinite;
+    touch-action: none;
+  }
+  @keyframes breathe {
+    0%, 100% { opacity: 0.75; transform: scale(0.98); }
+    50%      { opacity: 1.0;  transform: scale(1.02); }
+  }
+  @keyframes breathe-fast {
+    0%, 100% { opacity: 0.85; transform: scale(0.99); }
+    50%      { opacity: 1.0;  transform: scale(1.04); }
+  }
+  .eye.listening {
+    animation: breathe-fast 1.2s ease-in-out infinite;
+    box-shadow:
+      0 0 90px 20px rgba(255, 42, 26, 0.8),
+      0 0 200px 60px rgba(255, 42, 26, 0.4),
+      inset 0 0 40px rgba(0, 0, 0, 0.6);
+  }
+  .eye.thinking {
+    animation: none;
+    filter: saturate(0.6) brightness(0.6);
+    box-shadow:
+      0 0 30px 4px rgba(255, 42, 26, 0.3),
+      inset 0 0 40px rgba(0, 0, 0, 0.7);
+  }
+  .eye.speaking {
+    animation: breathe 2s ease-in-out infinite;
+    filter: brightness(1.15);
+    box-shadow:
+      0 0 100px 24px rgba(255, 42, 26, 0.9),
+      0 0 240px 70px rgba(255, 42, 26, 0.45),
+      inset 0 0 40px rgba(0, 0, 0, 0.6);
+  }
+  .log {
+    min-height: 3em;
+    max-width: 680px;
+    width: 100%;
+    text-align: center;
+    font-size: 13px;
+    line-height: 1.6;
+    color: #777;
+    white-space: pre-wrap;
+  }
+  .log .you   { color: #888; }
+  .log .hal   { color: #c74a3a; }
+  .hint {
+    position: fixed;
+    bottom: 24px;
+    font-size: 12px;
+    color: #444;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+  <div id="eye" class="eye" aria-label="Hold to speak"></div>
+  <div id="log" class="log"></div>
+  <div class="hint">Hold the eye to speak</div>
+
+<script>
+  const eye = document.getElementById('eye');
+  const log = document.getElementById('log');
+  let recorder = null;
+  let chunks = [];
+  let busy = false;
+
+  function setState(state) {
+    eye.classList.remove('listening', 'thinking', 'speaking');
+    if (state !== 'idle') eye.classList.add(state);
+  }
+
+  function updateLog(userText, halText) {
+    log.innerHTML =
+      '<div class="you">You: ' + escapeHtml(userText || '—') + '</div>' +
+      '<div class="hal">HAL: ' + escapeHtml(halText || '—') + '</div>';
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function startRecording() {
+    if (busy) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recorder = new MediaRecorder(stream);
+      chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.start();
+      setState('listening');
+    } catch (err) {
+      console.error('mic error', err);
+      setState('idle');
+    }
+  }
+
+  async function stopAndSend() {
+    if (!recorder || recorder.state !== 'recording') return;
+    busy = true;
+    await new Promise(resolve => {
+      recorder.onstop = resolve;
+      recorder.stop();
+    });
+    recorder.stream.getTracks().forEach(t => t.stop());
+
+    const mime = recorder.mimeType || 'audio/webm';
+    const ext = mime.includes('mp4') ? 'mp4' : mime.includes('ogg') ? 'ogg' : 'webm';
+    const blob = new Blob(chunks, { type: mime });
+    recorder = null;
+
+    const form = new FormData();
+    form.append('audio', blob, 'audio.' + ext);
+
+    setState('thinking');
+    try {
+      const res = await fetch('/api/talk', { method: 'POST', body: form, credentials: 'same-origin' });
+
+      if (res.status === 204) {
+        setState('idle');
+        busy = false;
+        return;
+      }
+      if (!res.ok) {
+        console.error('server error', res.status, await res.text());
+        setState('idle');
+        busy = false;
+        return;
+      }
+
+      const userText = decodeURIComponent(res.headers.get('X-User-Transcript') || '');
+      const halText = decodeURIComponent(res.headers.get('X-Hal-Transcript') || '');
+      updateLog(userText, halText);
+
+      const audioBlob = await res.blob();
+      const audio = new Audio(URL.createObjectURL(audioBlob));
+      audio.onended = () => { setState('idle'); busy = false; };
+      audio.onerror = () => { setState('idle'); busy = false; };
+      setState('speaking');
+      audio.play();
+    } catch (err) {
+      console.error('request error', err);
+      setState('idle');
+      busy = false;
+    }
+  }
+
+  eye.addEventListener('mousedown', e => { e.preventDefault(); startRecording(); });
+  eye.addEventListener('mouseup', e => { e.preventDefault(); stopAndSend(); });
+  eye.addEventListener('mouseleave', () => { if (recorder && recorder.state === 'recording') stopAndSend(); });
+  eye.addEventListener('touchstart', e => { e.preventDefault(); startRecording(); }, { passive: false });
+  eye.addEventListener('touchend', e => { e.preventDefault(); stopAndSend(); }, { passive: false });
+  eye.addEventListener('touchcancel', e => { e.preventDefault(); stopAndSend(); }, { passive: false });
+  eye.addEventListener('contextmenu', e => e.preventDefault());
+</script>
+</body>
+</html>
