@@ -6,3 +6,4 @@ models/*.onnx
 models/*.json
 *.wav
 .DS_Store
+data/

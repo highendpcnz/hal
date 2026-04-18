@@ -1,7 +1,9 @@
 import io
+import json
 import os
 import uuid
 import wave
+from pathlib import Path
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -21,18 +23,47 @@ MODEL_PATH = "models/hal.onnx"
 CLAUDE_MODEL = "claude-sonnet-4-6"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 MAX_HISTORY_TURNS = 20
+PROFILE_PATH = Path("profile.md")
+DATA_DIR = Path(os.environ.get("HAL_DATA_DIR", "data"))
+SESSIONS_DIR = DATA_DIR / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 print("Loading HAL voice...")
 VOICE = PiperVoice.load(MODEL_PATH)
 print("HAL voice loaded")
 
+if PROFILE_PATH.exists():
+    profile_text = PROFILE_PATH.read_text().strip()
+    SYSTEM_PROMPT = f"{HAL_SYSTEM_PROMPT}\n\n---\n\nContext about Peter:\n\n{profile_text}"
+    print(f"Loaded profile ({len(profile_text)} chars)")
+else:
+    SYSTEM_PROMPT = HAL_SYSTEM_PROMPT
+
 groq_client = Groq()
 anthropic_client = Anthropic()
 
-SESSIONS: dict[str, list[dict]] = {}
-
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+def session_file(session_id: str) -> Path:
+    return SESSIONS_DIR / f"{session_id}.json"
+
+
+def load_history(session_id: str) -> list[dict]:
+    f = session_file(session_id)
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def save_history(session_id: str, history: list[dict]) -> None:
+    tmp = session_file(session_id).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(history))
+    tmp.replace(session_file(session_id))
 
 
 def transcribe(audio_bytes: bytes, filename: str = "audio.webm") -> str:
@@ -48,7 +79,7 @@ def hal_respond(history: list[dict]) -> str:
     resp = anthropic_client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=300,
-        system=HAL_SYSTEM_PROMPT,
+        system=SYSTEM_PROMPT,
         messages=history,
     )
     return resp.content[0].text.strip()
@@ -72,7 +103,7 @@ async def talk(request: Request, audio: UploadFile = File(...)):
     new_session = session_id is None
     if new_session:
         session_id = str(uuid.uuid4())
-    history = SESSIONS.setdefault(session_id, [])
+    history = load_history(session_id)
 
     audio_bytes = await audio.read()
     filename = audio.filename or "audio.webm"
@@ -89,6 +120,7 @@ async def talk(request: Request, audio: UploadFile = File(...)):
 
     hal_text = hal_respond(trimmed)
     history.append({"role": "assistant", "content": hal_text})
+    save_history(session_id, history)
 
     wav_bytes = synthesize_hal(hal_text)
 
