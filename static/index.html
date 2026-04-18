@@ -106,6 +106,29 @@
   let recorder = null;
   let chunks = [];
   let busy = false;
+  let audioCtx = null;
+  let primedAudio = null;
+
+  // iOS/Safari require audio playback to be initiated from a user gesture.
+  // Prime an <audio> element and an AudioContext on first touch so later
+  // programmatic play() calls are allowed.
+  function primePlayback() {
+    try {
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (Ctx) audioCtx = new Ctx();
+      }
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+      if (!primedAudio) {
+        primedAudio = new Audio();
+        primedAudio.playsInline = true;
+        primedAudio.setAttribute('playsinline', '');
+        primedAudio.muted = true;
+        primedAudio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+        primedAudio.play().catch(() => {});
+      }
+    } catch (e) {}
+  }
 
   function setState(state) {
     eye.classList.remove('listening', 'thinking', 'speaking');
@@ -175,11 +198,28 @@
       updateLog(userText, halText);
 
       const audioBlob = await res.blob();
-      const audio = new Audio(URL.createObjectURL(audioBlob));
+      const url = URL.createObjectURL(audioBlob);
+      const audio = primedAudio || new Audio();
+      audio.muted = false;
+      audio.playsInline = true;
+      audio.setAttribute('playsinline', '');
+      audio.src = url;
       audio.onended = () => { setState('idle'); busy = false; };
       audio.onerror = () => { setState('idle'); busy = false; };
       setState('speaking');
-      audio.play();
+      try {
+        await audio.play();
+      } catch (err) {
+        console.error('playback blocked', err);
+        log.innerHTML += '<div class="hal">[tap eye to hear reply]</div>';
+        const resume = async () => {
+          eye.removeEventListener('touchend', resume);
+          eye.removeEventListener('click', resume);
+          try { await audio.play(); } catch (e) { setState('idle'); busy = false; }
+        };
+        eye.addEventListener('touchend', resume, { once: true });
+        eye.addEventListener('click', resume, { once: true });
+      }
     } catch (err) {
       console.error('request error', err);
       setState('idle');
@@ -187,10 +227,10 @@
     }
   }
 
-  eye.addEventListener('mousedown', e => { e.preventDefault(); startRecording(); });
+  eye.addEventListener('mousedown', e => { e.preventDefault(); primePlayback(); startRecording(); });
   eye.addEventListener('mouseup', e => { e.preventDefault(); stopAndSend(); });
   eye.addEventListener('mouseleave', () => { if (recorder && recorder.state === 'recording') stopAndSend(); });
-  eye.addEventListener('touchstart', e => { e.preventDefault(); startRecording(); }, { passive: false });
+  eye.addEventListener('touchstart', e => { e.preventDefault(); primePlayback(); startRecording(); }, { passive: false });
   eye.addEventListener('touchend', e => { e.preventDefault(); stopAndSend(); }, { passive: false });
   eye.addEventListener('touchcancel', e => { e.preventDefault(); stopAndSend(); }, { passive: false });
   eye.addEventListener('contextmenu', e => e.preventDefault());
