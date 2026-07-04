@@ -81,14 +81,25 @@ browser. `hal --no-open` starts it without opening a browser tab.
 | `HAL_TTS_MASTERING` | `0` | set `1` to restore ffmpeg mastering at the cost of extra latency |
 | `HAL_LENGTH_SCALE` etc. | `1.08 / 0.6 / 0.72` | voice pacing/timbre knobs |
 | `HAL_DATA_DIR` | `./data` | transcript history + session map |
+| `HAL_STT_PROMPT` | *(empty)* | optional whisper bias prompt (helps it spell "HAL"/"Hermes"; can hallucinate on silence) |
+| `HAL_MAX_UPLOAD_MB` | `25` | reject recordings larger than this (413) |
+| `HAL_COOKIE_MAX_AGE_DAYS` | `180` | lifetime of the `hal_session` cookie |
+| `HAL_SYSTEMS_TTL` | `20` | seconds to cache the `/api/systems` CLI surfaces |
 
 ## Endpoints
 
-- `GET /` — the eye
+- `GET /` — the eye (hold it, or hold the space bar, to speak)
 - `POST /api/talk` — multipart audio in, WAV out (`X-User-Transcript` /
-  `X-Hal-Transcript` response headers)
+  `X-Hal-Transcript` response headers, truncated to 2000 chars; full text
+  in `/api/history`)
 - `POST /api/say` — `{"text": "..."}` in, WAV out; same pipeline minus the mic
-- `GET /api/health`
+- `POST /api/session/reset` — forget this browser session's Hermes thread and
+  history, issue a fresh cookie (also a button in the Systems drawer)
+- `GET /api/health` — includes ACP bridge liveness (`status: degraded` if the
+  agent process is down)
+- `GET /api/status` / `GET /api/systems` / `GET /api/history` — what the
+  Systems drawer reads; `/api/systems?refresh=1` bypasses its cache
+- `GET /api/events` — SSE stream of tool-call/permission events for the eye
 
 ## Autostart at login (optional)
 
