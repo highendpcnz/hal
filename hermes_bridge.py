@@ -22,6 +22,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shlex
 import socket
 import time
 from collections import defaultdict
@@ -53,7 +54,7 @@ OFFLINE_CHECK_TTL = float(os.environ.get("HAL_OFFLINE_CHECK_TTL", "30"))
 YOLO = os.environ.get("HAL_YOLO", "") == "1"
 SESSION_SOURCE = "hal-web"
 # Extra CLI args for subprocess mode, e.g. HAL_HERMES_ARGS="-m gpt-5.4 --yolo"
-EXTRA_ARGS = os.environ.get("HAL_HERMES_ARGS", "").split()
+EXTRA_ARGS = shlex.split(os.environ.get("HAL_HERMES_ARGS", ""))
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _SESSION_ID_RE = re.compile(r"^session_id:\s*(\S+)", re.M)
@@ -339,6 +340,13 @@ class ACPBridge:
     def _alive(self) -> bool:
         return self._conn is not None and self._proc is not None and self._proc.returncode is None
 
+    def health(self) -> dict:
+        alive = self._alive()
+        return {"alive": alive, "pid": self._proc.pid if alive else None}
+
+    def forget(self, session_id: str) -> None:
+        self._loaded.discard(session_id)
+
     async def _ensure_started_locked(self) -> None:
         if self._alive():
             return
@@ -507,6 +515,32 @@ async def startup() -> None:
 async def shutdown() -> None:
     if _acp_bridge is not None:
         await _acp_bridge.stop()
+
+
+def bridge_health() -> dict:
+    """Liveness of the thinking half, for /api/health and /api/status."""
+    info: dict = {"mode": BRIDGE_MODE}
+    if _acp_bridge is None:
+        # Subprocess mode has no persistent process to probe.
+        info.update(alive=True, pid=None)
+    else:
+        info.update(_acp_bridge.health())
+    return info
+
+
+def drop_session(cookie_id: str) -> None:
+    """Forget the Hermes session behind a browser session (/api/session/reset).
+    The agent-side session record in ~/.hermes/state.db is left orphaned."""
+    if _session_map is None:
+        return
+    acp_id = _session_map.get(cookie_id)
+    _session_map.drop(cookie_id)
+    if acp_id:
+        _acp_to_cookie.pop(acp_id, None)
+        if _acp_bridge is not None:
+            _acp_bridge.forget(acp_id)
+    _cookie_locks.pop(cookie_id, None)
+    _event_queues.pop(cookie_id, None)
 
 
 async def ask_hermes(text: str, session_id: str) -> str:

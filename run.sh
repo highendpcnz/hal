@@ -9,7 +9,7 @@ PORT="${HAL_PORT:-8000}"
 HOST="${HAL_HOST:-127.0.0.1}"
 
 # Fail fast if the port is taken — before loading two ML models and an agent.
-if curl -sf "http://$HOST:$PORT/api/health" >/dev/null 2>&1; then
+if curl -sf -m 2 "http://$HOST:$PORT/api/health" >/dev/null 2>&1; then
   echo "HAL is already running at http://$HOST:$PORT" >&2
   exit 0
 fi

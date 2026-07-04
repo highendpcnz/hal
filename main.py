@@ -24,7 +24,7 @@ from urllib.parse import quote
 import asyncio
 
 from fastapi import FastAPI, File, Request, Response, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
 from piper import PiperVoice, SynthesisConfig
@@ -38,8 +38,20 @@ VOICE_PATH = Path(
     os.path.expanduser(os.environ.get("HAL_VOICE", "~/.hermes/voices/hal9000/hal9000.onnx"))
 )
 STT_MODEL_NAME = os.environ.get("HAL_STT_MODEL", "base.en")
+# Optional bias prompt for whisper, e.g. "Dave speaking with HAL 9000." —
+# helps it spell HAL/Hermes correctly. Off by default: a bias prompt can make
+# whisper hallucinate text on near-silent recordings.
+STT_PROMPT = os.environ.get("HAL_STT_PROMPT", "").strip() or None
 MAX_HISTORY_TURNS = 40
 MAX_SPOKEN_CHARS = 1500
+# Transcripts travel in response headers; percent-encoding inflates ~3x and
+# proxies/browsers cap header blocks, so bound them. Full text stays in history.
+MAX_TRANSCRIPT_HEADER_CHARS = 2000
+MAX_UPLOAD_BYTES = int(float(os.environ.get("HAL_MAX_UPLOAD_MB", "25")) * 1024 * 1024)
+# Session cookie must outlive the browser process or the whole persistence
+# story (ACP session/load, history files) dies with the window.
+SESSION_COOKIE_MAX_AGE = int(float(os.environ.get("HAL_COOKIE_MAX_AGE_DAYS", "180")) * 86400)
+SYSTEMS_CACHE_TTL = float(os.environ.get("HAL_SYSTEMS_TTL", "20"))
 LATENCY_LOG = os.environ.get("HAL_LATENCY_LOG", "1").strip().lower() not in {"0", "false", "no"}
 TTS_MASTERING = os.environ.get("HAL_TTS_MASTERING", "0").strip().lower() not in {
     "0",
@@ -108,6 +120,16 @@ def _valid_session_id(session_id: str | None) -> str | None:
     return None
 
 
+def _set_session_cookie(resp: Response, session_id: str) -> None:
+    resp.set_cookie(
+        "hal_session",
+        session_id,
+        max_age=SESSION_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+    )
+
+
 def _session_from_request(request: Request) -> tuple[str, bool]:
     session_id = _valid_session_id(request.cookies.get("hal_session"))
     if session_id is not None:
@@ -125,9 +147,10 @@ def load_history(session_id: str) -> list[dict]:
     f = session_file(session_id)
     if f.exists():
         try:
-            return json.loads(f.read_text())
+            history = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
             return []
+        return history if isinstance(history, list) else []
     return []
 
 
@@ -139,7 +162,7 @@ def save_history(session_id: str, history: list[dict]) -> None:
 
 def transcribe(audio_bytes: bytes) -> str:
     segments, _info = STT.transcribe(
-        io.BytesIO(audio_bytes), language="en", vad_filter=True
+        io.BytesIO(audio_bytes), language="en", vad_filter=True, initial_prompt=STT_PROMPT
     )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -147,10 +170,15 @@ def transcribe(audio_bytes: bytes) -> str:
 _MD_PATTERNS = [
     (re.compile(r"```.*?```", re.S), " I've put the code in the transcript, Dave. "),
     (re.compile(r"`([^`]*)`"), r"\1"),
+    (re.compile(r"(?:^[ \t]*\|.*\|[ \t]*$\n?)+", re.M), " The table is in the transcript, Dave. "),
     (re.compile(r"^#{1,6}\s*", re.M), ""),
+    (re.compile(r"^[ \t]*[-*_]{3,}[ \t]*$", re.M), ""),
+    (re.compile(r"^\s*>\s?", re.M), ""),
+    (re.compile(r"~~([^~]+)~~"), r"\1"),
     (re.compile(r"[*_]{1,3}([^*_]+)[*_]{1,3}"), r"\1"),
     (re.compile(r"\[([^\]]+)\]\([^)]+\)"), r"\1"),
     (re.compile(r"^\s*[-*•]\s+", re.M), ""),
+    (re.compile(r"^\s*\d+[.)]\s+", re.M), ""),
 ]
 
 
@@ -162,7 +190,9 @@ def speakable(text: str) -> str:
         text = _hal_tts._normalize_hal_text(text)
     else:
         text = re.sub(r"\bHAL\b", "Hal", text)
-    return text[:MAX_SPOKEN_CHARS].strip()
+    text = text[:MAX_SPOKEN_CHARS].strip()
+    # Piper on an empty string is undefined behavior; never let it happen.
+    return text or "The full response is in the transcript, Dave."
 
 
 def synthesize_hal(text: str) -> bytes:
@@ -284,15 +314,15 @@ def _turn_response(
     timings: dict[str, int] | None = None,
 ) -> Response:
     resp = Response(content=wav, media_type="audio/wav")
-    resp.headers["X-User-Transcript"] = quote(user_text)
-    resp.headers["X-Hal-Transcript"] = quote(hal_text)
+    resp.headers["X-User-Transcript"] = quote(user_text[:MAX_TRANSCRIPT_HEADER_CHARS])
+    resp.headers["X-Hal-Transcript"] = quote(hal_text[:MAX_TRANSCRIPT_HEADER_CHARS])
     if timings:
         resp.headers["Server-Timing"] = ", ".join(
             f"{name};dur={duration}" for name, duration in timings.items()
         )
         resp.headers["X-Hal-Timings"] = quote(json.dumps(timings, separators=(",", ":")))
     if new_session:
-        resp.set_cookie("hal_session", session_id, httponly=True, samesite="lax")
+        _set_session_cookie(resp, session_id)
     return resp
 
 
@@ -301,17 +331,19 @@ def index(request: Request):
     session_id, new_session = _session_from_request(request)
     resp = FileResponse(str(APP_DIR / "static" / "index.html"))
     if new_session:
-        resp.set_cookie("hal_session", session_id, httponly=True, samesite="lax")
+        _set_session_cookie(resp, session_id)
     return resp
 
 
 @app.get("/api/health")
 def health():
+    bridge = hermes_bridge.bridge_health()
     return {
-        "status": "operational",
+        "status": "operational" if bridge["alive"] else "degraded",
         "voice": VOICE_PATH.name,
         "stt": STT_MODEL_NAME,
         "brain": f"hermes-agent ({hermes_bridge.BRIDGE_MODE})",
+        "bridge": bridge,
     }
 
 
@@ -348,6 +380,7 @@ def status(request: Request):
         "session_id": session_id,
         "acp_session_id": hermes_bridge.acp_session_for(session_id) if session_id else None,
         "bridge_mode": hermes_bridge.BRIDGE_MODE,
+        "bridge": hermes_bridge.bridge_health(),
         "yolo": hermes_bridge.YOLO,
         "voice": VOICE_PATH.name,
         "stt_model": STT_MODEL_NAME,
@@ -356,15 +389,31 @@ def status(request: Request):
     }
 
 
+# The surfaces fan out 7 CLI subprocesses; cache them briefly so reopening
+# the drawer (or several tabs) doesn't hammer the Hermes CLI.
+_systems_cache: dict | None = None
+_systems_cache_at = 0.0
+_systems_generated_at = 0
+_systems_lock = asyncio.Lock()
+
+
 @app.get("/api/systems")
-async def systems(request: Request):
+async def systems(request: Request, refresh: int = 0):
+    global _systems_cache, _systems_cache_at, _systems_generated_at
     session_id = _valid_session_id(request.cookies.get("hal_session"))
-    tasks = {
-        name: asyncio.create_task(_run_hermes_cli(args, timeout=timeout))
-        for name, (args, timeout) in _SYSTEM_SURFACES.items()
-    }
+    async with _systems_lock:
+        stale = _systems_cache is None or time.monotonic() - _systems_cache_at > SYSTEMS_CACHE_TTL
+        if refresh or stale:
+            tasks = {
+                name: asyncio.create_task(_run_hermes_cli(args, timeout=timeout))
+                for name, (args, timeout) in _SYSTEM_SURFACES.items()
+            }
+            _systems_cache = {name: await task for name, task in tasks.items()}
+            _systems_cache_at = time.monotonic()
+            _systems_generated_at = round(time.time())
+        surfaces = _systems_cache
     return {
-        "generated_at": round(time.time()),
+        "generated_at": _systems_generated_at,
         "local": {
             "session_id": session_id,
             "acp_session_id": hermes_bridge.acp_session_for(session_id) if session_id else None,
@@ -375,7 +424,7 @@ async def systems(request: Request):
             "agent_cwd": Path(hermes_bridge.AGENT_CWD).name,
             "uptime_seconds": round(time.monotonic() - _BOOT_TIME),
         },
-        "surfaces": {name: await task for name, task in tasks.items()},
+        "surfaces": surfaces,
     }
 
 
@@ -397,6 +446,12 @@ async def talk(request: Request, audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
     timings["upload"] = _elapsed_ms(stage_start)
 
+    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+        resp = Response(status_code=413)
+        if new_session:
+            _set_session_cookie(resp, session_id)
+        return resp
+
     stage_start = time.perf_counter()
     user_text = await asyncio.to_thread(transcribe, audio_bytes)
     timings["stt"] = _elapsed_ms(stage_start)
@@ -404,7 +459,7 @@ async def talk(request: Request, audio: UploadFile = File(...)):
     if not user_text:
         resp = Response(status_code=204)
         if new_session:
-            resp.set_cookie("hal_session", session_id, httponly=True, samesite="lax")
+            _set_session_cookie(resp, session_id)
         return resp
 
     hal_text, wav, turn_timings = await run_turn(session_id, user_text)
@@ -426,9 +481,26 @@ async def say(request: Request, body: SayRequest):
 
     user_text = body.text.strip()
     if not user_text:
-        return Response(status_code=204)
+        resp = Response(status_code=204)
+        if new_session:
+            _set_session_cookie(resp, session_id)
+        return resp
 
     hal_text, wav, timings = await run_turn(session_id, user_text)
     timings["total"] = _elapsed_ms(total_start)
     _log_latency(session_id, timings)
     return _turn_response(session_id, new_session, user_text, hal_text, wav, timings)
+
+
+@app.post("/api/session/reset")
+def reset_session(request: Request):
+    """Start fresh: drop the Hermes session mapping and transcript history,
+    then hand the browser a new cookie."""
+    old_id = _valid_session_id(request.cookies.get("hal_session"))
+    if old_id is not None:
+        hermes_bridge.drop_session(old_id)
+        session_file(old_id).unlink(missing_ok=True)
+    new_id = str(uuid.uuid4())
+    resp = JSONResponse({"session_id": new_id})
+    _set_session_cookie(resp, new_id)
+    return resp
