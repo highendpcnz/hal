@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main  # noqa: E402
 import hermes_bridge  # noqa: E402
+import mission_control  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -110,6 +111,96 @@ sm.set("c2", "h2")
 sm.drop("c1")
 sm2 = hermes_bridge.SessionMap(smp)
 check("session map persists", sm2.get("c2") == "h2" and sm2.get("c1") is None)
+
+# --- SSE event aliasing (missions) -------------------------------------------
+
+q = hermes_bridge.register_event_queue("browser-1")
+hermes_bridge.alias_events("mission-sess", "browser-1")
+hermes_bridge.publish_event("mission-sess", {"type": "tool_call", "title": "probe"})
+check("aliased publish reaches target queue", not q.empty() and "probe" in q.get_nowait())
+hermes_bridge.unalias_events("mission-sess")
+hermes_bridge.publish_event("mission-sess", {"type": "tool_call"})
+check("unaliased publish goes nowhere", q.empty())
+hermes_bridge.publish_event("browser-1", {"type": "mission_update"})
+check("direct publish still works", not q.empty())
+hermes_bridge.unregister_event_queue("browser-1", q)
+
+# --- mission triggers ---------------------------------------------------------
+
+check("mission trigger typed", main._mission_request("/mission fix the CI") == "fix the CI")
+check("mission trigger typed empty", main._mission_request("/mission") == "")
+check(
+    "mission trigger voice",
+    main._mission_request("HAL, start mission clean the pod bay.") == "clean the pod bay",
+)
+check(
+    "mission trigger voice no comma",
+    main._mission_request("hal start mission scan logs") == "scan logs",
+)
+check("mission trigger negative", main._mission_request("Hal, what's a mission?") is None)
+check("plain text is not a mission", main._mission_request("open the pod bay doors") is None)
+
+# --- mission persistence --------------------------------------------------------
+
+mdir = Path(_tmp.name) / "missions-data"
+mgr = mission_control.MissionManager(mdir)
+mission = mission_control.Mission(id="m1", title="probe pod", cookie_id="c1", session_id="s1")
+mgr._save(mission)
+check("mission write leaves no tmp file", not list(mgr.missions_dir.glob("*.tmp")))
+done = mission_control.Mission(
+    id="m2", title="done", cookie_id="c2", session_id="s2", status="completed", result="ok"
+)
+mgr._save(done)
+(mgr.missions_dir / "corrupt.json").write_text("{not json")
+mgr2 = mission_control.MissionManager(mdir)
+check("active mission is failed after restart", mgr2.missions["m1"].status == "failed")
+check("completed mission survives restart", mgr2.missions["m2"].status == "completed")
+check("corrupt mission file tolerated", len(mgr2.missions) == 2)
+check(
+    "list_missions filters by cookie",
+    [m["id"] for m in mgr2.list_missions("c1")] == ["m1"],
+)
+
+# --- frontend duplex WS busy-state invariant ---------------------------------
+# static/index.html has no JS test harness (zero-dependency Python suite), but
+# a regression here is easy to reintroduce: if a duplex utterance starts
+# recording (busy=true) without marking wsTurn, a socket drop mid-recording
+# skips ws.onclose's unlock branch and wedges the UI (busy/isWsRecording stuck
+# true forever, mic dead until reload). Assert the ordering statically instead.
+
+_frontend_src = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+
+
+def _fn_body(name: str) -> str:
+    start = _frontend_src.index(f"function {name}(")
+    # crude brace match from the first '{' after the signature
+    brace_start = _frontend_src.index("{", start)
+    depth = 0
+    for i in range(brace_start, len(_frontend_src)):
+        if _frontend_src[i] == "{":
+            depth += 1
+        elif _frontend_src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return _frontend_src[brace_start:i + 1]
+    raise AssertionError(f"unbalanced braces scanning function {name}")
+
+
+start_ws_recording = _fn_body("startWsRecording")
+check(
+    "startWsRecording marks wsTurn so a mid-recording disconnect can unlock",
+    "wsTurn = true" in start_ws_recording,
+    start_ws_recording,
+)
+
+ws_onclose_start = _frontend_src.index("ws.onclose = () => {")
+ws_onclose_end = _frontend_src.index("};", ws_onclose_start)
+ws_onclose_body = _frontend_src[ws_onclose_start:ws_onclose_end]
+check(
+    "ws.onclose stops a live duplex recorder before unlocking",
+    "isWsRecording" in ws_onclose_body and "vadRecorder" in ws_onclose_body,
+    ws_onclose_body,
+)
 
 # ----------------------------------------------------------------------------
 

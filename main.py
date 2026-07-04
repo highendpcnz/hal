@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 import wave
+from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import quote
 
@@ -246,6 +247,42 @@ def synthesize_hal_stream(text: str):
     with _TTS_LOCK:
         for chunk in VOICE.synthesize(text, syn_config=SYN_CONFIG):
             yield chunk.audio_int16_bytes
+
+
+async def synthesize_hal_stream_async(text: str) -> AsyncIterator[bytes]:
+    """synthesize_hal_stream for coroutines (the WebSocket paths): Piper runs
+    in a worker thread, so synthesis never stalls the event loop the way
+    iterating the sync generator directly in a coroutine would — that held
+    _TTS_LOCK on the loop thread for the whole reply. If the consumer exits
+    early (socket gone), the worker stops at the next sentence boundary."""
+    loop = asyncio.get_running_loop()
+    chunks: asyncio.Queue = asyncio.Queue()
+    finished = object()
+    abandoned = threading.Event()
+
+    def produce() -> None:
+        try:
+            for chunk in synthesize_hal_stream(text):
+                if abandoned.is_set():
+                    break
+                loop.call_soon_threadsafe(chunks.put_nowait, chunk)
+        except Exception as exc:  # surfaced to the consumer below
+            loop.call_soon_threadsafe(chunks.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(chunks.put_nowait, finished)
+
+    producer = asyncio.create_task(asyncio.to_thread(produce))
+    try:
+        while True:
+            item = await chunks.get()
+            if item is finished:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        abandoned.set()
+        await producer
 
 
 def _elapsed_ms(start: float) -> int:
@@ -594,100 +631,179 @@ def reset_session(request: Request):
     return resp
 
 
-active_websockets = {}
+# ---------------------------------------------------------------------------
+# Full-duplex WebSocket + mission notifications
+# ---------------------------------------------------------------------------
 
-async def on_mission_complete(mission: mission_control.Mission):
-    ws = active_websockets.get(mission.cookie_id)
-    if not ws:
-        return
-    text = f"Dave, I have completed the mission: {mission.title}. "
-    if mission.status == "failed":
-        text += f"Unfortunately, it failed. {mission.result}"
+# One live conversation socket per browser session. A newer tab replaces an
+# older one; the older socket's cleanup must not evict its replacement.
+active_websockets: dict[str, WebSocket] = {}
+
+# Spoken mission trigger, e.g. "HAL, start mission tidy the downloads folder."
+_MISSION_VOICE_RE = re.compile(r"^\s*hal[,.]?\s+start\s+mission[,:]?\s*(.*)$", re.I)
+
+
+def _mission_request(user_text: str) -> str | None:
+    """Return the mission title if the utterance starts one, else None.
+
+    Typed form: "/mission <title>". Spoken form: "HAL, start mission <title>".
+    An empty title means the trigger fired but no mission can be created.
+    """
+    if user_text == "/mission" or user_text.startswith("/mission "):
+        return user_text[len("/mission"):].strip()
+    match = _MISSION_VOICE_RE.match(user_text)
+    if match is not None:
+        return match.group(1).strip().rstrip(".!?")
+    return None
+
+
+async def _ws_send_tts(websocket: WebSocket, text: str) -> None:
+    """Speak one reply over the socket: tts_start, PCM frames, tts_done."""
+    await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
+    async for chunk in synthesize_hal_stream_async(speakable(text)):
+        await websocket.send_bytes(chunk)
+    await websocket.send_json({"type": "tts_done"})
+
+
+async def _ws_abort_turn(websocket: WebSocket, reason: str, text: str) -> None:
+    """Tell the client this turn produced no reply so it can unlock its UI."""
+    await websocket.send_json({"type": "turn_aborted", "reason": reason, "text": text})
+
+
+async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) -> None:
+    await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
+
+    mission_title = _mission_request(user_text)
+    if mission_title is None:
+        hal_text, _timings = await run_turn_text(session_id, user_text)
     else:
-        text += "I'm ready to review the results with you."
-        
+        if mission_title:
+            mission_control.manager.create_mission(
+                session_id, mission_title, f"Execute mission: {mission_title}"
+            )
+            hal_text = (
+                f"I've started the mission: {mission_title}. "
+                "I will let you know when it is done."
+            )
+        else:
+            hal_text = "I need a mission title, Dave. Tell me what the mission is."
+        # run_turn_text records normal turns in the scrollback; mission
+        # trigger turns belong there too.
+        history = load_history(session_id)
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": hal_text})
+        save_history(session_id, history[-MAX_HISTORY_TURNS:])
+
+    await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
+    await _ws_send_tts(websocket, hal_text)
+
+
+async def on_mission_complete(mission: mission_control.Mission) -> None:
+    if mission.status == "failed":
+        text = (
+            f"Dave, I have completed the mission: {mission.title}. "
+            f"Unfortunately, it failed. {mission.result}"
+        )
+    else:
+        text = (
+            f"Dave, I have completed the mission: {mission.title}. "
+            "I'm ready to review the results with you."
+        )
+
+    # The report belongs in the scrollback whether or not anyone is listening.
+    history = load_history(mission.cookie_id)
+    history.append({"role": "assistant", "content": text})
+    save_history(mission.cookie_id, history[-MAX_HISTORY_TURNS:])
+
+    websocket = active_websockets.get(mission.cookie_id)
+    if websocket is None:
+        return
     try:
-        await ws.send_json({"type": "transcript", "role": "hal", "text": text})
-        await ws.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
-        for chunk in synthesize_hal_stream(speakable(text)):
-            await ws.send_bytes(chunk)
-        await ws.send_json({"type": "tts_done"})
-    except Exception as e:
-        print(f"Failed to notify UI of mission completion: {e}")
+        await websocket.send_json({"type": "transcript", "role": "hal", "text": text})
+        await _ws_send_tts(websocket, text)
+    except Exception as exc:
+        print(f"[ws] mission completion notify failed: {exc!r}")
+
 
 mission_control.manager.on_complete = on_mission_complete
 
+
 @app.websocket("/ws/conversation")
 async def ws_conversation(websocket: WebSocket):
-    cookie_id = websocket.cookies.get("hal_session")
-    session_id = _valid_session_id(cookie_id)
-    if not session_id:
+    session_id = _valid_session_id(websocket.cookies.get("hal_session"))
+    if session_id is None:
         await websocket.close(code=1008, reason="Missing session cookie")
         return
 
     await websocket.accept()
-    active_websockets[cookie_id] = websocket
-    audio_chunks = []
+    active_websockets[session_id] = websocket
+    audio_chunks: list[bytes] = []
+    audio_size = 0
+    audio_overflow = False
 
     try:
         while True:
             msg = await websocket.receive()
             if "bytes" in msg and msg["bytes"]:
-                audio_chunks.append(msg["bytes"])
+                if audio_overflow:
+                    continue
+                audio_size += len(msg["bytes"])
+                if audio_size > MAX_UPLOAD_BYTES:
+                    # Same cap as /api/talk — drop the recording, keep the socket.
+                    audio_chunks = []
+                    audio_overflow = True
+                else:
+                    audio_chunks.append(msg["bytes"])
             elif "text" in msg and msg["text"]:
                 try:
                     data = json.loads(msg["text"])
                 except json.JSONDecodeError:
                     continue
+                kind = data.get("type")
 
-                if data.get("type") == "start_speech":
+                if kind == "start_speech":
                     audio_chunks = []
-                elif data.get("type") == "text_input":
-                    user_text = data.get("text", "")
-                    await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
-                    
-                    if user_text.startswith("/mission "):
-                        title = user_text[9:].strip()
-                        m = mission_control.manager.create_mission(cookie_id, title, f"Execute mission: {title}")
-                        hal_text = f"I've started the mission: {title}. I will let you know when it is done."
-                    else:
-                        hal_text, timings = await run_turn_text(session_id, user_text)
-                    
-                    await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
-                    await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
-                    for chunk in synthesize_hal_stream(speakable(hal_text)):
-                        await websocket.send_bytes(chunk)
-                    await websocket.send_json({"type": "tts_done"})
-                    
-                elif data.get("type") == "end_speech":
-                    if not audio_chunks:
+                    audio_size = 0
+                    audio_overflow = False
+                    continue
+
+                if kind == "text_input":
+                    user_text = (data.get("text") or "").strip()
+                elif kind == "end_speech":
+                    if audio_overflow:
+                        audio_overflow = False
+                        await _ws_abort_turn(
+                            websocket, "too_long", "That recording was too long for me, Dave."
+                        )
                         continue
                     audio_bytes = b"".join(audio_chunks)
                     audio_chunks = []
-
-                    # 1. Transcribe
-                    user_text = await asyncio.to_thread(transcribe, audio_bytes)
-                    if not user_text:
+                    audio_size = 0
+                    if not audio_bytes:
+                        await _ws_abort_turn(
+                            websocket, "no_speech", "I didn't quite catch that, Dave."
+                        )
                         continue
-                    await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
+                    user_text = await asyncio.to_thread(transcribe, audio_bytes)
+                else:
+                    continue
 
-                    # Check for voice mission trigger
-                    if user_text.lower().startswith("hal, start mission"):
-                        title = user_text[18:].strip()
-                        m = mission_control.manager.create_mission(cookie_id, title, f"Execute mission: {title}")
-                        hal_text = f"I've started the mission: {title}. I will let you know when it is done."
-                    else:
-                        # 2. Hermes Turn
-                        hal_text, timings = await run_turn_text(session_id, user_text)
-                        
-                    await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
-
-                    # 3. Stream TTS
-                    await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
-                    for chunk in synthesize_hal_stream(speakable(hal_text)):
-                        await websocket.send_bytes(chunk)
-                    await websocket.send_json({"type": "tts_done"})
+                if not user_text:
+                    await _ws_abort_turn(
+                        websocket, "no_speech", "I didn't quite catch that, Dave."
+                    )
+                    continue
+                try:
+                    await _ws_run_turn(websocket, session_id, user_text)
+                except WebSocketDisconnect:
+                    raise
+                except Exception as exc:
+                    print(f"[ws] turn failed (session={session_id[:8]}): {exc!r}")
+                    await _ws_abort_turn(
+                        websocket, "error", "Something went wrong on my end, Dave."
+                    )
     except WebSocketDisconnect:
-        active_websockets.pop(cookie_id, None)
-
-
+        pass
+    finally:
+        if active_websockets.get(session_id) is websocket:
+            active_websockets.pop(session_id, None)

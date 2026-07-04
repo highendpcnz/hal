@@ -195,7 +195,28 @@ def unregister_event_queue(cookie_id: str, q: asyncio.Queue) -> None:
             _event_queues.pop(cookie_id, None)
 
 
+# Aliases let a synthetic session key (a mission's private session) deliver
+# its events to the owning browser session's queues.
+_publish_aliases: dict[str, str] = {}
+
+
+def alias_events(alias_id: str, cookie_id: str) -> None:
+    """Route events published under alias_id to cookie_id's SSE queues."""
+    _publish_aliases[alias_id] = cookie_id
+
+
+def unalias_events(alias_id: str) -> None:
+    _publish_aliases.pop(alias_id, None)
+
+
+def publish_event(cookie_id: str, payload: dict) -> None:
+    """Emit an SSE event for a browser session — the public face of _publish
+    for other modules (mission_control)."""
+    _publish(cookie_id, payload)
+
+
 def _publish(cookie_id: str, payload: dict) -> None:
+    cookie_id = _publish_aliases.get(cookie_id, cookie_id)
     data = json.dumps(payload)
     for q in list(_event_queues.get(cookie_id, ())):
         try:

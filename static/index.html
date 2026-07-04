@@ -1415,9 +1415,12 @@
   // Turn lifecycle (preserved from original)
   // ═══════════════════════════════════════════════════
   function turnDone() {
+    stopThinkingTimer();
     setState('idle');
-    stopWaveform();
+    // In duplex mode the mic stays hot between turns; keep its waveform alive.
+    if (!duplexEnabled) stopWaveform();
     busy = false;
+    wsTurn = false;
   }
 
   // Stop any in-flight HAL speech (both playback paths). Returns true if
@@ -1638,14 +1641,16 @@
   let wsSampleRate = 22050;
   let wsNextTime = 0;
   let wsStarted = false;
+  let wsTurn = false;  // the in-flight turn belongs to the WebSocket transport
 
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws/conversation`);
-    
+
     ws.onmessage = async (e) => {
       if (typeof e.data === 'string') {
-        const msg = JSON.parse(e.data);
+        let msg;
+        try { msg = JSON.parse(e.data); } catch (err) { return; }
         if (msg.type === 'transcript') {
           updateLog(msg.role === 'user' ? msg.text : null, msg.role === 'hal' ? msg.text : null);
           showCaption(msg.text);
@@ -1653,17 +1658,43 @@
             setState('speaking');
           }
         } else if (msg.type === 'tts_start') {
-           wsSampleRate = msg.sample_rate || 22050;
-           wsNextTime = 0;
-           wsStarted = false;
+          stopThinkingTimer();
+          wsSampleRate = msg.sample_rate || 22050;
+          wsNextTime = 0;
+          wsStarted = false;
         } else if (msg.type === 'tts_done') {
-           turnDone();
+          turnDone();
+        } else if (msg.type === 'turn_aborted') {
+          // The server had nothing to say (empty audio, over-long recording,
+          // error) — without this the UI would wait on a reply forever.
+          showCaption(msg.text || "I didn't quite catch that, Dave.",
+                      { isError: msg.reason === 'error' });
+          turnDone();
         }
       } else {
         await playWsChunk(e.data);
       }
     };
-    ws.onclose = () => setTimeout(connectWS, 2000);
+    ws.onclose = () => {
+      if (isWsRecording) {
+        // Socket died while still capturing a duplex utterance — there will
+        // be no end_speech reply to unlock on. Stop the recorder before
+        // turnDone() below runs (wsTurn is already true from startWsRecording).
+        isWsRecording = false;
+        if (vadRecorder && vadRecorder.state === 'recording') {
+          vadRecorder.onstop = null;
+          vadRecorder.ondataavailable = null;
+          try { vadRecorder.stop(); } catch (e) {}
+        }
+        vadRecorder = null;
+      }
+      if (wsTurn) {
+        // Socket died mid-turn; the reply is gone. Unlock the UI.
+        showCaption("I've lost my connection, Dave.", { isError: true });
+        turnDone();
+      }
+      setTimeout(connectWS, 2000);
+    };
   }
   connectWS();
 
@@ -1671,95 +1702,128 @@
     primePlayback();
     const ctx = audioCtx;
     if (ctx.state === 'suspended') await ctx.resume();
-    
+
     const arrayBuffer = await blob.arrayBuffer();
     const ints = new Int16Array(arrayBuffer);
     const buf = ctx.createBuffer(1, ints.length, wsSampleRate);
     const floats = buf.getChannelData(0);
     for (let i = 0; i < ints.length; i++) floats[i] = ints[i] / 32768;
-    
+
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.connect(ctx.destination);
-    
+
     if (!streamPlayback) streamPlayback = { sources: new Set(), cancelled: false };
     streamPlayback.sources.add(src);
-    src.onended = () => streamPlayback.sources.delete(src);
-    
+    src.onended = () => { if (streamPlayback) streamPlayback.sources.delete(src); };
+
     if (wsNextTime < ctx.currentTime + 0.02) wsNextTime = ctx.currentTime + 0.05;
     src.start(wsNextTime);
     wsNextTime += buf.duration;
-    
+
     if (!wsStarted) {
       wsStarted = true;
       setState('speaking');
     }
   }
 
+  // ═══════════════════════════════════════════════════
+  // Duplex VAD — always-on mic with client-side gating
+  // ═══════════════════════════════════════════════════
   let vadMicStream = null;
   let vadRecorder = null;
+  let vadAnalyser = null;
+  let vadDataArray = null;
   let vadSilenceFrames = 0;
+  let vadVoiceFrames = 0;
   let isWsRecording = false;
   let duplexEnabled = false;
-  
+
+  const VAD_THRESHOLD = 15;
+  const VAD_SILENCE_FRAMES = 60;   // ~1s of quiet ends the utterance
+  const VAD_BARGE_IN_FRAMES = 12;  // ~200ms of sustained speech cuts HAL off
+
   const btnDuplex = document.getElementById('mlog-duplex');
   btnDuplex?.addEventListener('click', async () => {
     duplexEnabled = !duplexEnabled;
     btnDuplex.textContent = `Duplex: ${duplexEnabled ? 'ON' : 'OFF'}`;
     btnDuplex.style.color = duplexEnabled ? '#ff2a1a' : '';
-    
+
     if (duplexEnabled) {
       await enableFullDuplex();
     } else {
+      if (vadRecorder && vadRecorder.state === 'recording') {
+        vadRecorder.onstop = null;
+        vadRecorder.ondataavailable = null;
+        try { vadRecorder.stop(); } catch (e) {}
+      }
+      vadRecorder = null;
+      if (isWsRecording) {
+        isWsRecording = false;
+        turnDone();  // a half-captured utterance must not leave the UI busy
+      }
       if (vadMicStream) {
         vadMicStream.getTracks().forEach(t => t.stop());
         vadMicStream = null;
       }
+      vadAnalyser = null;
+      vadDataArray = null;
+      stopWaveform();
       appendToMissionLog('system', 'Duplex mode disabled.');
     }
   });
 
   async function enableFullDuplex() {
     try {
-      vadMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Echo cancellation keeps HAL's own voice (from the speakers) from
+      // tripping the VAD and barging in on himself.
+      vadMicStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      
+
       vadAnalyser = audioCtx.createAnalyser();
       vadAnalyser.fftSize = 512;
       const source = audioCtx.createMediaStreamSource(vadMicStream);
       source.connect(vadAnalyser);
       vadDataArray = new Uint8Array(vadAnalyser.frequencyBinCount);
-      
+
       startWaveformMic(vadMicStream);
       requestAnimationFrame(vadLoop);
-      
+
       appendToMissionLog('system', 'Full-duplex mode active. Mic is hot.');
     } catch (e) {
       showCaption("Microphone access denied for full-duplex.", { isError: true });
       duplexEnabled = false;
       btnDuplex.textContent = 'Duplex: OFF';
+      btnDuplex.style.color = '';
     }
   }
 
   function vadLoop() {
     if (!duplexEnabled || !vadAnalyser) return;
     requestAnimationFrame(vadLoop);
-    
+
     vadAnalyser.getByteFrequencyData(vadDataArray);
     let sum = 0;
     for (let i = 0; i < vadDataArray.length; i++) sum += vadDataArray[i];
-    let avg = sum / vadDataArray.length;
-    
-    const THRESHOLD = 15; 
-    if (avg > THRESHOLD) {
+    const avg = sum / vadDataArray.length;
+
+    if (avg > VAD_THRESHOLD) {
       vadSilenceFrames = 0;
-      if (!isWsRecording && ws && ws.readyState === WebSocket.OPEN && !busy) {
+      vadVoiceFrames++;
+      if (isWsRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const halSpeaking = eye.classList.contains('speaking');
+      // A free mic starts capturing immediately; while HAL speaks, demand
+      // sustained speech before barging in so residual echo can't cut him off.
+      if (!busy || (halSpeaking && vadVoiceFrames >= VAD_BARGE_IN_FRAMES)) {
         startWsRecording();
       }
     } else {
+      vadVoiceFrames = 0;
       if (isWsRecording) {
         vadSilenceFrames++;
-        if (vadSilenceFrames > 60) { 
+        if (vadSilenceFrames > VAD_SILENCE_FRAMES) {
           stopWsRecording();
         }
       }
@@ -1768,30 +1832,38 @@
 
   function startWsRecording() {
     if (eye.classList.contains('speaking') && stopSpeaking()) {
-       // Barge-in
-       busy = false;
+      // Barge-in
+      busy = false;
     }
     isWsRecording = true;
     busy = true;
+    wsTurn = true;  // this turn now owns the WS reply; onclose must unlock it
     setState('listening');
     ws.send(JSON.stringify({ type: 'start_speech' }));
-    
-    vadRecorder = new MediaRecorder(vadMicStream, { mimeType: 'audio/webm' });
+
+    // Safari's MediaRecorder has no webm support; use its default container.
+    const opts = (window.MediaRecorder && MediaRecorder.isTypeSupported &&
+                  MediaRecorder.isTypeSupported('audio/webm'))
+      ? { mimeType: 'audio/webm' } : undefined;
+    vadRecorder = new MediaRecorder(vadMicStream, opts);
     vadRecorder.ondataavailable = e => {
-      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN && isWsRecording) {
+      // No isWsRecording guard: the final chunk fires after stop(), and
+      // dropping it would clip the tail off every utterance.
+      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
         ws.send(e.data);
       }
     };
-    vadRecorder.start(250); 
+    vadRecorder.start(250);
   }
 
   function stopWsRecording() {
     isWsRecording = false;
+    wsTurn = true;
     if (vadRecorder && vadRecorder.state === 'recording') {
       vadRecorder.onstop = () => {
-         ws.send(JSON.stringify({ type: 'end_speech' }));
-         setState('thinking');
-         startThinkingTimer();
+        ws.send(JSON.stringify({ type: 'end_speech' }));
+        setState('thinking');
+        startThinkingTimer();
       };
       vadRecorder.stop();
     } else {
@@ -1853,10 +1925,15 @@
     setState('thinking');
     startThinkingTimer();
 
-    // Route through WebSocket if available (handles /mission natively)
+    // Route through WebSocket if available (handles /mission natively).
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'text_input', text: text }));
-      return;
+      wsTurn = true;
+      try {
+        ws.send(JSON.stringify({ type: 'text_input', text: text }));
+        return;
+      } catch (err) {
+        wsTurn = false;  // fall through to the HTTP path
+      }
     }
 
     try {
