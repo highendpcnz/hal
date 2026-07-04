@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import socket
+import threading
 import time
 from collections import defaultdict
 from contextlib import AsyncExitStack
@@ -64,6 +65,7 @@ FAILURE_LINE = "I'm sorry, Dave. I'm afraid something went wrong on my end."
 TIMEOUT_LINE = "I'm sorry, Dave. That took longer than I allow myself. Please try again."
 OFFLINE_LINE = "I'm sorry, Dave. I am disconnected from inference right now."
 
+_network_lock = threading.Lock()
 _network_check_at = 0.0
 _network_check_online: bool | None = None
 
@@ -90,9 +92,10 @@ def _network_available() -> bool:
     if not OFFLINE_PREFLIGHT:
         return True
 
-    now = time.monotonic()
-    if _network_check_online is not None and now - _network_check_at < OFFLINE_CHECK_TTL:
-        return _network_check_online
+    with _network_lock:
+        now = time.monotonic()
+        if _network_check_online is not None and now - _network_check_at < OFFLINE_CHECK_TTL:
+            return _network_check_online
 
     hosts = _parse_check_hosts(OFFLINE_CHECK_HOSTS)
     if not hosts:
@@ -117,8 +120,9 @@ def _network_available() -> bool:
         except concurrent.futures.TimeoutError:
             online = False
 
-    _network_check_at = now
-    _network_check_online = online
+    with _network_lock:
+        _network_check_at = time.monotonic()
+        _network_check_online = online
     return online
 
 
@@ -127,6 +131,7 @@ class SessionMap:
 
     def __init__(self, path: Path):
         self._path = path
+        self._lock = threading.Lock()
         try:
             self._map: dict[str, str] = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
@@ -136,12 +141,14 @@ class SessionMap:
         return self._map.get(session_id)
 
     def set(self, session_id: str, hermes_id: str) -> None:
-        self._map[session_id] = hermes_id
-        self._flush()
+        with self._lock:
+            self._map[session_id] = hermes_id
+            self._flush()
 
     def drop(self, session_id: str) -> None:
-        if self._map.pop(session_id, None) is not None:
-            self._flush()
+        with self._lock:
+            if self._map.pop(session_id, None) is not None:
+                self._flush()
 
     def _flush(self) -> None:
         tmp = self._path.with_suffix(".json.tmp")
@@ -181,9 +188,11 @@ def register_event_queue(cookie_id: str) -> asyncio.Queue:
 
 
 def unregister_event_queue(cookie_id: str, q: asyncio.Queue) -> None:
-    _event_queues[cookie_id].discard(q)
-    if not _event_queues[cookie_id]:
-        _event_queues.pop(cookie_id, None)
+    queues = _event_queues.get(cookie_id)
+    if queues is not None:
+        queues.discard(q)
+        if not queues:
+            _event_queues.pop(cookie_id, None)
 
 
 def _publish(cookie_id: str, payload: dict) -> None:
@@ -387,6 +396,8 @@ class ACPBridge:
 
     async def _resolve_session(self, cookie_id: str) -> str:
         assert _session_map is not None
+        if not self._alive():
+            raise RuntimeError("ACP bridge is down during session resolution")
         acp_id = _session_map.get(cookie_id)
         if acp_id and acp_id in self._loaded:
             return acp_id
@@ -468,10 +479,11 @@ _acp_bridge = ACPBridge() if BRIDGE_MODE == "acp" else None
 
 async def _ask_subprocess(text: str, session_id: str) -> str:
     assert _session_map is not None
-    cmd = [HERMES_BIN, "chat", "-Q", "-q", text, "--source", SESSION_SOURCE, *EXTRA_ARGS]
+    cmd = [HERMES_BIN, "chat", "-Q", "-q", "--source", SESSION_SOURCE, *EXTRA_ARGS]
     hermes_id = _session_map.get(session_id)
     if hermes_id:
         cmd += ["--resume", hermes_id]
+    cmd += ["--", text]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -545,7 +557,6 @@ def drop_session(cookie_id: str) -> None:
         _acp_to_cookie.pop(acp_id, None)
         if _acp_bridge is not None:
             _acp_bridge.forget(acp_id)
-    _cookie_locks.pop(cookie_id, None)
     _event_queues.pop(cookie_id, None)
 
 
@@ -555,7 +566,13 @@ async def ask_hermes(text: str, session_id: str) -> str:
     if not await asyncio.to_thread(_network_available):
         print("[hermes_bridge] offline preflight blocked remote inference")
         return OFFLINE_LINE
-    async with _cookie_locks[session_id]:
+    lock = _cookie_locks[session_id]
+    async with lock:
         if _acp_bridge is not None:
-            return await _acp_bridge.ask(text, session_id)
-        return await _ask_subprocess(text, session_id)
+            result = await _acp_bridge.ask(text, session_id)
+        else:
+            result = await _ask_subprocess(text, session_id)
+    # Evict the lock if no other turn is queued for this session
+    if not lock.locked():
+        _cookie_locks.pop(session_id, None)
+    return result

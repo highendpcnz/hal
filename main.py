@@ -24,7 +24,7 @@ from urllib.parse import quote
 
 import asyncio
 
-from fastapi import FastAPI, File, Request, Response, UploadFile
+from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 import hermes_bridge
 from hermes_bridge import ask_hermes
+import mission_control
 
 APP_DIR = Path(__file__).resolve().parent
 VOICE_PATH = Path(
@@ -69,6 +70,7 @@ DATA_DIR = Path(os.environ.get("HAL_DATA_DIR", str(APP_DIR / "data")))
 SESSIONS_DIR = DATA_DIR / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 hermes_bridge.init(DATA_DIR)
+mission_control.init(DATA_DIR)
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -457,12 +459,14 @@ def status(request: Request):
 _systems_cache: dict | None = None
 _systems_cache_at = 0.0
 _systems_generated_at = 0
-_systems_lock = asyncio.Lock()
+_systems_lock: asyncio.Lock | None = None
 
 
 @app.get("/api/systems")
 async def systems(request: Request, refresh: int = 0):
-    global _systems_cache, _systems_cache_at, _systems_generated_at
+    global _systems_cache, _systems_cache_at, _systems_generated_at, _systems_lock
+    if _systems_lock is None:
+        _systems_lock = asyncio.Lock()
     session_id = _valid_session_id(request.cookies.get("hal_session"))
     async with _systems_lock:
         stale = _systems_cache is None or time.monotonic() - _systems_cache_at > SYSTEMS_CACHE_TTL
@@ -506,14 +510,22 @@ async def talk(request: Request, audio: UploadFile = File(...), stream: int = 0)
     session_id, new_session = _session_from_request(request)
 
     stage_start = time.perf_counter()
-    audio_bytes = await audio.read()
+    audio_chunks = []
+    total_size = 0
+    while True:
+        chunk = await audio.read(65536)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > MAX_UPLOAD_BYTES:
+            timings["upload"] = _elapsed_ms(stage_start)
+            resp = Response(status_code=413)
+            if new_session:
+                _set_session_cookie(resp, session_id)
+            return resp
+        audio_chunks.append(chunk)
+    audio_bytes = b"".join(audio_chunks)
     timings["upload"] = _elapsed_ms(stage_start)
-
-    if len(audio_bytes) > MAX_UPLOAD_BYTES:
-        resp = Response(status_code=413)
-        if new_session:
-            _set_session_cookie(resp, session_id)
-        return resp
 
     stage_start = time.perf_counter()
     user_text = await asyncio.to_thread(transcribe, audio_bytes)
@@ -580,3 +592,102 @@ def reset_session(request: Request):
     resp = JSONResponse({"session_id": new_id})
     _set_session_cookie(resp, new_id)
     return resp
+
+
+active_websockets = {}
+
+async def on_mission_complete(mission: mission_control.Mission):
+    ws = active_websockets.get(mission.cookie_id)
+    if not ws:
+        return
+    text = f"Dave, I have completed the mission: {mission.title}. "
+    if mission.status == "failed":
+        text += f"Unfortunately, it failed. {mission.result}"
+    else:
+        text += "I'm ready to review the results with you."
+        
+    try:
+        await ws.send_json({"type": "transcript", "role": "hal", "text": text})
+        await ws.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
+        for chunk in synthesize_hal_stream(speakable(text)):
+            await ws.send_bytes(chunk)
+        await ws.send_json({"type": "tts_done"})
+    except Exception as e:
+        print(f"Failed to notify UI of mission completion: {e}")
+
+mission_control.manager.on_complete = on_mission_complete
+
+@app.websocket("/ws/conversation")
+async def ws_conversation(websocket: WebSocket):
+    cookie_id = websocket.cookies.get("hal_session")
+    session_id = _valid_session_id(cookie_id)
+    if not session_id:
+        await websocket.close(code=1008, reason="Missing session cookie")
+        return
+
+    await websocket.accept()
+    active_websockets[cookie_id] = websocket
+    audio_chunks = []
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            if "bytes" in msg and msg["bytes"]:
+                audio_chunks.append(msg["bytes"])
+            elif "text" in msg and msg["text"]:
+                try:
+                    data = json.loads(msg["text"])
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get("type") == "start_speech":
+                    audio_chunks = []
+                elif data.get("type") == "text_input":
+                    user_text = data.get("text", "")
+                    await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
+                    
+                    if user_text.startswith("/mission "):
+                        title = user_text[9:].strip()
+                        m = mission_control.manager.create_mission(cookie_id, title, f"Execute mission: {title}")
+                        hal_text = f"I've started the mission: {title}. I will let you know when it is done."
+                    else:
+                        hal_text, timings = await run_turn_text(session_id, user_text)
+                    
+                    await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
+                    await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
+                    for chunk in synthesize_hal_stream(speakable(hal_text)):
+                        await websocket.send_bytes(chunk)
+                    await websocket.send_json({"type": "tts_done"})
+                    
+                elif data.get("type") == "end_speech":
+                    if not audio_chunks:
+                        continue
+                    audio_bytes = b"".join(audio_chunks)
+                    audio_chunks = []
+
+                    # 1. Transcribe
+                    user_text = await asyncio.to_thread(transcribe, audio_bytes)
+                    if not user_text:
+                        continue
+                    await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
+
+                    # Check for voice mission trigger
+                    if user_text.lower().startswith("hal, start mission"):
+                        title = user_text[18:].strip()
+                        m = mission_control.manager.create_mission(cookie_id, title, f"Execute mission: {title}")
+                        hal_text = f"I've started the mission: {title}. I will let you know when it is done."
+                    else:
+                        # 2. Hermes Turn
+                        hal_text, timings = await run_turn_text(session_id, user_text)
+                        
+                    await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
+
+                    # 3. Stream TTS
+                    await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
+                    for chunk in synthesize_hal_stream(speakable(hal_text)):
+                        await websocket.send_bytes(chunk)
+                    await websocket.send_json({"type": "tts_done"})
+    except WebSocketDisconnect:
+        active_websockets.pop(cookie_id, None)
+
+

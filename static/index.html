@@ -21,6 +21,8 @@
     user-select: none;
     -webkit-tap-highlight-color: transparent;
   }
+
+  /* ── Mobile-first: eye centered (original layout) ── */
   body {
     display: flex;
     flex-direction: column;
@@ -29,6 +31,10 @@
     gap: clamp(32px, 6vh, 48px);
     padding: 24px;
   }
+
+  /* ═══════════════════════════════════════════════════
+     EYE MODULE — preserved exactly from original
+     ═══════════════════════════════════════════════════ */
   .eye-module {
     position: relative;
     width: min(86vw, 430px);
@@ -281,6 +287,10 @@
     0%, 100% { filter: saturate(0.6) brightness(0.6); }
     50%      { filter: saturate(0.9) brightness(0.3) hue-rotate(-30deg); }
   }
+
+  /* ═══════════════════════════════════════════════════
+     MOBILE-ONLY ELEMENTS — hidden on desktop Bridge
+     ═══════════════════════════════════════════════════ */
   .log {
     min-height: 3em;
     max-width: 680px;
@@ -403,6 +413,7 @@
     line-height: 1.6;
     overflow-y: auto;
     padding: 28px 24px;
+    z-index: 100;
   }
   .drawer.open { display: block; }
   .drawer-inner {
@@ -544,6 +555,195 @@
     letter-spacing: 0.12em;
     text-transform: uppercase;
   }
+
+  /* ═══════════════════════════════════════════════════
+     BRIDGE: Mission Log (hidden on mobile)
+     ═══════════════════════════════════════════════════ */
+  .mission-log {
+    display: none;
+  }
+  .mission-log-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 0 10px;
+    border-bottom: 1px solid #151515;
+    margin-bottom: 10px;
+  }
+  .mission-log-title {
+    color: #555;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+  .mission-log-actions {
+    display: flex;
+    gap: 8px;
+  }
+  .mission-log-action {
+    border: 1px solid #1a1a1a;
+    border-radius: 999px;
+    background: transparent;
+    color: #444;
+    cursor: pointer;
+    font: inherit;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    padding: 4px 9px;
+    text-transform: uppercase;
+    transition: color 0.2s, border-color 0.2s;
+  }
+  .mission-log-action:hover {
+    border-color: #4a1710;
+    color: #b84b3b;
+  }
+  .mission-log-entries {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 4px;
+  }
+  .mission-log-entries::-webkit-scrollbar { width: 4px; }
+  .mission-log-entries::-webkit-scrollbar-track { background: transparent; }
+  .mission-log-entries::-webkit-scrollbar-thumb { background: #1a1a1a; border-radius: 2px; }
+  .mlog-entry {
+    padding: 6px 0;
+    border-bottom: 1px solid #0a0a0a;
+    font-size: 12px;
+    line-height: 1.55;
+    animation: mlog-fade-in 0.3s ease;
+  }
+  @keyframes mlog-fade-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .mlog-ts {
+    color: #333;
+    font-size: 10px;
+    margin-right: 6px;
+  }
+  .mlog-user { color: #888; }
+  .mlog-user .mlog-role { color: #666; }
+  .mlog-hal { color: #b84b3b; }
+  .mlog-hal .mlog-role { color: #7a322a; }
+  .mlog-tool {
+    color: #555;
+    font-size: 11px;
+  }
+  .mlog-tool-icon {
+    display: inline-block;
+    width: 14px;
+    text-align: center;
+  }
+  .mlog-tool.done { color: #2a6e4a; }
+  .mlog-tool.failed { color: #b84b3b; }
+  .mlog-tool.denied { color: #8a6a2a; }
+  .mlog-system {
+    color: #444;
+    font-size: 11px;
+    font-style: italic;
+  }
+
+  /* ═══════════════════════════════════════════════════
+     BRIDGE: Waveform (hidden on mobile)
+     ═══════════════════════════════════════════════════ */
+  .waveform-wrap {
+    display: none;
+  }
+  .waveform-canvas {
+    width: 100%;
+    height: 48px;
+    display: block;
+  }
+
+  /* ═══════════════════════════════════════════════════
+     BRIDGE: Telemetry bar (hidden on mobile)
+     ═══════════════════════════════════════════════════ */
+  .telemetry {
+    display: none;
+  }
+  .telemetry-inner {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 4px;
+  }
+  .telem-pill {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
+    border-right: 1px solid #111;
+    white-space: nowrap;
+  }
+  .telem-pill:last-child { border-right: none; }
+  .telem-label {
+    color: #444;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+  .telem-value {
+    color: #777;
+    font-size: 11px;
+  }
+  .telem-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #333;
+    flex-shrink: 0;
+  }
+  .telem-dot.ok { background: #2a6e4a; box-shadow: 0 0 6px rgba(42, 110, 74, 0.6); }
+  .telem-dot.bad { background: #b84b3b; box-shadow: 0 0 6px rgba(184, 75, 59, 0.6); }
+
+  /* ═══════════════════════════════════════════════════
+     BRIDGE: Always-visible input (hidden on mobile,
+     replaces the floating cmdline on desktop)
+     ═══════════════════════════════════════════════════ */
+  .bridge-input {
+    display: none;
+  }
+  .bridge-input form {
+    display: flex;
+    gap: 8px;
+  }
+  .bridge-input input {
+    flex: 1;
+    background: #050505;
+    border: 1px solid #1e1e1e;
+    border-radius: 999px;
+    color: #b84b3b;
+    font: inherit;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    padding: 9px 16px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .bridge-input input::placeholder { color: #3a2220; }
+  .bridge-input input:focus { border-color: #4a1710; }
+  .bridge-input button {
+    border: 1px solid #1e1e1e;
+    border-radius: 999px;
+    background: #050505;
+    color: #555;
+    cursor: pointer;
+    font: inherit;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    padding: 9px 14px;
+    text-transform: uppercase;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .bridge-input button:hover {
+    border-color: #4a1710;
+    color: #b84b3b;
+  }
+
+  /* ═══════════════════════════════════════════════════
+     RESPONSIVE: Mobile (default, < 760px)
+     ═══════════════════════════════════════════════════ */
   @media (max-width: 760px) {
     .eye-module {
       width: min(90vw, 360px);
@@ -562,28 +762,228 @@
     body { gap: 28px; }
     .eye-module { width: min(76vh, 86vw, 360px); }
   }
+
+  /* ═══════════════════════════════════════════════════
+     RESPONSIVE: Tablet (760–1100px) — eye + log column
+     ═══════════════════════════════════════════════════ */
+  @media (min-width: 761px) and (max-width: 1100px) {
+    body {
+      justify-content: flex-start;
+      padding: 24px 24px 0;
+      gap: 0;
+      overflow-y: auto;
+    }
+    .eye-module {
+      width: min(60vw, 340px);
+      margin: 24px auto 16px;
+    }
+    .log { display: none; }
+    .hint { display: none; }
+    .caption { top: 16px; }
+    .ticker { top: auto; bottom: 70px; }
+    .mission-log {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      max-width: 680px;
+      margin: 0 auto;
+      height: 35vh;
+      min-height: 160px;
+      border: 1px solid #111;
+      border-radius: 8px;
+      background: #030303;
+      padding: 12px 14px;
+    }
+    .telemetry {
+      display: block;
+      width: 100%;
+      max-width: 680px;
+      margin: 12px auto 0;
+      border-top: 1px solid #111;
+      padding: 6px 0;
+    }
+    .bridge-input {
+      display: block;
+      width: 100%;
+      max-width: 680px;
+      margin: 10px auto 20px;
+    }
+    .cmdline { display: none !important; }
+  }
+
+  /* ═══════════════════════════════════════════════════
+     RESPONSIVE: Desktop Bridge (>1100px) — full layout
+     ═══════════════════════════════════════════════════ */
+  @media (min-width: 1101px) {
+    body {
+      display: grid;
+      grid-template-columns: 400px 1fr;
+      grid-template-rows: 1fr auto auto;
+      gap: 0;
+      padding: 0;
+      align-items: stretch;
+      justify-content: stretch;
+    }
+
+    /* Left column: eye + waveform */
+    .bridge-left {
+      grid-column: 1;
+      grid-row: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px 16px;
+      border-right: 1px solid #111;
+      gap: 16px;
+      min-height: 0;
+    }
+    .eye-module {
+      width: min(82%, 340px);
+    }
+    .waveform-wrap {
+      display: block;
+      width: min(82%, 340px);
+      border: 1px solid #151515;
+      border-radius: 6px;
+      background: #030303;
+      padding: 4px;
+    }
+
+    /* Right column: mission log */
+    .mission-log {
+      grid-column: 2;
+      grid-row: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 16px 20px;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    /* Bottom spanning: telemetry */
+    .telemetry {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      display: block;
+      border-top: 1px solid #111;
+      padding: 4px 8px;
+    }
+
+    /* Bottom spanning: input */
+    .bridge-input {
+      grid-column: 1 / -1;
+      grid-row: 3;
+      display: block;
+      padding: 8px 20px 12px;
+      border-top: 1px solid #0a0a0a;
+    }
+
+    /* Hide mobile elements */
+    .log { display: none; }
+    .hint { display: none; }
+    .cmdline { display: none !important; }
+    .caption {
+      position: absolute;
+      top: 16px;
+      left: 50%;
+      z-index: 50;
+    }
+    .ticker {
+      position: absolute;
+      top: auto;
+      bottom: 100px;
+      left: 50%;
+      z-index: 50;
+    }
+    .monitor-tab {
+      z-index: 50;
+    }
+  }
 </style>
 </head>
 <body>
-  <div class="eye-module" role="group" aria-label="HAL optical panel">
-    <span class="panel-slot panel-slot-top" aria-hidden="true"></span>
-    <span class="panel-slot panel-slot-bottom" aria-hidden="true"></span>
-    <span class="panel-screw panel-screw-tl" aria-hidden="true"></span>
-    <span class="panel-screw panel-screw-tr" aria-hidden="true"></span>
-    <span class="panel-screw panel-screw-bl" aria-hidden="true"></span>
-    <span class="panel-screw panel-screw-br" aria-hidden="true"></span>
-    <span class="optic-retainer" aria-hidden="true"></span>
-    <div id="eye" class="eye" aria-label="Hold to speak"></div>
+  <!-- Bridge left column wrapper (only used by desktop grid) -->
+  <div class="bridge-left">
+    <div class="eye-module" role="group" aria-label="HAL optical panel">
+      <span class="panel-slot panel-slot-top" aria-hidden="true"></span>
+      <span class="panel-slot panel-slot-bottom" aria-hidden="true"></span>
+      <span class="panel-screw panel-screw-tl" aria-hidden="true"></span>
+      <span class="panel-screw panel-screw-tr" aria-hidden="true"></span>
+      <span class="panel-screw panel-screw-bl" aria-hidden="true"></span>
+      <span class="panel-screw panel-screw-br" aria-hidden="true"></span>
+      <span class="optic-retainer" aria-hidden="true"></span>
+      <div id="eye" class="eye" aria-label="Hold to speak"></div>
+    </div>
+    <div class="waveform-wrap">
+      <canvas id="waveform" class="waveform-canvas"></canvas>
+    </div>
   </div>
+
+  <!-- Mission Log (visible on tablet + desktop) -->
+  <div id="mission-log" class="mission-log">
+    <div class="mission-log-header">
+      <div class="mission-log-title">Mission Log</div>
+      <div class="mission-log-actions">
+        <button id="mlog-duplex" class="mission-log-action">Duplex: OFF</button>
+        <button id="mlog-clear" class="mission-log-action">Clear</button>
+        <button id="mlog-reset" class="mission-log-action">New Session</button>
+      </div>
+    </div>
+    <div id="mlog-entries" class="mission-log-entries"></div>
+  </div>
+
+  <!-- Mobile-only log (hidden on tablet/desktop) -->
   <div id="log" class="log"></div>
+
+  <!-- Overlays (shared) -->
   <div id="caption" class="caption" aria-live="polite"></div>
   <div id="ticker" class="ticker"></div>
   <div class="hint">Hold the eye — or the space bar — to speak · "/" to type</div>
+
+  <!-- Mobile command line (hidden on tablet/desktop) -->
   <form id="cmdline" class="cmdline">
     <input id="cmd-input" type="text" autocomplete="off" spellcheck="false"
            placeholder="Type to HAL — Enter sends, Esc closes" />
   </form>
 
+  <!-- Telemetry bar (visible on tablet + desktop) -->
+  <div id="telemetry" class="telemetry">
+    <div class="telemetry-inner">
+      <div class="telem-pill">
+        <span class="telem-label">Bridge</span>
+        <span id="telem-bridge-dot" class="telem-dot"></span>
+        <span id="telem-bridge" class="telem-value">—</span>
+      </div>
+      <div class="telem-pill">
+        <span class="telem-label">STT</span>
+        <span id="telem-stt" class="telem-value">—</span>
+      </div>
+      <div class="telem-pill">
+        <span class="telem-label">Voice</span>
+        <span id="telem-voice" class="telem-value">—</span>
+      </div>
+      <div class="telem-pill">
+        <span class="telem-label">Tools</span>
+        <span id="telem-yolo" class="telem-value">—</span>
+      </div>
+      <div class="telem-pill">
+        <span class="telem-label">Uptime</span>
+        <span id="telem-uptime" class="telem-value">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bridge input (visible on tablet + desktop) -->
+  <div class="bridge-input">
+    <form id="bridge-form">
+      <input id="bridge-cmd" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Type to HAL — Enter sends, Space bar to speak" />
+      <button type="submit">Send</button>
+    </form>
+  </div>
+
+  <!-- Systems drawer (unchanged) -->
   <button id="monitor-tab" class="monitor-tab" aria-label="Show system monitor" title="System monitor">Systems</button>
   <div id="drawer" class="drawer">
     <div class="drawer-inner">
@@ -659,6 +1059,9 @@
   </div>
 
 <script>
+  // ═══════════════════════════════════════════════════
+  // Core state (preserved from original)
+  // ═══════════════════════════════════════════════════
   const eye = document.getElementById('eye');
   const log = document.getElementById('log');
   const caption = document.getElementById('caption');
@@ -666,11 +1069,16 @@
   let recorder = null;
   let chunks = [];
   let busy = false;
+  let micPending = false;
+  let resumeCleanup = null;
   let audioCtx = null;
   let primedAudio = null;
   let currentAudio = null;    // <audio>-based (non-streaming) playback in flight
   let currentBlobUrl = null;
   let streamPlayback = null;  // WebAudio streaming playback in flight
+
+  // Bridge-mode detection (used for input routing)
+  const isBridgeMode = () => window.matchMedia('(min-width: 761px)').matches;
 
   // Streamed PCM playback needs fetch body streams + WebAudio; ask the server
   // for a plain WAV when either is missing.
@@ -718,10 +1126,88 @@
     setTimeout(() => eye.classList.remove('denied'), 1000);
   }
 
+  // ═══════════════════════════════════════════════════
+  // Mission Log — persistent scrolling transcript
+  // ═══════════════════════════════════════════════════
+  const mlogEntries = document.getElementById('mlog-entries');
+
+  function mlogTimestamp() {
+    const d = new Date();
+    return String(d.getHours()).padStart(2, '0') + ':' +
+           String(d.getMinutes()).padStart(2, '0');
+  }
+
+  function appendToMissionLog(type, text, extra) {
+    if (!mlogEntries) return;
+    const el = document.createElement('div');
+    el.className = 'mlog-entry';
+    const ts = '<span class="mlog-ts">' + mlogTimestamp() + '</span>';
+
+    if (type === 'user') {
+      el.className += ' mlog-user';
+      el.innerHTML = ts + '<span class="mlog-role">You</span>  ' + escapeHtml(text);
+    } else if (type === 'hal') {
+      el.className += ' mlog-hal';
+      el.innerHTML = ts + '<span class="mlog-role">HAL</span>  ' + escapeHtml(text);
+    } else if (type === 'tool') {
+      const status = extra || '';
+      const icon = status === 'completed' ? '✓' : status === 'failed' ? '✗' : status === 'denied' ? '⊘' : '⚡';
+      const cls = status === 'completed' ? ' done' : status === 'failed' ? ' failed' : status === 'denied' ? ' denied' : '';
+      el.className += ' mlog-tool' + cls;
+      el.innerHTML = ts + '<span class="mlog-tool-icon">' + icon + '</span> ' + escapeHtml(text);
+    } else {
+      el.className += ' mlog-system';
+      el.innerHTML = ts + escapeHtml(text);
+    }
+
+    mlogEntries.appendChild(el);
+    // Auto-scroll if user is near the bottom
+    const isNearBottom = mlogEntries.scrollHeight - mlogEntries.scrollTop - mlogEntries.clientHeight < 80;
+    if (isNearBottom) {
+      mlogEntries.scrollTop = mlogEntries.scrollHeight;
+    }
+  }
+
+  // Clear mission log
+  document.getElementById('mlog-clear')?.addEventListener('click', () => {
+    mlogEntries.innerHTML = '';
+    appendToMissionLog('system', 'Log cleared.');
+  });
+
+  // New session from mission log header
+  document.getElementById('mlog-reset')?.addEventListener('click', () => {
+    resetSession();
+  });
+
+  // Load existing history into mission log on page load
+  async function loadHistoryIntoLog() {
+    try {
+      const res = await fetch('/api/history');
+      const data = await res.json();
+      if (data.history && data.history.length) {
+        data.history.forEach(m => {
+          appendToMissionLog(m.role === 'user' ? 'user' : 'hal', m.content);
+        });
+      } else {
+        appendToMissionLog('system', 'Session started. Hold the eye to speak, or type below.');
+      }
+    } catch (e) {
+      appendToMissionLog('system', 'Session started.');
+    }
+  }
+  loadHistoryIntoLog();
+
+  // ═══════════════════════════════════════════════════
+  // Log + Caption (preserved, extended for mission log)
+  // ═══════════════════════════════════════════════════
   function updateLog(userText, halText) {
+    // Mobile log (original behavior)
     log.innerHTML =
       '<div class="you">You: ' + escapeHtml(userText || '—') + '</div>' +
       '<div class="hal">HAL: ' + escapeHtml(halText || '—') + '</div>';
+    // Mission log (new)
+    if (userText) appendToMissionLog('user', userText);
+    if (halText) appendToMissionLog('hal', halText);
   }
 
   function escapeHtml(s) {
@@ -755,29 +1241,182 @@
     tickerTimer = setTimeout(() => ticker.classList.remove('show'), 2500);
   }
 
-  // Live tool-call/permission event stream — powers the diegetic eye tint
-  // and the ticker. The hal_session cookie is set on page load (GET /), so
-  // this is safe to open unconditionally.
-  const events = new EventSource('/api/events');
-  events.onmessage = (e) => {
-    if (!e.data) return;
-    let msg;
-    try { msg = JSON.parse(e.data); } catch (err) { return; }
-    if (msg.type === 'tool_call' || msg.type === 'tool_call_update') {
-      showTicker(msg.title, msg.status);
-      if (msg.status === 'completed' || msg.status === 'failed') {
-        setToolKind(null);
-      } else {
-        setToolKind(msg.kind);
+  // ═══════════════════════════════════════════════════
+  // SSE — tool events (extended for mission log)
+  // ═══════════════════════════════════════════════════
+  let events = null;
+  function connectSSE() {
+    events = new EventSource('/api/events');
+    events.onmessage = (e) => {
+      if (!e.data) return;
+      let msg;
+      try { msg = JSON.parse(e.data); } catch (err) { return; }
+      if (msg.type === 'tool_call' || msg.type === 'tool_call_update') {
+        showTicker(msg.title, msg.status);
+        // Append to mission log
+        if (msg.title) {
+          appendToMissionLog('tool', msg.title, msg.status);
+        }
+        if (msg.status === 'completed' || msg.status === 'failed') {
+          setToolKind(null);
+        } else {
+          setToolKind(msg.kind);
+        }
+      } else if (msg.type === 'permission_denied') {
+        showTicker(msg.title, 'failed');
+        appendToMissionLog('tool', (msg.title || 'a tool') + ' — permission denied', 'denied');
+        flashDenied();
+      } else if (msg.type === 'mission_update') {
+        const m = msg.mission;
+        const shortId = m.id.substring(0, 6);
+        const statusText = m.status === 'active' ? 'running' : m.status;
+        appendToMissionLog('system', `Mission [${shortId}] "${m.title}": ${statusText}`);
       }
-    } else if (msg.type === 'permission_denied') {
-      showTicker(msg.title, 'failed');
-      flashDenied();
-    }
-  };
+    };
+    events.onerror = () => {
+      if (events.readyState === EventSource.CLOSED) {
+        setTimeout(connectSSE, 5000);
+      }
+    };
+  }
+  connectSSE();
 
+  // ═══════════════════════════════════════════════════
+  // Waveform — WebAudio oscilloscope visualization
+  // ═══════════════════════════════════════════════════
+  const wfCanvas = document.getElementById('waveform');
+  let wfCtx = null;
+  let wfAnalyser = null;
+  let wfAnimId = null;
+  let wfSource = null;
+  let wfDataArray = null;
+
+  function initWaveform() {
+    if (!wfCanvas) return;
+    wfCtx = wfCanvas.getContext('2d');
+    // Set canvas resolution to match display
+    const rect = wfCanvas.getBoundingClientRect();
+    wfCanvas.width = rect.width * (window.devicePixelRatio || 1);
+    wfCanvas.height = rect.height * (window.devicePixelRatio || 1);
+    drawWaveformIdle();
+  }
+
+  function drawWaveformIdle() {
+    if (!wfCtx) return;
+    const w = wfCanvas.width, h = wfCanvas.height;
+    wfCtx.clearRect(0, 0, w, h);
+    wfCtx.strokeStyle = '#1a0a08';
+    wfCtx.lineWidth = 1;
+    wfCtx.beginPath();
+    wfCtx.moveTo(0, h / 2);
+    wfCtx.lineTo(w, h / 2);
+    wfCtx.stroke();
+  }
+
+  function startWaveformMic(stream) {
+    if (!audioCtx || !wfCanvas) return;
+    try {
+      wfAnalyser = audioCtx.createAnalyser();
+      wfAnalyser.fftSize = 256;
+      wfSource = audioCtx.createMediaStreamSource(stream);
+      wfSource.connect(wfAnalyser);
+      wfDataArray = new Uint8Array(wfAnalyser.frequencyBinCount);
+      drawWaveformLoop();
+    } catch (e) {}
+  }
+
+  function stopWaveform() {
+    if (wfAnimId) { cancelAnimationFrame(wfAnimId); wfAnimId = null; }
+    if (wfSource) { try { wfSource.disconnect(); } catch (e) {} wfSource = null; }
+    wfAnalyser = null;
+    wfDataArray = null;
+    drawWaveformIdle();
+  }
+
+  function drawWaveformLoop() {
+    if (!wfAnalyser || !wfCtx) return;
+    wfAnimId = requestAnimationFrame(drawWaveformLoop);
+    wfAnalyser.getByteTimeDomainData(wfDataArray);
+
+    const w = wfCanvas.width, h = wfCanvas.height;
+    wfCtx.clearRect(0, 0, w, h);
+
+    // Draw center line
+    wfCtx.strokeStyle = '#0a0504';
+    wfCtx.lineWidth = 1;
+    wfCtx.beginPath();
+    wfCtx.moveTo(0, h / 2);
+    wfCtx.lineTo(w, h / 2);
+    wfCtx.stroke();
+
+    // Draw waveform
+    wfCtx.strokeStyle = '#ff2a1a';
+    wfCtx.lineWidth = 1.5;
+    wfCtx.shadowColor = 'rgba(255, 42, 26, 0.4)';
+    wfCtx.shadowBlur = 4;
+    wfCtx.beginPath();
+    const sliceWidth = w / wfDataArray.length;
+    let x = 0;
+    for (let i = 0; i < wfDataArray.length; i++) {
+      const v = wfDataArray[i] / 128.0;
+      const y = (v * h) / 2;
+      if (i === 0) wfCtx.moveTo(x, y);
+      else wfCtx.lineTo(x, y);
+      x += sliceWidth;
+    }
+    wfCtx.lineTo(w, h / 2);
+    wfCtx.stroke();
+    wfCtx.shadowBlur = 0;
+  }
+
+  // Init waveform when visible
+  if (window.matchMedia('(min-width: 1101px)').matches) {
+    // Defer to ensure layout is settled
+    requestAnimationFrame(initWaveform);
+  }
+  window.matchMedia('(min-width: 1101px)').addEventListener('change', (e) => {
+    if (e.matches) requestAnimationFrame(initWaveform);
+    else stopWaveform();
+  });
+
+  // ═══════════════════════════════════════════════════
+  // Telemetry — auto-refreshing HUD
+  // ═══════════════════════════════════════════════════
+  function formatUptime(seconds) {
+    if (!Number.isFinite(seconds)) return '—';
+    const mins = Math.floor(seconds / 60);
+    const hrs = Math.floor(mins / 60);
+    if (hrs > 0) return hrs + 'h ' + (mins % 60) + 'm';
+    return mins + 'm';
+  }
+
+  async function refreshTelemetry() {
+    try {
+      const res = await fetch('/api/status');
+      const d = await res.json();
+      const dot = document.getElementById('telem-bridge-dot');
+      const alive = d.bridge && d.bridge.alive;
+      if (dot) {
+        dot.classList.toggle('ok', !!alive);
+        dot.classList.toggle('bad', !alive);
+      }
+      const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val || '—'; };
+      setText('telem-bridge', (d.bridge_mode || '—').toUpperCase());
+      setText('telem-stt', d.stt_model || '—');
+      setText('telem-voice', d.voice || '—');
+      setText('telem-yolo', d.yolo ? 'YOLO' : 'Permissioned');
+      setText('telem-uptime', formatUptime(d.uptime_seconds));
+    } catch (e) {}
+  }
+  refreshTelemetry();
+  setInterval(refreshTelemetry, 30000);
+
+  // ═══════════════════════════════════════════════════
+  // Turn lifecycle (preserved from original)
+  // ═══════════════════════════════════════════════════
   function turnDone() {
     setState('idle');
+    stopWaveform();
     busy = false;
   }
 
@@ -803,6 +1442,7 @@
       streamPlayback = null;
       stopped = true;
     }
+    if (resumeCleanup) { resumeCleanup(); resumeCleanup = null; }
     return stopped;
   }
 
@@ -890,6 +1530,7 @@
     const audioBlob = await res.blob();
     const url = URL.createObjectURL(audioBlob);
     const audio = primedAudio || new Audio();
+    if (primedAudio) primedAudio = null;  // consume; create fresh elements for later turns
     audio.muted = false;
     audio.playsInline = true;
     audio.setAttribute('playsinline', '');
@@ -915,10 +1556,15 @@
       const resume = async () => {
         eye.removeEventListener('touchend', resume);
         eye.removeEventListener('click', resume);
+        resumeCleanup = null;
         try { await audio.play(); } catch (e) { finish(); }
       };
       eye.addEventListener('touchend', resume, { once: true });
       eye.addEventListener('click', resume, { once: true });
+      resumeCleanup = () => {
+        eye.removeEventListener('touchend', resume);
+        eye.removeEventListener('click', resume);
+      };
     }
   }
 
@@ -956,8 +1602,14 @@
         return;
       }
     }
+    micPending = true;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!micPending) {
+        // stopAndSend fired while getUserMedia was pending — release the mic
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
       recorder = new MediaRecorder(stream);
       chunks = [];
       recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
@@ -968,17 +1620,193 @@
         stopAndSend();
       }, MAX_RECORD_MS);
       setState('listening');
+      // Start waveform visualization with the mic stream
+      startWaveformMic(stream);
     } catch (err) {
       console.error('mic error', err);
       showCaption("I can't hear you, Dave. Microphone access is blocked.", { isError: true });
       setState('idle');
+    } finally {
+      micPending = false;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════
+  // Phase 2: Full-Duplex WebSocket
+  // ═══════════════════════════════════════════════════
+  let ws = null;
+  let wsSampleRate = 22050;
+  let wsNextTime = 0;
+  let wsStarted = false;
+
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws/conversation`);
+    
+    ws.onmessage = async (e) => {
+      if (typeof e.data === 'string') {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'transcript') {
+          updateLog(msg.role === 'user' ? msg.text : null, msg.role === 'hal' ? msg.text : null);
+          showCaption(msg.text);
+          if (msg.role === 'hal') {
+            setState('speaking');
+          }
+        } else if (msg.type === 'tts_start') {
+           wsSampleRate = msg.sample_rate || 22050;
+           wsNextTime = 0;
+           wsStarted = false;
+        } else if (msg.type === 'tts_done') {
+           turnDone();
+        }
+      } else {
+        await playWsChunk(e.data);
+      }
+    };
+    ws.onclose = () => setTimeout(connectWS, 2000);
+  }
+  connectWS();
+
+  async function playWsChunk(blob) {
+    primePlayback();
+    const ctx = audioCtx;
+    if (ctx.state === 'suspended') await ctx.resume();
+    
+    const arrayBuffer = await blob.arrayBuffer();
+    const ints = new Int16Array(arrayBuffer);
+    const buf = ctx.createBuffer(1, ints.length, wsSampleRate);
+    const floats = buf.getChannelData(0);
+    for (let i = 0; i < ints.length; i++) floats[i] = ints[i] / 32768;
+    
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    
+    if (!streamPlayback) streamPlayback = { sources: new Set(), cancelled: false };
+    streamPlayback.sources.add(src);
+    src.onended = () => streamPlayback.sources.delete(src);
+    
+    if (wsNextTime < ctx.currentTime + 0.02) wsNextTime = ctx.currentTime + 0.05;
+    src.start(wsNextTime);
+    wsNextTime += buf.duration;
+    
+    if (!wsStarted) {
+      wsStarted = true;
+      setState('speaking');
+    }
+  }
+
+  let vadMicStream = null;
+  let vadRecorder = null;
+  let vadSilenceFrames = 0;
+  let isWsRecording = false;
+  let duplexEnabled = false;
+  
+  const btnDuplex = document.getElementById('mlog-duplex');
+  btnDuplex?.addEventListener('click', async () => {
+    duplexEnabled = !duplexEnabled;
+    btnDuplex.textContent = `Duplex: ${duplexEnabled ? 'ON' : 'OFF'}`;
+    btnDuplex.style.color = duplexEnabled ? '#ff2a1a' : '';
+    
+    if (duplexEnabled) {
+      await enableFullDuplex();
+    } else {
+      if (vadMicStream) {
+        vadMicStream.getTracks().forEach(t => t.stop());
+        vadMicStream = null;
+      }
+      appendToMissionLog('system', 'Duplex mode disabled.');
+    }
+  });
+
+  async function enableFullDuplex() {
+    try {
+      vadMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      
+      vadAnalyser = audioCtx.createAnalyser();
+      vadAnalyser.fftSize = 512;
+      const source = audioCtx.createMediaStreamSource(vadMicStream);
+      source.connect(vadAnalyser);
+      vadDataArray = new Uint8Array(vadAnalyser.frequencyBinCount);
+      
+      startWaveformMic(vadMicStream);
+      requestAnimationFrame(vadLoop);
+      
+      appendToMissionLog('system', 'Full-duplex mode active. Mic is hot.');
+    } catch (e) {
+      showCaption("Microphone access denied for full-duplex.", { isError: true });
+      duplexEnabled = false;
+      btnDuplex.textContent = 'Duplex: OFF';
+    }
+  }
+
+  function vadLoop() {
+    if (!duplexEnabled || !vadAnalyser) return;
+    requestAnimationFrame(vadLoop);
+    
+    vadAnalyser.getByteFrequencyData(vadDataArray);
+    let sum = 0;
+    for (let i = 0; i < vadDataArray.length; i++) sum += vadDataArray[i];
+    let avg = sum / vadDataArray.length;
+    
+    const THRESHOLD = 15; 
+    if (avg > THRESHOLD) {
+      vadSilenceFrames = 0;
+      if (!isWsRecording && ws && ws.readyState === WebSocket.OPEN && !busy) {
+        startWsRecording();
+      }
+    } else {
+      if (isWsRecording) {
+        vadSilenceFrames++;
+        if (vadSilenceFrames > 60) { 
+          stopWsRecording();
+        }
+      }
+    }
+  }
+
+  function startWsRecording() {
+    if (eye.classList.contains('speaking') && stopSpeaking()) {
+       // Barge-in
+       busy = false;
+    }
+    isWsRecording = true;
+    busy = true;
+    setState('listening');
+    ws.send(JSON.stringify({ type: 'start_speech' }));
+    
+    vadRecorder = new MediaRecorder(vadMicStream, { mimeType: 'audio/webm' });
+    vadRecorder.ondataavailable = e => {
+      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN && isWsRecording) {
+        ws.send(e.data);
+      }
+    };
+    vadRecorder.start(250); 
+  }
+
+  function stopWsRecording() {
+    isWsRecording = false;
+    if (vadRecorder && vadRecorder.state === 'recording') {
+      vadRecorder.onstop = () => {
+         ws.send(JSON.stringify({ type: 'end_speech' }));
+         setState('thinking');
+         startThinkingTimer();
+      };
+      vadRecorder.stop();
+    } else {
+      ws.send(JSON.stringify({ type: 'end_speech' }));
+      setState('thinking');
+      startThinkingTimer();
     }
   }
 
   async function stopAndSend() {
     clearTimeout(recordTimer);
+    micPending = false;
     if (!recorder || recorder.state !== 'recording') return;
     busy = true;
+    stopWaveform();
     await new Promise(resolve => {
       recorder.onstop = resolve;
       recorder.stop();
@@ -1010,6 +1838,7 @@
   }
 
   // Typed input path — same turn pipeline as the mic, minus the microphone.
+  // Typed input path
   async function sendTyped(text) {
     if (busy) {
       if (eye.classList.contains('speaking') && stopSpeaking()) {
@@ -1023,6 +1852,13 @@
     primePlayback();
     setState('thinking');
     startThinkingTimer();
+
+    // Route through WebSocket if available (handles /mission natively)
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'text_input', text: text }));
+      return;
+    }
+
     try {
       const res = await fetch('/api/say' + (supportsStreaming ? '?stream=1' : ''), {
         method: 'POST',
@@ -1040,6 +1876,9 @@
     }
   }
 
+  // ═══════════════════════════════════════════════════
+  // Push-to-talk: eye mouse/touch + spacebar
+  // ═══════════════════════════════════════════════════
   eye.addEventListener('mousedown', e => { e.preventDefault(); primePlayback(); startRecording(); });
   eye.addEventListener('mouseup', e => { e.preventDefault(); stopAndSend(); });
   eye.addEventListener('mouseleave', () => { if (recorder && recorder.state === 'recording') stopAndSend(); });
@@ -1049,8 +1888,7 @@
   eye.addEventListener('contextmenu', e => e.preventDefault());
 
   // Keyboard push-to-talk: hold the space bar. Skipped while the drawer is
-  // open, while typing in the command line, or when a button has focus
-  // (space would activate it).
+  // open, while typing in an input, or when a button has focus.
   function typingTarget(e) {
     return e.target && (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT');
   }
@@ -1067,24 +1905,43 @@
     stopAndSend();
   });
 
-  // Typed command line — "/" opens it, Enter sends, Escape closes.
+  // ═══════════════════════════════════════════════════
+  // Typed input — mobile cmdline + desktop bridge input
+  // ═══════════════════════════════════════════════════
   const cmdline = document.getElementById('cmdline');
   const cmdInput = document.getElementById('cmd-input');
+  const bridgeForm = document.getElementById('bridge-form');
+  const bridgeCmd = document.getElementById('bridge-cmd');
+
   function openCmdline() {
-    cmdline.classList.add('open');
-    cmdInput.focus();
+    if (isBridgeMode()) {
+      // On tablet/desktop, focus the always-visible input
+      bridgeCmd.focus();
+    } else {
+      cmdline.classList.add('open');
+      cmdInput.focus();
+    }
   }
   function closeCmdline() {
     cmdline.classList.remove('open');
     cmdInput.value = '';
     cmdInput.blur();
   }
+  // Mobile cmdline submit
   cmdline.addEventListener('submit', (e) => {
     e.preventDefault();
     const text = cmdInput.value.trim();
     closeCmdline();
     if (text) sendTyped(text);
   });
+  // Desktop bridge input submit
+  bridgeForm?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = bridgeCmd.value.trim();
+    bridgeCmd.value = '';
+    if (text) sendTyped(text);
+  });
+
   window.addEventListener('keydown', (e) => {
     if (e.key === '/' && !typingTarget(e) && !drawer.classList.contains('open')) {
       e.preventDefault();
@@ -1092,7 +1949,9 @@
     }
   });
 
-  // Hidden monitor drawer - status, CLI surfaces, and scrollback.
+  // ═══════════════════════════════════════════════════
+  // Systems drawer (preserved from original)
+  // ═══════════════════════════════════════════════════
   const monitorTab = document.getElementById('monitor-tab');
   const drawer = document.getElementById('drawer');
   const drawerClose = document.getElementById('drawer-close');
@@ -1104,14 +1963,6 @@
   function shortId(id) {
     if (!id) return '(none)';
     return id.length > 18 ? id.slice(0, 10) + '…' + id.slice(-6) : id;
-  }
-
-  function formatUptime(seconds) {
-    if (!Number.isFinite(seconds)) return '(unknown)';
-    const mins = Math.floor(seconds / 60);
-    const hrs = Math.floor(mins / 60);
-    if (hrs > 0) return hrs + 'h ' + (mins % 60) + 'm';
-    return mins + 'm';
   }
 
   function stat(label, value) {
