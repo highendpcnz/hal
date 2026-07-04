@@ -121,9 +121,9 @@ launchctl load ~/Library/LaunchAgents/com.hal9000.frontend.plist
 
 ## Vestigial files from the original Space
 
-`Dockerfile`, `download_model.py`, `.env.example`, `profile.md`, and
-`hal_prompt.py` are no longer used by this fork (persona and user context now
-live in `AGENTS.md`). They are kept for reference / upstream diffing.
+`Dockerfile`, `download_model.py`, `.env.example`, and `hal_prompt.py` are no
+longer used by this fork (persona and user context now live in `AGENTS.md`).
+They are kept for reference / upstream diffing.
 
 ## Notes
 

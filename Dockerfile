@@ -17,7 +17,6 @@ RUN python download_model.py
 
 COPY hal_prompt.py main.py ./
 COPY static/ ./static/
-COPY profile.md ./
 
 RUN mkdir -p /app/data && chown -R hal:hal /app
 USER hal

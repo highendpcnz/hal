@@ -34,7 +34,7 @@ Both modes maintain a cookie-session → hermes-session-id map persisted in `HAL
 
 **`static/index.html`** — single-file frontend: the breathing/eye UI, push-to-talk recorder, and SSE client for tool-call events. No build step or framework.
 
-**Vestigial files** (kept for reference/upstream diffing only, not used by the running app): `Dockerfile`, `download_model.py`, `.env.example`, `profile.md`, `hal_prompt.py`. These belong to the original cloud-API-based HF Space this was forked from — don't wire them back in without deliberately reintroducing that dependency.
+**Vestigial files** (kept for reference/upstream diffing only, not used by the running app): `Dockerfile`, `download_model.py`, `.env.example`, `hal_prompt.py`. These belong to the original cloud-API-based HF Space this was forked from — don't wire them back in without deliberately reintroducing that dependency.
 
 ## Key environment variables
 
