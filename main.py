@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import wave
@@ -38,6 +39,10 @@ VOICE_PATH = Path(
     os.path.expanduser(os.environ.get("HAL_VOICE", "~/.hermes/voices/hal9000/hal9000.onnx"))
 )
 STT_MODEL_NAME = os.environ.get("HAL_STT_MODEL", "base.en")
+STT_BEAM_SIZE = int(os.environ.get("HAL_STT_BEAM", "5"))
+# Skip loading the STT/TTS models — for tests of the pure-python parts only;
+# /api/talk and /api/say will not work.
+SKIP_MODELS = os.environ.get("HAL_SKIP_MODELS", "") == "1"
 # Optional bias prompt for whisper, e.g. "Dave speaking with HAL 9000." —
 # helps it spell HAL/Hermes correctly. Off by default: a bias prompt can make
 # whisper hallucinate text on near-silent recordings.
@@ -84,19 +89,29 @@ def _load_hal_tts_module():
 
 _hal_tts = _load_hal_tts_module() if _HAL_TTS_SCRIPT.exists() else None
 
-print("Loading HAL voice...")
-VOICE = PiperVoice.load(str(VOICE_PATH))
 SYN_CONFIG = SynthesisConfig(
     length_scale=float(os.environ.get("HAL_LENGTH_SCALE", "1.08")),
     noise_scale=float(os.environ.get("HAL_NOISE_SCALE", "0.6")),
     noise_w_scale=float(os.environ.get("HAL_NOISE_W_SCALE", "0.72")),
     normalize_audio=True,
 )
-print("HAL voice loaded")
 
-print(f"Loading STT model ({STT_MODEL_NAME})...")
-STT = WhisperModel(STT_MODEL_NAME, device="cpu", compute_type="int8")
-print("STT model loaded")
+if SKIP_MODELS:
+    VOICE = None
+    STT = None
+else:
+    print("Loading HAL voice...")
+    VOICE = PiperVoice.load(str(VOICE_PATH))
+    print("HAL voice loaded")
+    print(f"Loading STT model ({STT_MODEL_NAME})...")
+    STT = WhisperModel(STT_MODEL_NAME, device="cpu", compute_type="int8")
+    print("STT model loaded")
+
+SAMPLE_RATE = VOICE.config.sample_rate if VOICE is not None else 22050
+
+# Piper phonemizes through espeak-ng, which keeps global state — concurrent
+# synthesis from two turns must be serialized or it can crash/corrupt audio.
+_TTS_LOCK = threading.Lock()
 
 _BOOT_TIME = time.monotonic()
 
@@ -162,7 +177,11 @@ def save_history(session_id: str, history: list[dict]) -> None:
 
 def transcribe(audio_bytes: bytes) -> str:
     segments, _info = STT.transcribe(
-        io.BytesIO(audio_bytes), language="en", vad_filter=True, initial_prompt=STT_PROMPT
+        io.BytesIO(audio_bytes),
+        language="en",
+        vad_filter=True,
+        initial_prompt=STT_PROMPT,
+        beam_size=STT_BEAM_SIZE,
     )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -179,6 +198,8 @@ _MD_PATTERNS = [
     (re.compile(r"\[([^\]]+)\]\([^)]+\)"), r"\1"),
     (re.compile(r"^\s*[-*•]\s+", re.M), ""),
     (re.compile(r"^\s*\d+[.)]\s+", re.M), ""),
+    # Emoji and dingbats — TTS either mangles them or reads their names aloud.
+    (re.compile(r"[\U0001F000-\U0001FAFF☀-➿⬀-⯿️]"), ""),
 ]
 
 
@@ -197,8 +218,9 @@ def speakable(text: str) -> str:
 
 def synthesize_hal(text: str) -> bytes:
     buf = io.BytesIO()
-    with wave.open(buf, "wb") as wav_file:
-        VOICE.synthesize_wav(text, wav_file, syn_config=SYN_CONFIG)
+    with _TTS_LOCK:
+        with wave.open(buf, "wb") as wav_file:
+            VOICE.synthesize_wav(text, wav_file, syn_config=SYN_CONFIG)
     raw = buf.getvalue()
     if _hal_tts is None or not TTS_MASTERING:
         return raw
@@ -215,6 +237,15 @@ def synthesize_hal(text: str) -> bytes:
     return raw
 
 
+def synthesize_hal_stream(text: str):
+    """Yield raw 16-bit mono PCM as Piper finishes each sentence — the browser
+    starts playing after the first sentence instead of the whole reply.
+    Starlette runs this sync generator in its threadpool."""
+    with _TTS_LOCK:
+        for chunk in VOICE.synthesize(text, syn_config=SYN_CONFIG):
+            yield chunk.audio_int16_bytes
+
+
 def _elapsed_ms(start: float) -> int:
     return round((time.perf_counter() - start) * 1000)
 
@@ -226,8 +257,8 @@ def _log_latency(session_id: str, timings: dict[str, int]) -> None:
     print(f"[latency] session={session_id[:8]} {parts}")
 
 
-async def run_turn(session_id: str, user_text: str) -> tuple[str, bytes, dict[str, int]]:
-    turn_start = time.perf_counter()
+async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str, int]]:
+    """Inference + history — everything in a turn except audio synthesis."""
     timings: dict[str, int] = {}
 
     stage_start = time.perf_counter()
@@ -240,6 +271,12 @@ async def run_turn(session_id: str, user_text: str) -> tuple[str, bytes, dict[st
     history.append({"role": "assistant", "content": hal_text})
     save_history(session_id, history[-MAX_HISTORY_TURNS:])
     timings["history"] = _elapsed_ms(stage_start)
+    return hal_text, timings
+
+
+async def run_turn(session_id: str, user_text: str) -> tuple[str, bytes, dict[str, int]]:
+    turn_start = time.perf_counter()
+    hal_text, timings = await run_turn_text(session_id, user_text)
 
     stage_start = time.perf_counter()
     wav = await asyncio.to_thread(synthesize_hal, speakable(hal_text))
@@ -305,15 +342,14 @@ _SYSTEM_SURFACES = {
 }
 
 
-def _turn_response(
+def _apply_turn_headers(
+    resp: Response,
     session_id: str,
     new_session: bool,
     user_text: str,
     hal_text: str,
-    wav: bytes,
-    timings: dict[str, int] | None = None,
+    timings: dict[str, int] | None,
 ) -> Response:
-    resp = Response(content=wav, media_type="audio/wav")
     resp.headers["X-User-Transcript"] = quote(user_text[:MAX_TRANSCRIPT_HEADER_CHARS])
     resp.headers["X-Hal-Transcript"] = quote(hal_text[:MAX_TRANSCRIPT_HEADER_CHARS])
     if timings:
@@ -324,6 +360,33 @@ def _turn_response(
     if new_session:
         _set_session_cookie(resp, session_id)
     return resp
+
+
+def _turn_response(
+    session_id: str,
+    new_session: bool,
+    user_text: str,
+    hal_text: str,
+    wav: bytes,
+    timings: dict[str, int] | None = None,
+) -> Response:
+    resp = Response(content=wav, media_type="audio/wav")
+    return _apply_turn_headers(resp, session_id, new_session, user_text, hal_text, timings)
+
+
+def _stream_turn_response(
+    session_id: str,
+    new_session: bool,
+    user_text: str,
+    hal_text: str,
+    timings: dict[str, int] | None = None,
+) -> Response:
+    """Headers go out immediately; PCM chunks follow as sentences synthesize."""
+    resp = StreamingResponse(
+        synthesize_hal_stream(speakable(hal_text)), media_type="audio/L16"
+    )
+    resp.headers["X-Hal-Sample-Rate"] = str(SAMPLE_RATE)
+    return _apply_turn_headers(resp, session_id, new_session, user_text, hal_text, timings)
 
 
 @app.get("/")
@@ -437,7 +500,7 @@ def history(request: Request):
 
 
 @app.post("/api/talk")
-async def talk(request: Request, audio: UploadFile = File(...)):
+async def talk(request: Request, audio: UploadFile = File(...), stream: int = 0):
     total_start = time.perf_counter()
     timings: dict[str, int] = {}
     session_id, new_session = _session_from_request(request)
@@ -462,6 +525,13 @@ async def talk(request: Request, audio: UploadFile = File(...)):
             _set_session_cookie(resp, session_id)
         return resp
 
+    if stream:
+        hal_text, turn_timings = await run_turn_text(session_id, user_text)
+        timings.update(turn_timings)
+        timings["total"] = _elapsed_ms(total_start)
+        _log_latency(session_id, timings)
+        return _stream_turn_response(session_id, new_session, user_text, hal_text, timings)
+
     hal_text, wav, turn_timings = await run_turn(session_id, user_text)
     timings.update(turn_timings)
     timings["total"] = _elapsed_ms(total_start)
@@ -474,7 +544,7 @@ class SayRequest(BaseModel):
 
 
 @app.post("/api/say")
-async def say(request: Request, body: SayRequest):
+async def say(request: Request, body: SayRequest, stream: int = 0):
     """Text-in, voice-out — same pipeline as /api/talk minus the microphone."""
     total_start = time.perf_counter()
     session_id, new_session = _session_from_request(request)
@@ -485,6 +555,12 @@ async def say(request: Request, body: SayRequest):
         if new_session:
             _set_session_cookie(resp, session_id)
         return resp
+
+    if stream:
+        hal_text, timings = await run_turn_text(session_id, user_text)
+        timings["total"] = _elapsed_ms(total_start)
+        _log_latency(session_id, timings)
+        return _stream_turn_response(session_id, new_session, user_text, hal_text, timings)
 
     hal_text, wav, timings = await run_turn(session_id, user_text)
     timings["total"] = _elapsed_ms(total_start)

@@ -355,6 +355,12 @@ class ACPBridge:
             self._acp = _load_acp()
         m = self._acp
         log_path = (_data_dir or Path(".")) / "acp.log"
+        try:
+            # Append-mode forever otherwise; one rotation generation is enough.
+            if log_path.stat().st_size > 5 * 1024 * 1024:
+                log_path.replace(log_path.with_suffix(".log.1"))
+        except OSError:
+            pass
         log_file = open(log_path, "ab", buffering=0)
         self._client = _HALClient(m)
         self._stack = AsyncExitStack()
