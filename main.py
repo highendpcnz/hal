@@ -296,13 +296,45 @@ def _log_latency(session_id: str, timings: dict[str, int]) -> None:
     print(f"[latency] session={session_id[:8]} {parts}")
 
 
+# Spoken mission trigger, e.g. "HAL, start mission tidy the downloads folder."
+_MISSION_VOICE_RE = re.compile(r"^\s*hal[,.]?\s+start\s+mission[,:]?\s*(.*)$", re.I)
+
+
+def _mission_request(user_text: str) -> str | None:
+    """Return the mission title if the utterance starts one, else None.
+
+    Typed form: "/mission <title>". Spoken form: "HAL, start mission <title>".
+    An empty title means the trigger fired but no mission can be created.
+    """
+    if user_text == "/mission" or user_text.startswith("/mission "):
+        return user_text[len("/mission"):].strip()
+    match = _MISSION_VOICE_RE.match(user_text)
+    if match is not None:
+        return match.group(1).strip().rstrip(".!?")
+    return None
+
+
 async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str, int]]:
-    """Inference + history — everything in a turn except audio synthesis."""
+    """Inference + history — everything in a turn except audio synthesis.
+    Mission triggers are parsed here so every transport honors them."""
     timings: dict[str, int] = {}
 
-    stage_start = time.perf_counter()
-    hal_text = await ask_hermes(user_text, session_id)
-    timings["infer"] = _elapsed_ms(stage_start)
+    mission_title = _mission_request(user_text)
+    if mission_title is not None:
+        if mission_title:
+            mission_control.manager.create_mission(
+                session_id, mission_title, f"Execute mission: {mission_title}"
+            )
+            hal_text = (
+                f"I've started the mission: {mission_title}. "
+                "I will let you know when it is done."
+            )
+        else:
+            hal_text = "I need a mission title, Dave. Tell me what the mission is."
+    else:
+        stage_start = time.perf_counter()
+        hal_text = await ask_hermes(user_text, session_id)
+        timings["infer"] = _elapsed_ms(stage_start)
 
     stage_start = time.perf_counter()
     history = load_history(session_id)
@@ -639,24 +671,6 @@ def reset_session(request: Request):
 # older one; the older socket's cleanup must not evict its replacement.
 active_websockets: dict[str, WebSocket] = {}
 
-# Spoken mission trigger, e.g. "HAL, start mission tidy the downloads folder."
-_MISSION_VOICE_RE = re.compile(r"^\s*hal[,.]?\s+start\s+mission[,:]?\s*(.*)$", re.I)
-
-
-def _mission_request(user_text: str) -> str | None:
-    """Return the mission title if the utterance starts one, else None.
-
-    Typed form: "/mission <title>". Spoken form: "HAL, start mission <title>".
-    An empty title means the trigger fired but no mission can be created.
-    """
-    if user_text == "/mission" or user_text.startswith("/mission "):
-        return user_text[len("/mission"):].strip()
-    match = _MISSION_VOICE_RE.match(user_text)
-    if match is not None:
-        return match.group(1).strip().rstrip(".!?")
-    return None
-
-
 async def _ws_send_tts(websocket: WebSocket, text: str) -> None:
     """Speak one reply over the socket: tts_start, PCM frames, tts_done."""
     await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
@@ -672,28 +686,7 @@ async def _ws_abort_turn(websocket: WebSocket, reason: str, text: str) -> None:
 
 async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) -> None:
     await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
-
-    mission_title = _mission_request(user_text)
-    if mission_title is None:
-        hal_text, _timings = await run_turn_text(session_id, user_text)
-    else:
-        if mission_title:
-            mission_control.manager.create_mission(
-                session_id, mission_title, f"Execute mission: {mission_title}"
-            )
-            hal_text = (
-                f"I've started the mission: {mission_title}. "
-                "I will let you know when it is done."
-            )
-        else:
-            hal_text = "I need a mission title, Dave. Tell me what the mission is."
-        # run_turn_text records normal turns in the scrollback; mission
-        # trigger turns belong there too.
-        history = load_history(session_id)
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "assistant", "content": hal_text})
-        save_history(session_id, history[-MAX_HISTORY_TURNS:])
-
+    hal_text, _timings = await run_turn_text(session_id, user_text)
     await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
     await _ws_send_tts(websocket, hal_text)
 
