@@ -1,0 +1,25 @@
+#!/bin/zsh
+# Launch the HAL 9000 web frontend for Hermes Agent.
+# Runs inside the Hermes venv — no separate environment needed.
+set -euo pipefail
+
+APP_DIR="${0:a:h}"
+HERMES_VENV="${HAL_HERMES_VENV:-$HOME/hermes-agent/.venv}"
+PORT="${HAL_PORT:-8000}"
+HOST="${HAL_HOST:-127.0.0.1}"
+
+# Fail fast if the port is taken — before loading two ML models and an agent.
+if curl -sf "http://$HOST:$PORT/api/health" >/dev/null 2>&1; then
+  echo "HAL is already running at http://$HOST:$PORT" >&2
+  exit 0
+fi
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port $PORT is in use by another process (not HAL)." >&2
+  echo "Pick a different port: HAL_PORT=8001 $0" >&2
+  exit 1
+fi
+
+exec "$HERMES_VENV/bin/uvicorn" main:app \
+  --app-dir "$APP_DIR" \
+  --host "$HOST" \
+  --port "$PORT"
