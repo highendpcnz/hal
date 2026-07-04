@@ -3,6 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#000000" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="HAL" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23180404'/%3E%3Ccircle cx='32' cy='32' r='17' fill='%23ff2a1a'/%3E%3Ccircle cx='26' cy='26' r='5' fill='%23fff2ee'/%3E%3C/svg%3E" />
 <title>HAL</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -297,6 +302,32 @@
     text-transform: uppercase;
   }
 
+  /* Typed command line — "/" to open, Enter sends through /api/say. */
+  .cmdline {
+    position: fixed;
+    bottom: 56px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(520px, 86vw);
+    display: none;
+  }
+  .cmdline.open { display: block; }
+  .cmdline input {
+    width: 100%;
+    background: rgba(8, 2, 2, 0.85);
+    border: 1px solid #2a1210;
+    border-radius: 999px;
+    color: #b84b3b;
+    font: inherit;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    padding: 10px 16px;
+    text-align: center;
+    outline: none;
+  }
+  .cmdline input::placeholder { color: #4a2a26; }
+  .cmdline input:focus { border-color: #4a1710; }
+
   /* Care Captions — fading, closed-caption-style feedback for the latest
      exchange and for failures that were previously silent. */
   .caption {
@@ -547,7 +578,11 @@
   <div id="log" class="log"></div>
   <div id="caption" class="caption" aria-live="polite"></div>
   <div id="ticker" class="ticker"></div>
-  <div class="hint">Hold the eye — or the space bar — to speak</div>
+  <div class="hint">Hold the eye — or the space bar — to speak · "/" to type</div>
+  <form id="cmdline" class="cmdline">
+    <input id="cmd-input" type="text" autocomplete="off" spellcheck="false"
+           placeholder="Type to HAL — Enter sends, Esc closes" />
+  </form>
 
   <button id="monitor-tab" class="monitor-tab" aria-label="Show system monitor" title="System monitor">Systems</button>
   <div id="drawer" class="drawer">
@@ -633,6 +668,16 @@
   let busy = false;
   let audioCtx = null;
   let primedAudio = null;
+  let currentAudio = null;    // <audio>-based (non-streaming) playback in flight
+  let currentBlobUrl = null;
+  let streamPlayback = null;  // WebAudio streaming playback in flight
+
+  // Streamed PCM playback needs fetch body streams + WebAudio; ask the server
+  // for a plain WAV when either is missing.
+  const supportsStreaming =
+    !!(window.AudioContext || window.webkitAudioContext) &&
+    typeof ReadableStream === 'function' &&
+    'body' in Response.prototype;
 
   // iOS/Safari require audio playback to be initiated from a user gesture.
   // Prime an <audio> element and an AudioContext on first touch so later
@@ -696,8 +741,10 @@
 
   // Ephemeral tool-call ticker — reuses the ACP tool-call title verbatim.
   let tickerTimer = null;
+  let lastToolTickerAt = 0;
   function showTicker(title, status) {
     if (!title) return;
+    lastToolTickerAt = Date.now();
     const verb = status === 'completed' ? 'done'
       : status === 'failed' ? 'failed'
       : status === 'in_progress' ? 'running'
@@ -729,12 +776,186 @@
     }
   };
 
+  function turnDone() {
+    setState('idle');
+    busy = false;
+  }
+
+  // Stop any in-flight HAL speech (both playback paths). Returns true if
+  // something was actually silenced — the basis for barge-in.
+  function stopSpeaking() {
+    let stopped = false;
+    if (currentAudio) {
+      currentAudio.onended = null;
+      currentAudio.onerror = null;
+      try { currentAudio.pause(); } catch (e) {}
+      currentAudio = null;
+      stopped = true;
+    }
+    if (currentBlobUrl) {
+      URL.revokeObjectURL(currentBlobUrl);
+      currentBlobUrl = null;
+    }
+    if (streamPlayback) {
+      streamPlayback.cancelled = true;
+      try { streamPlayback.reader.cancel(); } catch (e) {}
+      streamPlayback.sources.forEach(s => { try { s.stop(); } catch (e) {} });
+      streamPlayback = null;
+      stopped = true;
+    }
+    return stopped;
+  }
+
+  // Progressive playback of raw 16-bit mono PCM: schedule each network chunk
+  // as an AudioBuffer back-to-back. HAL starts speaking after the first
+  // sentence instead of after the whole reply is synthesized.
+  async function playStreamed(res) {
+    const sampleRate = parseInt(res.headers.get('X-Hal-Sample-Rate') || '22050', 10);
+    primePlayback();
+    const ctx = audioCtx;
+    if (ctx.state === 'suspended') await ctx.resume();
+    const reader = res.body.getReader();
+    const pb = { sources: new Set(), reader, cancelled: false };
+    streamPlayback = pb;
+    let carry = new Uint8Array(0);
+    let nextTime = 0;
+    let started = false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (pb.cancelled) return;
+      if (done) break;
+      let bytes = value;
+      if (carry.length) {
+        const merged = new Uint8Array(carry.length + bytes.length);
+        merged.set(carry);
+        merged.set(bytes, carry.length);
+        bytes = merged;
+      }
+      const usable = bytes.length - (bytes.length % 2);
+      carry = bytes.slice(usable);
+      if (!usable) continue;
+      const aligned = bytes.slice(0, usable);  // fresh copy => aligned buffer
+      const ints = new Int16Array(aligned.buffer);
+      const buf = ctx.createBuffer(1, ints.length, sampleRate);
+      const floats = buf.getChannelData(0);
+      for (let i = 0; i < ints.length; i++) floats[i] = ints[i] / 32768;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      pb.sources.add(src);
+      src.onended = () => pb.sources.delete(src);
+      if (nextTime < ctx.currentTime + 0.02) nextTime = ctx.currentTime + 0.05;
+      src.start(nextTime);
+      nextTime += buf.duration;
+      if (!started) {
+        started = true;
+        setState('speaking');
+      }
+    }
+    while (!pb.cancelled && ctx.currentTime < nextTime) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (pb.cancelled) return;  // barge-in already reset state
+    streamPlayback = null;
+    turnDone();
+  }
+
+  // Shared response handling for both the mic (/api/talk) and typed
+  // (/api/say) paths.
+  async function handleReply(res) {
+    if (res.status === 204) {
+      showCaption("I didn't quite catch that, Dave.");
+      turnDone();
+      return;
+    }
+    if (!res.ok) {
+      console.error('server error', res.status, await res.text());
+      showCaption(res.status === 413
+        ? "That recording was too long for me, Dave."
+        : "Something went wrong on my end, Dave.", { isError: true });
+      turnDone();
+      return;
+    }
+
+    const userText = decodeURIComponent(res.headers.get('X-User-Transcript') || '');
+    const halText = decodeURIComponent(res.headers.get('X-Hal-Transcript') || '');
+    updateLog(userText, halText);
+    showCaption(halText);
+
+    if ((res.headers.get('content-type') || '').includes('audio/L16')) {
+      await playStreamed(res);
+      return;
+    }
+
+    const audioBlob = await res.blob();
+    const url = URL.createObjectURL(audioBlob);
+    const audio = primedAudio || new Audio();
+    audio.muted = false;
+    audio.playsInline = true;
+    audio.setAttribute('playsinline', '');
+    audio.src = url;
+    currentAudio = audio;
+    currentBlobUrl = url;
+    const finish = () => {
+      if (currentAudio === audio) currentAudio = null;
+      if (currentBlobUrl === url) {
+        URL.revokeObjectURL(url);
+        currentBlobUrl = null;
+      }
+      turnDone();
+    };
+    audio.onended = finish;
+    audio.onerror = finish;
+    setState('speaking');
+    try {
+      await audio.play();
+    } catch (err) {
+      console.error('playback blocked', err);
+      log.innerHTML += '<div class="hal">[tap eye to hear reply]</div>';
+      const resume = async () => {
+        eye.removeEventListener('touchend', resume);
+        eye.removeEventListener('click', resume);
+        try { await audio.play(); } catch (e) { finish(); }
+      };
+      eye.addEventListener('touchend', resume, { once: true });
+      eye.addEventListener('click', resume, { once: true });
+    }
+  }
+
+  // While HAL is thinking with no tool activity, tick the elapsed time so a
+  // long turn doesn't feel dead.
+  let thinkingTimer = null;
+  let thinkingSince = 0;
+  function startThinkingTimer() {
+    thinkingSince = Date.now();
+    clearInterval(thinkingTimer);
+    thinkingTimer = setInterval(() => {
+      const s = Math.round((Date.now() - thinkingSince) / 1000);
+      if (s >= 6 && Date.now() - lastToolTickerAt > 4000) {
+        ticker.textContent = 'Processing — ' + s + 's';
+        ticker.classList.add('show');
+      }
+    }, 1000);
+  }
+  function stopThinkingTimer() {
+    clearInterval(thinkingTimer);
+    thinkingTimer = null;
+    ticker.classList.remove('show');
+  }
+
   // Auto-stop long holds: a stuck touch event would otherwise record forever.
   const MAX_RECORD_MS = 90 * 1000;
   let recordTimer = null;
 
   async function startRecording() {
-    if (busy) return;
+    if (busy) {
+      // Barge-in: pressing the eye while HAL speaks cuts him off and listens.
+      if (eye.classList.contains('speaking') && stopSpeaking()) {
+        busy = false;
+      } else {
+        return;
+      }
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       recorder = new MediaRecorder(stream);
@@ -773,58 +994,49 @@
     form.append('audio', blob, 'audio.' + ext);
 
     setState('thinking');
+    startThinkingTimer();
     try {
-      const res = await fetch('/api/talk', { method: 'POST', body: form, credentials: 'same-origin' });
-
-      if (res.status === 204) {
-        showCaption("I didn't quite catch that, Dave.");
-        setState('idle');
-        busy = false;
-        return;
-      }
-      if (!res.ok) {
-        console.error('server error', res.status, await res.text());
-        showCaption(res.status === 413
-          ? "That recording was too long for me, Dave."
-          : "Something went wrong on my end, Dave.", { isError: true });
-        setState('idle');
-        busy = false;
-        return;
-      }
-
-      const userText = decodeURIComponent(res.headers.get('X-User-Transcript') || '');
-      const halText = decodeURIComponent(res.headers.get('X-Hal-Transcript') || '');
-      updateLog(userText, halText);
-      showCaption(halText);
-
-      const audioBlob = await res.blob();
-      const url = URL.createObjectURL(audioBlob);
-      const audio = primedAudio || new Audio();
-      audio.muted = false;
-      audio.playsInline = true;
-      audio.setAttribute('playsinline', '');
-      audio.src = url;
-      audio.onended = () => { setState('idle'); busy = false; };
-      audio.onerror = () => { setState('idle'); busy = false; };
-      setState('speaking');
-      try {
-        await audio.play();
-      } catch (err) {
-        console.error('playback blocked', err);
-        log.innerHTML += '<div class="hal">[tap eye to hear reply]</div>';
-        const resume = async () => {
-          eye.removeEventListener('touchend', resume);
-          eye.removeEventListener('click', resume);
-          try { await audio.play(); } catch (e) { setState('idle'); busy = false; }
-        };
-        eye.addEventListener('touchend', resume, { once: true });
-        eye.addEventListener('click', resume, { once: true });
-      }
+      const res = await fetch('/api/talk' + (supportsStreaming ? '?stream=1' : ''), {
+        method: 'POST', body: form, credentials: 'same-origin',
+      });
+      stopThinkingTimer();
+      await handleReply(res);
     } catch (err) {
+      stopThinkingTimer();
       console.error('request error', err);
       showCaption("I've lost my connection, Dave.", { isError: true });
-      setState('idle');
-      busy = false;
+      turnDone();
+    }
+  }
+
+  // Typed input path — same turn pipeline as the mic, minus the microphone.
+  async function sendTyped(text) {
+    if (busy) {
+      if (eye.classList.contains('speaking') && stopSpeaking()) {
+        busy = false;
+      } else {
+        showCaption("One moment, Dave — I'm still on the last one.");
+        return;
+      }
+    }
+    busy = true;
+    primePlayback();
+    setState('thinking');
+    startThinkingTimer();
+    try {
+      const res = await fetch('/api/say' + (supportsStreaming ? '?stream=1' : ''), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      stopThinkingTimer();
+      await handleReply(res);
+    } catch (err) {
+      stopThinkingTimer();
+      console.error('request error', err);
+      showCaption("I've lost my connection, Dave.", { isError: true });
+      turnDone();
     }
   }
 
@@ -837,19 +1049,47 @@
   eye.addEventListener('contextmenu', e => e.preventDefault());
 
   // Keyboard push-to-talk: hold the space bar. Skipped while the drawer is
-  // open or a button has focus (space would activate it).
+  // open, while typing in the command line, or when a button has focus
+  // (space would activate it).
+  function typingTarget(e) {
+    return e.target && (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT');
+  }
   window.addEventListener('keydown', (e) => {
     if (e.code !== 'Space' || e.repeat) return;
-    if (drawer.classList.contains('open')) return;
-    if (e.target && e.target.tagName === 'BUTTON') return;
+    if (drawer.classList.contains('open') || typingTarget(e)) return;
     e.preventDefault();
     primePlayback();
     startRecording();
   });
   window.addEventListener('keyup', (e) => {
-    if (e.code !== 'Space') return;
+    if (e.code !== 'Space' || typingTarget(e)) return;
     e.preventDefault();
     stopAndSend();
+  });
+
+  // Typed command line — "/" opens it, Enter sends, Escape closes.
+  const cmdline = document.getElementById('cmdline');
+  const cmdInput = document.getElementById('cmd-input');
+  function openCmdline() {
+    cmdline.classList.add('open');
+    cmdInput.focus();
+  }
+  function closeCmdline() {
+    cmdline.classList.remove('open');
+    cmdInput.value = '';
+    cmdInput.blur();
+  }
+  cmdline.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = cmdInput.value.trim();
+    closeCmdline();
+    if (text) sendTyped(text);
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === '/' && !typingTarget(e) && !drawer.classList.contains('open')) {
+      e.preventDefault();
+      openCmdline();
+    }
   });
 
   // Hidden monitor drawer - status, CLI surfaces, and scrollback.
@@ -964,6 +1204,7 @@
       e.preventDefault();
       drawer.classList.contains('open') ? closeDrawer() : openDrawer();
     } else if (e.key === 'Escape') {
+      closeCmdline();
       closeDrawer();
     }
   });
