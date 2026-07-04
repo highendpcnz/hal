@@ -210,12 +210,7 @@ def unalias_events(alias_id: str) -> None:
 
 
 def publish_event(cookie_id: str, payload: dict) -> None:
-    """Emit an SSE event for a browser session — the public face of _publish
-    for other modules (mission_control)."""
-    _publish(cookie_id, payload)
-
-
-def _publish(cookie_id: str, payload: dict) -> None:
+    """Emit an SSE event for a browser session (aliases resolved)."""
     cookie_id = _publish_aliases.get(cookie_id, cookie_id)
     data = json.dumps(payload)
     for q in list(_event_queues.get(cookie_id, ())):
@@ -276,7 +271,7 @@ class _HALClient:
             cookie_id = _acp_to_cookie.get(session_id)
             if cookie_id is None:
                 return  # session/load replay before any turn bound this session
-            _publish(cookie_id, {
+            publish_event(cookie_id, {
                 "type": kind,
                 "tool_call_id": getattr(update, "tool_call_id", None),
                 "title": getattr(update, "title", None),
@@ -298,7 +293,7 @@ class _HALClient:
         print("[hermes_bridge] denying tool permission request (set HAL_YOLO=1 to allow)")
         cookie_id = _acp_to_cookie.get(session_id)
         if cookie_id:
-            _publish(cookie_id, {
+            publish_event(cookie_id, {
                 "type": "permission_denied",
                 "tool_call_id": getattr(tool_call, "tool_call_id", None),
                 "title": getattr(tool_call, "title", None) or "a tool",
