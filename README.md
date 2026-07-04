@@ -60,6 +60,18 @@ Or just type `hal` anywhere (installed at `~/.local/bin/hal`) — it starts the
 server if needed, waits for it to become healthy, and opens the eye in your
 browser. `hal --no-open` starts it without opening a browser tab.
 
+## Tests
+
+```
+~/hermes-agent/.venv/bin/python tests/run.py
+```
+
+Zero-dependency (no pytest) checks of the pure-python parts — `speakable()`
+markdown stripping, session-id validation, history persistence, CLI output
+cleanup. Sets `HAL_SKIP_MODELS=1` internally so no models load; finishes in
+seconds. The audio/inference pipeline is still verified by running the
+server (see CLAUDE.md).
+
 ## Configuration (env vars, all optional)
 
 | Var | Default | Purpose |
@@ -82,17 +94,22 @@ browser. `hal --no-open` starts it without opening a browser tab.
 | `HAL_LENGTH_SCALE` etc. | `1.08 / 0.6 / 0.72` | voice pacing/timbre knobs |
 | `HAL_DATA_DIR` | `./data` | transcript history + session map |
 | `HAL_STT_PROMPT` | *(empty)* | optional whisper bias prompt (helps it spell "HAL"/"Hermes"; can hallucinate on silence) |
+| `HAL_STT_BEAM` | `5` | whisper beam size; `1` (greedy) is ~2x faster with slightly lower accuracy |
 | `HAL_MAX_UPLOAD_MB` | `25` | reject recordings larger than this (413) |
 | `HAL_COOKIE_MAX_AGE_DAYS` | `180` | lifetime of the `hal_session` cookie |
 | `HAL_SYSTEMS_TTL` | `20` | seconds to cache the `/api/systems` CLI surfaces |
 
 ## Endpoints
 
-- `GET /` — the eye (hold it, or hold the space bar, to speak)
+- `GET /` — the eye (hold it, or hold the space bar, to speak; press the eye
+  while HAL is talking to barge in; `/` opens a typed command line)
 - `POST /api/talk` — multipart audio in, WAV out (`X-User-Transcript` /
   `X-Hal-Transcript` response headers, truncated to 2000 chars; full text
-  in `/api/history`)
-- `POST /api/say` — `{"text": "..."}` in, WAV out; same pipeline minus the mic
+  in `/api/history`). Add `?stream=1` for raw 16-bit mono PCM (`audio/L16`,
+  rate in `X-Hal-Sample-Rate`) streamed sentence-by-sentence as Piper
+  synthesizes — the browser starts playing after the first sentence.
+- `POST /api/say` — `{"text": "..."}` in, WAV out; same pipeline minus the
+  mic; supports the same `?stream=1`
 - `POST /api/session/reset` — forget this browser session's Hermes thread and
   history, issue a fresh cookie (also a button in the Systems drawer)
 - `GET /api/health` — includes ACP bridge liveness (`status: degraded` if the

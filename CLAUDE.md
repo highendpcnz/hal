@@ -16,11 +16,11 @@ Pipeline: browser (MediaRecorder) → `POST /api/talk` → faster-whisper (STT) 
 
 Must run inside the Hermes venv (`~/hermes-agent/.venv` by default, override with `HAL_HERMES_VENV`) — it already has every dependency; `requirements.txt` is only for a standalone environment. `run.sh` fails fast if the port is already serving `/api/health` or is held by something else, before loading the STT/TTS models.
 
-There is no test suite, linter, or build step in this repo. Verify changes by running the server and hitting the endpoints (`curl` for `/api/health`, `/api/status`, `/api/systems`; a browser for the actual voice flow).
+Run `~/hermes-agent/.venv/bin/python tests/run.py` for the zero-dependency test suite (pure-python parts only; sets `HAL_SKIP_MODELS=1` so no models load). There is no linter or build step. Verify pipeline changes by running the server and hitting the endpoints (`curl` for `/api/health`, `/api/status`, `/api/systems`; a browser for the actual voice flow). For pipeline tests without real inference, run with `HAL_BRIDGE=subprocess` and `HAL_HERMES_BIN` pointed at a stub script (stdout = reply, stderr = `session_id: <id>`).
 
 ## Architecture
 
-**`main.py`** — FastAPI app. Owns HTTP surface, STT (faster-whisper) and TTS (Piper) model loading at import time, session-history persistence (JSON files per browser session under `data/sessions/`), and markdown-to-speech text cleanup (`speakable()`) before synthesis. Delegates all "thinking" to `hermes_bridge.ask_hermes()`.
+**`main.py`** — FastAPI app. Owns HTTP surface, STT (faster-whisper) and TTS (Piper) model loading at import time (skippable with `HAL_SKIP_MODELS=1` for tests), session-history persistence (JSON files per browser session under `data/sessions/`), and markdown-to-speech text cleanup (`speakable()`) before synthesis. Delegates all "thinking" to `hermes_bridge.ask_hermes()`. Audio goes out two ways: whole-WAV (default) or, with `?stream=1`, raw PCM chunks streamed per sentence as Piper synthesizes (`synthesize_hal_stream`) — the frontend requests streaming when it supports WebAudio playback. All synthesis is serialized through `_TTS_LOCK`: Piper phonemizes via espeak-ng, which has global state and is not thread-safe.
 
 **`hermes_bridge.py`** — The bridge to the actual agent, with two interchangeable implementations selected by `HAL_BRIDGE` (default `acp`):
 - `acp`: a single persistent `hermes-acp` subprocess speaking the Agent Client Protocol (ACP) over stdio. A turn is just `session/prompt` — no per-turn CLI startup cost. ACP sessions persist to `~/.hermes/state.db`, so a browser session survives both bridge and agent restarts via `session/load`.
