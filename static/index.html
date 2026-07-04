@@ -899,6 +899,10 @@
     .monitor-tab {
       z-index: 50;
     }
+    /* Keep the fixed Systems pill from covering the mission log actions */
+    .mission-log-header {
+      padding-right: 110px;
+    }
   }
 </style>
 </head>
@@ -1439,6 +1443,7 @@
       currentBlobUrl = null;
     }
     if (streamPlayback) {
+      wsPlaybackGen++;  // cancel any pending WS tts_done drain-wait
       streamPlayback.cancelled = true;
       try { streamPlayback.reader.cancel(); } catch (e) {}
       streamPlayback.sources.forEach(s => { try { s.stop(); } catch (e) {} });
@@ -1642,6 +1647,7 @@
   let wsNextTime = 0;
   let wsStarted = false;
   let wsTurn = false;  // the in-flight turn belongs to the WebSocket transport
+  let wsPlaybackGen = 0;  // bumped when WS playback is torn down or superseded
 
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1659,10 +1665,22 @@
           }
         } else if (msg.type === 'tts_start') {
           stopThinkingTimer();
+          wsPlaybackGen++;  // a new reply supersedes any drain-wait in flight
           wsSampleRate = msg.sample_rate || 22050;
           wsNextTime = 0;
           wsStarted = false;
         } else if (msg.type === 'tts_done') {
+          // tts_done races the async decode in playWsChunk (string frames are
+          // handled while binary ones still await arrayBuffer), and it only
+          // marks synthesis done — playback is still draining. Hold the turn
+          // open until the scheduled audio actually finishes.
+          const gen = wsPlaybackGen;
+          const ctx = audioCtx;
+          do {
+            await new Promise(r => setTimeout(r, 100));
+          } while (wsPlaybackGen === gen && ctx && ctx.currentTime < wsNextTime);
+          if (wsPlaybackGen !== gen) return;  // barge-in or a newer reply owns the state
+          streamPlayback = null;
           turnDone();
         } else if (msg.type === 'turn_aborted') {
           // The server had nothing to say (empty audio, over-long recording,

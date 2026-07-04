@@ -744,6 +744,10 @@ async def ws_conversation(websocket: WebSocket):
     try:
         while True:
             msg = await websocket.receive()
+            # Raw receive() reports disconnect as a message, not an exception —
+            # calling receive() again after it raises RuntimeError.
+            if msg.get("type") == "websocket.disconnect":
+                break
             if "bytes" in msg and msg["bytes"]:
                 if audio_overflow:
                     continue
