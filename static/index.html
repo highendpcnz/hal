@@ -1877,17 +1877,16 @@
   function stopWsRecording() {
     isWsRecording = false;
     wsTurn = true;
-    if (vadRecorder && vadRecorder.state === 'recording') {
-      vadRecorder.onstop = () => {
-        ws.send(JSON.stringify({ type: 'end_speech' }));
-        setState('thinking');
-        startThinkingTimer();
-      };
-      vadRecorder.stop();
-    } else {
+    const finish = () => {
       ws.send(JSON.stringify({ type: 'end_speech' }));
       setState('thinking');
       startThinkingTimer();
+    };
+    if (vadRecorder && vadRecorder.state === 'recording') {
+      vadRecorder.onstop = finish;
+      vadRecorder.stop();
+    } else {
+      finish();
     }
   }
 
@@ -1928,7 +1927,6 @@
   }
 
   // Typed input path — same turn pipeline as the mic, minus the microphone.
-  // Typed input path
   async function sendTyped(text) {
     if (busy) {
       if (eye.classList.contains('speaking') && stopSpeaking()) {
