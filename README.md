@@ -5,6 +5,11 @@ Push-to-talk web interface that makes HAL 9000 the face (and voice) of
 red eye, speak, release — Hermes does the thinking (with full tool access),
 and the reply comes back in HAL's voice.
 
+On screens wider than 760px the eye sits in a **Bridge** layout — mission log,
+telemetry bar, live waveform, always-visible input — with an optional
+full-duplex mode (always-on mic with voice detection and barge-in) and
+background **missions** HAL reports on when they finish.
+
 Forked from [piclez/hal](https://huggingface.co/spaces/piclez/hal) and rewired
 to run fully local with zero cloud API keys:
 
@@ -70,7 +75,7 @@ Zero-dependency (no pytest) checks of the pure-python parts — `speakable()`
 markdown stripping, session-id validation, history persistence, CLI output
 cleanup. Sets `HAL_SKIP_MODELS=1` internally so no models load; finishes in
 seconds. The audio/inference pipeline is still verified by running the
-server (see CLAUDE.md).
+server.
 
 ## Configuration (env vars, all optional)
 
@@ -116,7 +121,22 @@ server (see CLAUDE.md).
   agent process is down)
 - `GET /api/status` / `GET /api/systems` / `GET /api/history` — what the
   Systems drawer reads; `/api/systems?refresh=1` bypasses its cache
-- `GET /api/events` — SSE stream of tool-call/permission events for the eye
+- `GET /api/events` — SSE stream of tool-call/permission/mission events for the eye
+- `WS /ws/conversation` — full-duplex channel used by the Bridge UI and duplex
+  mode: client sends `start_speech` + binary audio + `end_speech` (or
+  `text_input`), server answers with `transcript` frames, `tts_start`, raw PCM,
+  `tts_done` — or `turn_aborted` when there is nothing to say. HAL can speak
+  first on this channel (mission completion reports).
+
+## Missions (background tasks)
+
+Type `/mission <title>` in the Bridge input — or say "HAL, start mission
+<title>" — to run a task in the background. Each mission gets its own Hermes
+session; its tool calls stream into the Mission Log, the record persists in
+`data/missions/`, and HAL announces the result over the live connection when
+it finishes. Missions obey the same permission model as everything else:
+with denials as the default they can't run tools, so set `HAL_YOLO=1` only
+if you accept unattended tool access.
 
 ## Autostart at login (optional)
 
