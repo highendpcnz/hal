@@ -407,6 +407,27 @@
     font: inherit;
   }
   .drawer-close:hover { color: #aaa; border-color: #3a1815; }
+  .drawer-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .drawer-action {
+    border: 1px solid #1e1e1e;
+    border-radius: 999px;
+    background: #050505;
+    color: #666;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    padding: 7px 11px;
+    text-transform: uppercase;
+  }
+  .drawer-action:hover {
+    border-color: #4a1710;
+    color: #b84b3b;
+  }
   .drawer-tabs {
     display: flex;
     flex-wrap: wrap;
@@ -526,14 +547,18 @@
   <div id="log" class="log"></div>
   <div id="caption" class="caption" aria-live="polite"></div>
   <div id="ticker" class="ticker"></div>
-  <div class="hint">Hold the eye to speak</div>
+  <div class="hint">Hold the eye — or the space bar — to speak</div>
 
   <button id="monitor-tab" class="monitor-tab" aria-label="Show system monitor" title="System monitor">Systems</button>
   <div id="drawer" class="drawer">
     <div class="drawer-inner">
       <div class="drawer-header">
         <div class="drawer-title">Ship systems</div>
-        <button id="drawer-close" class="drawer-close" aria-label="Close system monitor">×</button>
+        <div class="drawer-actions">
+          <button id="drawer-refresh" class="drawer-action">Refresh</button>
+          <button id="drawer-reset" class="drawer-action">New session</button>
+          <button id="drawer-close" class="drawer-close" aria-label="Close system monitor">×</button>
+        </div>
       </div>
       <div class="drawer-tabs" role="tablist">
         <button class="drawer-tab active" data-panel="overview">Overview</button>
@@ -704,6 +729,10 @@
     }
   };
 
+  // Auto-stop long holds: a stuck touch event would otherwise record forever.
+  const MAX_RECORD_MS = 90 * 1000;
+  let recordTimer = null;
+
   async function startRecording() {
     if (busy) return;
     try {
@@ -712,6 +741,11 @@
       chunks = [];
       recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
       recorder.start();
+      clearTimeout(recordTimer);
+      recordTimer = setTimeout(() => {
+        showCaption("That's ninety seconds, Dave. Let me work with what I have.");
+        stopAndSend();
+      }, MAX_RECORD_MS);
       setState('listening');
     } catch (err) {
       console.error('mic error', err);
@@ -721,6 +755,7 @@
   }
 
   async function stopAndSend() {
+    clearTimeout(recordTimer);
     if (!recorder || recorder.state !== 'recording') return;
     busy = true;
     await new Promise(resolve => {
@@ -742,13 +777,16 @@
       const res = await fetch('/api/talk', { method: 'POST', body: form, credentials: 'same-origin' });
 
       if (res.status === 204) {
+        showCaption("I didn't quite catch that, Dave.");
         setState('idle');
         busy = false;
         return;
       }
       if (!res.ok) {
         console.error('server error', res.status, await res.text());
-        showCaption("Something went wrong on my end, Dave.", { isError: true });
+        showCaption(res.status === 413
+          ? "That recording was too long for me, Dave."
+          : "Something went wrong on my end, Dave.", { isError: true });
         setState('idle');
         busy = false;
         return;
@@ -798,6 +836,22 @@
   eye.addEventListener('touchcancel', e => { e.preventDefault(); stopAndSend(); }, { passive: false });
   eye.addEventListener('contextmenu', e => e.preventDefault());
 
+  // Keyboard push-to-talk: hold the space bar. Skipped while the drawer is
+  // open or a button has focus (space would activate it).
+  window.addEventListener('keydown', (e) => {
+    if (e.code !== 'Space' || e.repeat) return;
+    if (drawer.classList.contains('open')) return;
+    if (e.target && e.target.tagName === 'BUTTON') return;
+    e.preventDefault();
+    primePlayback();
+    startRecording();
+  });
+  window.addEventListener('keyup', (e) => {
+    if (e.code !== 'Space') return;
+    e.preventDefault();
+    stopAndSend();
+  });
+
   // Hidden monitor drawer - status, CLI surfaces, and scrollback.
   const monitorTab = document.getElementById('monitor-tab');
   const drawer = document.getElementById('drawer');
@@ -837,10 +891,14 @@
     drawerPanels.forEach(panel => panel.classList.toggle('open', panel.id === 'panel-' + name));
   }
 
-  async function refreshDrawer() {
+  async function refreshDrawer(force = false) {
+    drawerLoading.textContent = 'Stand by';
     drawerLoading.style.display = 'block';
     try {
-      const [systemsRes, historyRes] = await Promise.all([fetch('/api/systems'), fetch('/api/history')]);
+      const [systemsRes, historyRes] = await Promise.all([
+        fetch('/api/systems' + (force ? '?refresh=1' : '')),
+        fetch('/api/history'),
+      ]);
       const systems = await systemsRes.json();
       const hist = await historyRes.json();
       const local = systems.local || {};
@@ -877,14 +935,29 @@
 
   async function openDrawer() {
     drawer.classList.add('open');
-    if (!drawerLoaded) await refreshDrawer();
+    // Always refresh — the server caches the CLI surfaces, so this mostly
+    // just keeps the scrollback and session stats current.
+    await refreshDrawer();
   }
 
   function closeDrawer() { drawer.classList.remove('open'); }
 
+  async function resetSession() {
+    if (!confirm('Start a fresh session? HAL will not recall this conversation thread.')) return;
+    try {
+      await fetch('/api/session/reset', { method: 'POST', credentials: 'same-origin' });
+    } catch (e) {
+      console.error('session reset failed', e);
+    }
+    // New cookie means new event-stream identity — reload to rebind everything.
+    location.reload();
+  }
+
   drawerTabs.forEach(btn => btn.addEventListener('click', () => setDrawerPanel(btn.dataset.panel)));
   monitorTab.addEventListener('click', openDrawer);
   drawerClose.addEventListener('click', closeDrawer);
+  document.getElementById('drawer-refresh').addEventListener('click', () => refreshDrawer(true));
+  document.getElementById('drawer-reset').addEventListener('click', resetSession);
   drawer.addEventListener('click', (e) => { if (e.target === drawer) closeDrawer(); });
   window.addEventListener('keydown', (e) => {
     if (e.key === '.' && (e.metaKey || e.ctrlKey)) {
