@@ -8,6 +8,7 @@ Run with the Hermes venv (no pytest required):
 HAL_SKIP_MODELS=1 is set below, so the STT/TTS models never load — the whole
 suite finishes in seconds and touches no audio, network, or inference.
 """
+import asyncio
 import os
 import sys
 import tempfile
@@ -111,6 +112,36 @@ sm.set("c2", "h2")
 sm.drop("c1")
 sm2 = hermes_bridge.SessionMap(smp)
 check("session map persists", sm2.get("c2") == "h2" and sm2.get("c1") is None)
+
+# --- keyed session locks -------------------------------------------------------
+# Overlapping turns on one session must serialize, and eviction must not drop
+# a lock that still has waiters (the old locked() check raced exactly there).
+
+
+async def _exercise_keyed_locks():
+    locks = hermes_bridge._KeyedLocks()
+    active = 0
+    max_active = 0
+
+    async def turn():
+        nonlocal active, max_active
+        async with locks.hold("sess"):
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.005)
+            active -= 1
+
+    await asyncio.gather(*(turn() for _ in range(4)))
+    return max_active, locks
+
+
+_max_active, _keyed = asyncio.run(_exercise_keyed_locks())
+check("keyed locks serialize a session", _max_active == 1, str(_max_active))
+check(
+    "keyed locks evict only when idle",
+    _keyed._locks == {} and _keyed._refs == {},
+    repr((_keyed._locks, _keyed._refs)),
+)
 
 # --- SSE event aliasing (missions) -------------------------------------------
 

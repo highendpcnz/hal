@@ -27,7 +27,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 BRIDGE_MODE = os.environ.get("HAL_BRIDGE", "acp").strip().lower()
@@ -59,7 +59,37 @@ EXTRA_ARGS = shlex.split(os.environ.get("HAL_HERMES_ARGS", ""))
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _SESSION_ID_RE = re.compile(r"^session_id:\s*(\S+)", re.M)
-_cookie_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+class _KeyedLocks:
+    """One asyncio.Lock per key, evicted only when truly idle.
+
+    Eviction can't just test lock.locked(): between release() and a queued
+    waiter re-acquiring, locked() is False, so a lock with waiters would be
+    dropped and the next turn would mint a fresh one — two turns running
+    concurrently on a single-writer Hermes session. Refcount holders and
+    waiters instead."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._refs: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def hold(self, key: str):
+        self._refs[key] = self._refs.get(key, 0) + 1
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        try:
+            async with lock:
+                yield
+        finally:
+            if self._refs[key] == 1:
+                del self._refs[key]
+                self._locks.pop(key, None)
+            else:
+                self._refs[key] -= 1
+
+
+_cookie_locks = _KeyedLocks()
 
 FAILURE_LINE = "I'm sorry, Dave. I'm afraid something went wrong on my end."
 TIMEOUT_LINE = "I'm sorry, Dave. That took longer than I allow myself. Please try again."
@@ -582,13 +612,9 @@ async def ask_hermes(text: str, session_id: str) -> str:
     if not await asyncio.to_thread(_network_available):
         print("[hermes_bridge] offline preflight blocked remote inference")
         return OFFLINE_LINE
-    lock = _cookie_locks[session_id]
-    async with lock:
+    async with _cookie_locks.hold(session_id):
         if _acp_bridge is not None:
             result = await _acp_bridge.ask(text, session_id)
         else:
             result = await _ask_subprocess(text, session_id)
-    # Evict the lock if no other turn is queued for this session
-    if not lock.locked():
-        _cookie_locks.pop(session_id, None)
     return result

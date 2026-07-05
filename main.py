@@ -28,6 +28,7 @@ import asyncio
 from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from faster_whisper import WhisperModel
 from piper import PiperVoice, SynthesisConfig
 from pydantic import BaseModel
@@ -49,7 +50,8 @@ SKIP_MODELS = os.environ.get("HAL_SKIP_MODELS", "") == "1"
 # helps it spell HAL/Hermes correctly. Off by default: a bias prompt can make
 # whisper hallucinate text on near-silent recordings.
 STT_PROMPT = os.environ.get("HAL_STT_PROMPT", "").strip() or None
-MAX_HISTORY_TURNS = 40
+# History files hold messages, not turns — one spoken turn appends two.
+MAX_HISTORY_MESSAGES = 40
 MAX_SPOKEN_CHARS = 1500
 # Transcripts travel in response headers; percent-encoding inflates ~3x and
 # proxies/browsers cap header blocks, so bound them. Full text stays in history.
@@ -129,6 +131,16 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+# Loopback binding is the only security boundary (there is no auth), and DNS
+# rebinding crosses it: a hostile page whose hostname resolves to 127.0.0.1
+# reaches this API without cookies. Rejecting unexpected Host headers closes
+# that. Binding beyond loopback requires listing your hostname/IP ("*" works).
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get("HAL_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if h.strip()
+]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -243,18 +255,19 @@ def synthesize_hal(text: str) -> bytes:
 def synthesize_hal_stream(text: str):
     """Yield raw 16-bit mono PCM as Piper finishes each sentence — the browser
     starts playing after the first sentence instead of the whole reply.
-    Starlette runs this sync generator in its threadpool."""
+    Consume via synthesize_hal_stream_async: iterating this directly ties how
+    long _TTS_LOCK is held to the consumer's pace, not synthesis speed."""
     with _TTS_LOCK:
         for chunk in VOICE.synthesize(text, syn_config=SYN_CONFIG):
             yield chunk.audio_int16_bytes
 
 
 async def synthesize_hal_stream_async(text: str) -> AsyncIterator[bytes]:
-    """synthesize_hal_stream for coroutines (the WebSocket paths): Piper runs
-    in a worker thread, so synthesis never stalls the event loop the way
-    iterating the sync generator directly in a coroutine would — that held
-    _TTS_LOCK on the loop thread for the whole reply. If the consumer exits
-    early (socket gone), the worker stops at the next sentence boundary."""
+    """synthesize_hal_stream for coroutines (WebSocket and HTTP streaming):
+    Piper runs in a worker thread pushing into a queue, so synthesis never
+    stalls the event loop and _TTS_LOCK is released at synthesis speed even
+    when the consumer drains slowly. If the consumer exits early (socket
+    gone), the worker stops at the next sentence boundary."""
     loop = asyncio.get_running_loop()
     chunks: asyncio.Queue = asyncio.Queue()
     finished = object()
@@ -340,7 +353,7 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
     history = load_history(session_id)
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": hal_text})
-    save_history(session_id, history[-MAX_HISTORY_TURNS:])
+    save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
     timings["history"] = _elapsed_ms(stage_start)
     return hal_text, timings
 
@@ -452,9 +465,11 @@ def _stream_turn_response(
     hal_text: str,
     timings: dict[str, int] | None = None,
 ) -> Response:
-    """Headers go out immediately; PCM chunks follow as sentences synthesize."""
+    """Headers go out immediately; PCM chunks follow as sentences synthesize.
+    The async generator holds _TTS_LOCK only for as long as Piper needs — a
+    slow reader must not block every other voice reply behind this one."""
     resp = StreamingResponse(
-        synthesize_hal_stream(speakable(hal_text)), media_type="audio/L16"
+        synthesize_hal_stream_async(speakable(hal_text)), media_type="audio/L16"
     )
     resp.headers["X-Hal-Sample-Rate"] = str(SAMPLE_RATE)
     return _apply_turn_headers(resp, session_id, new_session, user_text, hal_text, timings)
@@ -706,7 +721,7 @@ async def on_mission_complete(mission: mission_control.Mission) -> None:
     # The report belongs in the scrollback whether or not anyone is listening.
     history = load_history(mission.cookie_id)
     history.append({"role": "assistant", "content": text})
-    save_history(mission.cookie_id, history[-MAX_HISTORY_TURNS:])
+    save_history(mission.cookie_id, history[-MAX_HISTORY_MESSAGES:])
 
     websocket = active_websockets.get(mission.cookie_id)
     if websocket is None:
