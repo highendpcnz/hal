@@ -408,6 +408,19 @@ _PERM_DENY_RE = re.compile(
 )
 
 
+# Wake-word gate for duplex mode ("Duplex: WAKE"): the utterance must be
+# addressed to HAL. The match is check-only — the full utterance still goes
+# to the agent, so voice mission triggers ("HAL, start mission…") keep
+# working and the persona is addressed the way it expects.
+_WAKE_RE = re.compile(r"^\s*(?:hey|ok|okay)?[,\s]*hal\b[,.!?:]*\s*(.*)$", re.I | re.S)
+
+# Interim transcripts while a duplex utterance records (HAL_INTERIM_STT=0
+# disables). Each pass re-transcribes the buffered audio, so keep the
+# interval generous — this is caption polish, not streaming STT.
+INTERIM_STT = os.environ.get("HAL_INTERIM_STT", "1").strip().lower() not in {"0", "false", "no"}
+INTERIM_STT_INTERVAL = 3.0
+
+
 def _permission_reply(session_id: str, user_text: str) -> str | None:
     """If a permission request is pending for this session and the utterance
     answers it, resolve it and return HAL's acknowledgement; else None."""
@@ -995,6 +1008,27 @@ async def ws_conversation(websocket: WebSocket):
     audio_chunks: list[bytes] = []
     audio_size = 0
     audio_overflow = False
+    # Wake-word gating ("Duplex: WAKE" in the UI): utterances not addressed
+    # to HAL are transcribed locally and silently dropped. Toggled by the
+    # client's set_mode frame; applies to speech only, never typed input.
+    wake_gated = False
+    # Interim transcripts: while a long utterance records, periodically
+    # transcribe the buffered audio so the caption shows words as you speak.
+    interim_gen = 0
+    interim_last = 0.0
+    interim_task: asyncio.Task | None = None
+
+    async def send_interim(snapshot: bytes, gen: int) -> None:
+        try:
+            text = await asyncio.to_thread(transcribe, snapshot)
+        except Exception:
+            return  # partial containers can fail to decode — never fatal
+        if gen != interim_gen or not text:
+            return  # recording already ended; the real transcript wins
+        try:
+            await websocket.send_json({"type": "interim_transcript", "text": text})
+        except Exception:
+            pass
 
     try:
         while True:
@@ -1013,6 +1047,16 @@ async def ws_conversation(websocket: WebSocket):
                     audio_overflow = True
                 else:
                     audio_chunks.append(msg["bytes"])
+                    if (
+                        INTERIM_STT
+                        and time.monotonic() - interim_last >= INTERIM_STT_INTERVAL
+                        and (interim_task is None or interim_task.done())
+                    ):
+                        interim_last = time.monotonic()
+                        interim_task = _spawn(
+                            send_interim(b"".join(audio_chunks), interim_gen),
+                            name="ws-interim",
+                        )
             elif "text" in msg and msg["text"]:
                 try:
                     data = json.loads(msg["text"])
@@ -1024,11 +1068,19 @@ async def ws_conversation(websocket: WebSocket):
                     audio_chunks = []
                     audio_size = 0
                     audio_overflow = False
+                    interim_gen += 1
+                    interim_last = time.monotonic()
                     continue
 
+                if kind == "set_mode":
+                    wake_gated = bool(data.get("wake_word"))
+                    continue
+
+                from_speech = False
                 if kind == "text_input":
                     user_text = (data.get("text") or "").strip()
                 elif kind == "end_speech":
+                    interim_gen += 1  # stale interim results must not surface
                     if audio_overflow:
                         audio_overflow = False
                         await _ws_abort_turn(
@@ -1044,6 +1096,7 @@ async def ws_conversation(websocket: WebSocket):
                         )
                         continue
                     user_text = await asyncio.to_thread(transcribe, audio_bytes)
+                    from_speech = True
                 else:
                     continue
 
@@ -1052,6 +1105,22 @@ async def ws_conversation(websocket: WebSocket):
                         websocket, "no_speech", "I didn't quite catch that, Dave."
                     )
                     continue
+
+                if from_speech and wake_gated:
+                    wake = _WAKE_RE.match(user_text)
+                    if wake is None:
+                        # Ambient speech, not addressed to HAL — drop silently.
+                        await _ws_abort_turn(websocket, "no_wake_word", "")
+                        continue
+                    if not wake.group(1).strip():
+                        # A bare "HAL." — acknowledge without engaging the brain.
+                        await websocket.send_json(
+                            {"type": "transcript", "role": "user", "text": user_text}
+                        )
+                        await _speak_over_ws(session_id, websocket, "Yes, Dave?")
+                        continue
+                    # Keep the full utterance: the persona expects to be
+                    # addressed, and voice mission triggers rely on the prefix.
                 _spawn(
                     _ws_turn_task(websocket, session_id, user_text),
                     name=f"ws-turn-{session_id[:8]}",

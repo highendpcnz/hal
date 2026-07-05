@@ -1961,14 +1961,21 @@
         } else if (msg.type === 'turn_aborted') {
           // The server had nothing to say (empty audio, over-long recording,
           // error) — without this the UI would wait on a reply forever.
-          showCaption(msg.text || "I didn't quite catch that, Dave.",
-                      { isError: msg.reason === 'error' });
+          // Wake-gated ambient speech is dropped without comment.
+          if (msg.reason !== 'no_wake_word') {
+            showCaption(msg.text || "I didn't quite catch that, Dave.",
+                        { isError: msg.reason === 'error' });
+          }
           turnDone();
+        } else if (msg.type === 'interim_transcript') {
+          // Live caption while a long utterance is still being recorded.
+          if (msg.text && isWsRecording) showCaption(msg.text + ' …', { holdMs: 4000 });
         }
       } else {
         await playWsChunk(e.data);
       }
     };
+    ws.onopen = () => { sendWakeMode(); };
     ws.onclose = () => {
       if (isWsRecording) {
         // Socket died while still capturing a duplex utterance — there will
@@ -2037,15 +2044,32 @@
   const VAD_SILENCE_FRAMES = 60;   // ~1s of quiet ends the utterance
   const VAD_BARGE_IN_FRAMES = 12;  // ~200ms of sustained speech cuts HAL off
 
+  // Duplex cycles OFF → ON → WAKE. In WAKE the mic stays hot but the server
+  // drops any utterance not addressed to HAL ("HAL, …" / "Hey HAL …").
+  const DUPLEX_LABELS = ['Duplex: OFF', 'Duplex: ON', 'Duplex: WAKE'];
+  let duplexMode = 0;
+
+  function sendWakeMode() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'set_mode', wake_word: duplexMode === 2 })); }
+      catch (e) {}
+    }
+  }
+
   const btnDuplex = document.getElementById('mlog-duplex');
   btnDuplex?.addEventListener('click', async () => {
-    duplexEnabled = !duplexEnabled;
-    btnDuplex.textContent = `Duplex: ${duplexEnabled ? 'ON' : 'OFF'}`;
-    btnDuplex.style.color = duplexEnabled ? '#ff2a1a' : '';
+    const prev = duplexMode;
+    duplexMode = (duplexMode + 1) % 3;
+    duplexEnabled = duplexMode > 0;
+    btnDuplex.textContent = DUPLEX_LABELS[duplexMode];
+    btnDuplex.style.color = duplexMode ? '#ff2a1a' : '';
+    sendWakeMode();
 
-    if (duplexEnabled) {
+    if (duplexMode === 1 && prev === 0) {
       await enableFullDuplex();
-    } else {
+    } else if (duplexMode === 2) {
+      appendToMissionLog('system', 'Wake-word mode: say "HAL, …" to be heard.');
+    } else if (duplexMode === 0) {
       if (vadRecorder && vadRecorder.state === 'recording') {
         vadRecorder.onstop = null;
         vadRecorder.ondataavailable = null;
@@ -2088,9 +2112,11 @@
       appendToMissionLog('system', 'Full-duplex mode active. Mic is hot.');
     } catch (e) {
       showCaption("Microphone access denied for full-duplex.", { isError: true });
+      duplexMode = 0;
       duplexEnabled = false;
-      btnDuplex.textContent = 'Duplex: OFF';
+      btnDuplex.textContent = DUPLEX_LABELS[0];
       btnDuplex.style.color = '';
+      sendWakeMode();
     }
   }
 

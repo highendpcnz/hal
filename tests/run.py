@@ -187,6 +187,19 @@ check("ordinary speech is not an answer",
       main._PERM_ALLOW_RE.match("yes we should think about this") is None
       and main._PERM_DENY_RE.match("no idea what that means") is None)
 
+# --- wake-word gate --------------------------------------------------------------
+
+check("wake matches plain address", main._WAKE_RE.match("HAL, open the log.") is not None)
+check("wake matches hey-prefix", main._WAKE_RE.match("Hey HAL what's our status?") is not None)
+_bare = main._WAKE_RE.match("Hal.")
+check("bare HAL leaves empty remainder", _bare is not None and _bare.group(1).strip() == "")
+check("wake rejects ambient speech", main._WAKE_RE.match("How are you doing?") is None)
+check("wake rejects embedded hal", main._WAKE_RE.match("Halt the presses") is None)
+check(
+    "wake keeps the remainder",
+    main._WAKE_RE.match("HAL, start mission scan logs").group(1).strip() == "start mission scan logs",
+)
+
 # --- SSE event aliasing (missions) -------------------------------------------
 
 q = hermes_bridge.register_event_queue("browser-1")
@@ -409,6 +422,24 @@ check(
     "ws.onclose stops a live duplex recorder before unlocking",
     "isWsRecording" in ws_onclose_body and "vadRecorder" in ws_onclose_body,
     ws_onclose_body,
+)
+
+# Frontend must speak the backend's protocol: these strings are the contract.
+for token in (
+    'id="permbar"',            # permission Allow/Deny UI exists
+    "/api/permission/",        # …and posts decisions to the endpoint
+    "permission_request",      # …driven by the SSE event
+    'id="missions-panel"',     # mission cards panel exists
+    "/api/missions",           # …seeded from the missions endpoint
+    "mission_session",         # tool events attributed to mission cards
+    "set_mode",                # wake-word toggle frame
+    "interim_transcript",      # live caption frames handled
+    "no_wake_word",            # gated utterances stay silent
+):
+    check(f"frontend wires {token}", token in _frontend_src)
+check(
+    "ws.onopen re-sends wake mode after reconnect",
+    "ws.onopen" in _frontend_src and "sendWakeMode" in _frontend_src,
 )
 
 # ----------------------------------------------------------------------------
