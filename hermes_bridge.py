@@ -61,7 +61,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _SESSION_ID_RE = re.compile(r"^session_id:\s*(\S+)", re.M)
 
 
-class _KeyedLocks:
+class KeyedLocks:
     """One asyncio.Lock per key, evicted only when truly idle.
 
     Eviction can't just test lock.locked(): between release() and a queued
@@ -89,7 +89,7 @@ class _KeyedLocks:
                 self._refs[key] -= 1
 
 
-_cookie_locks = _KeyedLocks()
+_cookie_locks = KeyedLocks()
 
 FAILURE_LINE = "I'm sorry, Dave. I'm afraid something went wrong on my end."
 TIMEOUT_LINE = "I'm sorry, Dave. That took longer than I allow myself. Please try again."

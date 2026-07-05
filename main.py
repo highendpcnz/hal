@@ -117,6 +117,15 @@ SAMPLE_RATE = VOICE.config.sample_rate if VOICE is not None else 22050
 # Piper phonemizes through espeak-ng, which keeps global state — concurrent
 # synthesis from two turns must be serialized or it can crash/corrupt audio.
 _TTS_LOCK = threading.Lock()
+# Whisper decodes are thread-safe but CPU-bound; two at once (HTTP + WS)
+# double each other's latency, so serialize them too.
+_STT_LOCK = threading.Lock()
+# History files are read-modify-write; overlapping turns on one session
+# (missions, concurrent transports) must not drop each other's entries.
+_history_locks = hermes_bridge.KeyedLocks()
+# One reply speaks at a time per socket: a mission announcement must not
+# interleave its PCM frames with an in-flight turn's reply.
+_ws_speech_locks = hermes_bridge.KeyedLocks()
 
 _BOOT_TIME = time.monotonic()
 
@@ -191,14 +200,16 @@ def save_history(session_id: str, history: list[dict]) -> None:
 
 
 def transcribe(audio_bytes: bytes) -> str:
-    segments, _info = STT.transcribe(
-        io.BytesIO(audio_bytes),
-        language="en",
-        vad_filter=True,
-        initial_prompt=STT_PROMPT,
-        beam_size=STT_BEAM_SIZE,
-    )
-    return " ".join(seg.text.strip() for seg in segments).strip()
+    with _STT_LOCK:
+        segments, _info = STT.transcribe(
+            io.BytesIO(audio_bytes),
+            language="en",
+            vad_filter=True,
+            initial_prompt=STT_PROMPT,
+            beam_size=STT_BEAM_SIZE,
+        )
+        # segments is lazy — decoding happens here, so join inside the lock.
+        return " ".join(seg.text.strip() for seg in segments).strip()
 
 
 _MD_PATTERNS = [
@@ -218,6 +229,20 @@ _MD_PATTERNS = [
 ]
 
 
+def _truncate_speech(text: str, limit: int) -> str:
+    """Cap spoken text at a sentence boundary when one is available — a hard
+    cut mid-sentence sounds like HAL glitching."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    best = max(cut.rfind(p) for p in (". ", "! ", "? ", ".\n", "!\n", "?\n"))
+    if best >= limit // 2:
+        return cut[: best + 1].strip()
+    space = cut.rfind(" ")
+    return (cut[:space] if space > 0 else cut).strip()
+
+
 def speakable(text: str) -> str:
     """Strip anything TTS would mangle; the raw reply still goes to the log."""
     for pattern, repl in _MD_PATTERNS:
@@ -226,7 +251,7 @@ def speakable(text: str) -> str:
         text = _hal_tts._normalize_hal_text(text)
     else:
         text = re.sub(r"\bHAL\b", "Hal", text)
-    text = text[:MAX_SPOKEN_CHARS].strip()
+    text = _truncate_speech(text, MAX_SPOKEN_CHARS)
     # Piper on an empty string is undefined behavior; never let it happen.
     return text or "The full response is in the transcript, Dave."
 
@@ -350,10 +375,12 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
         timings["infer"] = _elapsed_ms(stage_start)
 
     stage_start = time.perf_counter()
-    history = load_history(session_id)
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": hal_text})
-    save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
+    now = time.time()
+    async with _history_locks.hold(session_id):
+        history = load_history(session_id)
+        history.append({"role": "user", "content": user_text, "ts": now})
+        history.append({"role": "assistant", "content": hal_text, "ts": now})
+        save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
     timings["history"] = _elapsed_ms(stage_start)
     return hal_text, timings
 
@@ -699,11 +726,18 @@ async def _ws_abort_turn(websocket: WebSocket, reason: str, text: str) -> None:
     await websocket.send_json({"type": "turn_aborted", "reason": reason, "text": text})
 
 
+async def _speak_over_ws(session_id: str, websocket: WebSocket, text: str) -> None:
+    """Transcript frame + TTS as one unit, serialized per session so two
+    replies (a turn and a mission report, say) can't interleave PCM frames."""
+    async with _ws_speech_locks.hold(session_id):
+        await websocket.send_json({"type": "transcript", "role": "hal", "text": text})
+        await _ws_send_tts(websocket, text)
+
+
 async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) -> None:
     await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
     hal_text, _timings = await run_turn_text(session_id, user_text)
-    await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
-    await _ws_send_tts(websocket, hal_text)
+    await _speak_over_ws(session_id, websocket, hal_text)
 
 
 async def on_mission_complete(mission: mission_control.Mission) -> None:
@@ -719,16 +753,16 @@ async def on_mission_complete(mission: mission_control.Mission) -> None:
         )
 
     # The report belongs in the scrollback whether or not anyone is listening.
-    history = load_history(mission.cookie_id)
-    history.append({"role": "assistant", "content": text})
-    save_history(mission.cookie_id, history[-MAX_HISTORY_MESSAGES:])
+    async with _history_locks.hold(mission.cookie_id):
+        history = load_history(mission.cookie_id)
+        history.append({"role": "assistant", "content": text, "ts": time.time()})
+        save_history(mission.cookie_id, history[-MAX_HISTORY_MESSAGES:])
 
     websocket = active_websockets.get(mission.cookie_id)
     if websocket is None:
         return
     try:
-        await websocket.send_json({"type": "transcript", "role": "hal", "text": text})
-        await _ws_send_tts(websocket, text)
+        await _speak_over_ws(mission.cookie_id, websocket, text)
     except Exception as exc:
         print(f"[ws] mission completion notify failed: {exc!r}")
 

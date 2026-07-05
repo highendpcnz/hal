@@ -53,6 +53,18 @@ check("speakable strips emoji", "\U0001F680" not in out, out)
 check("speakable never returns empty", main.speakable("---").strip() != "")
 check("speakable truncates", len(main.speakable("word " * 2000)) <= main.MAX_SPOKEN_CHARS + 100)
 
+# --- speech truncation -------------------------------------------------------
+
+check("truncate passes short text through", main._truncate_speech("Hello, Dave.", 100) == "Hello, Dave.")
+long = ("One sentence here. " * 20).strip()
+cut = main._truncate_speech(long, 100)
+check("truncate ends on a sentence", cut.endswith("sentence here.") and len(cut) <= 100, cut)
+nospace = "x" * 300
+check("truncate survives no boundaries", len(main._truncate_speech(nospace, 100)) == 100)
+words = "word " * 100
+wcut = main._truncate_speech(words, 52)
+check("truncate falls back to word boundary", wcut.endswith("word") and len(wcut) <= 52, wcut)
+
 # --- session ids and history -----------------------------------------------
 
 check("session id accepts uuid-ish", main._valid_session_id("abc-123_X.z") == "abc-123_X.z")
@@ -119,7 +131,7 @@ check("session map persists", sm2.get("c2") == "h2" and sm2.get("c1") is None)
 
 
 async def _exercise_keyed_locks():
-    locks = hermes_bridge._KeyedLocks()
+    locks = hermes_bridge.KeyedLocks()
     active = 0
     max_active = 0
 
