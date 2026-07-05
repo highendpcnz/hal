@@ -1298,6 +1298,10 @@
     }
 
     mlogEntries.appendChild(el);
+    // Cap the DOM: a Bridge tab left open for days must not grow unbounded.
+    while (mlogEntries.childElementCount > 500) {
+      mlogEntries.firstElementChild.remove();
+    }
     // Auto-scroll if user is near the bottom
     const isNearBottom = mlogEntries.scrollHeight - mlogEntries.scrollTop - mlogEntries.clientHeight < 80;
     if (isNearBottom) {
@@ -1689,7 +1693,14 @@
     } catch (e) {}
   }
   refreshTelemetry();
-  setInterval(refreshTelemetry, 30000);
+  // Poll only where the bar is visible (tablet/desktop) and the tab is
+  // foreground — a hidden mobile tab shouldn't wake the server every 30s.
+  setInterval(() => {
+    if (!document.hidden && isBridgeMode()) refreshTelemetry();
+  }, 30000);
+  setInterval(() => {
+    if (!document.hidden && isBridgeMode()) refreshMissions();
+  }, 60000);
 
   // ═══════════════════════════════════════════════════
   // Turn lifecycle (preserved from original)

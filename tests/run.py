@@ -448,4 +448,4 @@ print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): {', '.join(FAILURES)}")
     sys.exit(1)
-print(f"all tests passed")
+print("all tests passed")

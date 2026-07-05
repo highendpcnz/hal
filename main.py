@@ -20,6 +20,7 @@ import time
 import uuid
 import wave
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
@@ -128,8 +129,6 @@ _history_locks = hermes_bridge.KeyedLocks()
 _ws_speech_locks = hermes_bridge.KeyedLocks()
 
 _BOOT_TIME = time.monotonic()
-
-from contextlib import asynccontextmanager
 
 
 @asynccontextmanager
