@@ -192,7 +192,9 @@ check("ordinary speech is not an answer",
 q = hermes_bridge.register_event_queue("browser-1")
 hermes_bridge.alias_events("mission-sess", "browser-1")
 hermes_bridge.publish_event("mission-sess", {"type": "tool_call", "title": "probe"})
-check("aliased publish reaches target queue", not q.empty() and "probe" in q.get_nowait())
+_aliased = q.get_nowait() if not q.empty() else ""
+check("aliased publish reaches target queue", "probe" in _aliased, _aliased)
+check("aliased publish is tagged with its mission", '"mission_session": "mission-sess"' in _aliased.replace('":"', '": "'), _aliased)
 hermes_bridge.unalias_events("mission-sess")
 hermes_bridge.publish_event("mission-sess", {"type": "tool_call"})
 check("unaliased publish goes nowhere", q.empty())
@@ -235,6 +237,138 @@ check(
     "list_missions filters by cookie",
     [m["id"] for m in mgr2.list_missions("c1")] == ["m1"],
 )
+
+# --- mission execution: cap, brain notes, failure journal ----------------------
+
+import json  # noqa: E402
+import mission_control as mc  # noqa: E402
+
+
+async def _exercise_missions():
+    orig_ask = hermes_bridge.ask_hermes
+
+    async def fake_ask(text, sid):
+        if "explode" in text:
+            raise RuntimeError("boom")
+        await asyncio.sleep(0.01)
+        return "All wrapped up."
+
+    hermes_bridge.ask_hermes = fake_ask
+    try:
+        mgr3 = mc.MissionManager(Path(_tmp.name) / "missions-exec")
+        for i in range(mc.MAX_ACTIVE_MISSIONS):
+            mgr3.create_mission("ck", f"m{i}", "do the thing")
+        capped = False
+        try:
+            mgr3.create_mission("ck", "over-cap", "do the thing")
+        except mc.MissionLimitError:
+            capped = True
+        mgr3.create_mission("ck2", "explode", "explode now")
+        await asyncio.gather(*list(mgr3._tasks))
+        notes = mgr3.drain_notes("ck")
+        drained = mgr3.drain_notes("ck")
+        fail_notes = mgr3.drain_notes("ck2")
+        return mgr3, capped, notes, drained, fail_notes
+    finally:
+        hermes_bridge.ask_hermes = orig_ask
+
+
+_mgr3, _capped, _notes, _drained, _fail_notes = asyncio.run(_exercise_missions())
+check("mission cap enforced", _capped)
+check(
+    "missions complete with results and finish times",
+    all(m.status == "completed" and m.finished_at for m in _mgr3.missions.values()
+        if m.cookie_id == "ck"),
+)
+check(
+    "completed missions queue brain notes",
+    len(_notes) == mc.MAX_ACTIVE_MISSIONS and all("All wrapped up." in n for n in _notes),
+    repr(_notes),
+)
+check("notes drain once", _drained == [])
+check("failed mission queues a failure note", len(_fail_notes) == 1 and "failed" in _fail_notes[0])
+_failed_journal = (_mgr3.missions_dir / "failed.jsonl").read_text().splitlines()
+check(
+    "failed mission journaled for reflection",
+    len(_failed_journal) == 1 and json.loads(_failed_journal[0])["title"] == "explode",
+)
+
+# --- mission triggers -----------------------------------------------------------
+
+
+async def _exercise_triggers():
+    orig_ask = hermes_bridge.ask_hermes
+
+    async def fake_ask(text, sid):
+        return "trigger done"
+
+    hermes_bridge.ask_hermes = fake_ask
+    try:
+        tdir = Path(_tmp.name) / "missions-trig"
+        mgr4 = mc.MissionManager(tdir)
+        watched = tdir / "watched"
+        watched.mkdir()
+        (tdir / "triggers.json").write_text(json.dumps([
+            {"title": "hourly", "prompt": "check systems", "every_minutes": 1},
+            {"title": "no prompt — skipped"},
+            {"title": "watcher", "prompt": "scan downloads", "watch": str(watched / "*")},
+            {"title": "off", "prompt": "x", "every_minutes": 1, "enabled": False},
+        ]))
+        state: dict = {}
+        mgr4._scheduler_tick(state, now=1000.0)          # arms interval, baselines watch
+        after_arm = len(mgr4.missions)
+        mgr4._scheduler_tick(state, now=1000.0 + 61)     # interval fires
+        (watched / "new.txt").write_text("hello")
+        mgr4._scheduler_tick(state, now=1000.0 + 62)     # watcher fires
+        mgr4._scheduler_tick(state, now=1000.0 + 63)     # nothing new — no refire
+        await asyncio.gather(*list(mgr4._tasks))
+        return mgr4, after_arm
+    finally:
+        hermes_bridge.ask_hermes = orig_ask
+
+
+_mgr4, _after_arm = asyncio.run(_exercise_triggers())
+_titles = sorted(m.title for m in _mgr4.missions.values())
+check("triggers arm without a boot storm", _after_arm == 0)
+check("interval and watch triggers fire exactly once", _titles == ["hourly", "watcher"], repr(_titles))
+check(
+    "trigger missions belong to the trigger cookie",
+    all(m.cookie_id == mc.TRIGGER_COOKIE for m in _mgr4.missions.values()),
+)
+_watch_mission = next(m for m in _mgr4.missions.values() if m.title == "watcher")
+check("watch trigger annotates its prompt", "(Trigger: files changed under" in _watch_mission.prompt)
+check(
+    "trigger missions visible to every session",
+    len(_mgr4.list_missions("any-cookie")) == 2,
+)
+_tdir2 = Path(_tmp.name) / "missions-trig2"
+_mgr5 = mc.MissionManager(_tdir2)
+(_tdir2 / "triggers.json").write_text("{not valid json")
+check("garbage triggers.json tolerated", _mgr5._load_triggers() == [])
+check("absent triggers.json tolerated", mc.MissionManager(Path(_tmp.name) / "missions-trig3")._load_triggers() == [])
+
+# --- mission prompt context ------------------------------------------------------
+
+_mp = main._mission_prompt("fix the CI", [
+    {"role": "user", "content": "the ci is red"},
+    {"role": "assistant", "content": "I see it, Dave."},
+])
+check(
+    "mission prompt carries conversation context",
+    "Mission: fix the CI" in _mp and "Dave: the ci is red" in _mp and "HAL: I see it, Dave." in _mp,
+)
+check("mission prompt tolerates empty history", "(no prior conversation)" in main._mission_prompt("x", []))
+
+# --- session event journal -------------------------------------------------------
+
+main._log_session_event("evt-sess", {"type": "tool_call_update", "status": "completed", "title": "Read file"})
+main._log_session_event("evt-sess", {"type": "tool_call", "status": "pending", "title": "transient — skip"})
+main._log_session_event("evt-sess", {"type": "mission_update", "mission": {"id": "m", "title": "t", "status": "completed", "prompt": "HUGE" * 999}})
+_evs = main.load_events("evt-sess")
+check("journal keeps terminal events only", len(_evs) == 2 and _evs[0]["title"] == "Read file", repr(_evs))
+check("journaled mission events are slimmed", "prompt" not in _evs[1]["mission"] and _evs[1]["mission"]["title"] == "t")
+check("journal missing session is empty", main.load_events("nope-evt") == [])
+check("journal has timestamps", all(e.get("ts") for e in _evs))
 
 # --- frontend duplex WS busy-state invariant ---------------------------------
 # static/index.html has no JS test harness (zero-dependency Python suite), but

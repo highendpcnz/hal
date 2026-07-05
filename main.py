@@ -135,7 +135,9 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await hermes_bridge.startup()
+    mission_control.manager.start_scheduler()
     yield
+    await mission_control.manager.stop_scheduler()
     await hermes_bridge.shutdown()
 
 
@@ -197,6 +199,62 @@ def save_history(session_id: str, history: list[dict]) -> None:
     tmp = session_file(session_id).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(history))
     tmp.replace(session_file(session_id))
+
+
+# Terminal tool/permission/mission events are journaled per session so the
+# Bridge mission log survives a reload, not just the transcripts.
+EVENTS_KEEP = 300
+
+
+def events_file(session_id: str) -> Path:
+    if _valid_session_id(session_id) is None:
+        raise ValueError("invalid session id")
+    return SESSIONS_DIR / f"{session_id}.events.jsonl"
+
+
+def load_events(session_id: str) -> list[dict]:
+    f = events_file(session_id)
+    try:
+        lines = f.read_text().splitlines()[-EVENTS_KEEP:]
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def _log_session_event(session_id: str, payload: dict) -> None:
+    kind = payload.get("type")
+    keep = (
+        (kind == "tool_call_update" and payload.get("status") in ("completed", "failed"))
+        or kind in ("permission_resolved", "permission_denied")
+        or kind == "mission_update"
+    )
+    if not keep or _valid_session_id(session_id) is None:
+        return
+    if kind == "mission_update":
+        # Don't journal the whole mission record (prompt/result can be huge).
+        mission = payload.get("mission") or {}
+        payload = {
+            "type": kind,
+            "mission": {k: mission.get(k) for k in ("id", "title", "status")},
+        }
+    line = json.dumps({"ts": round(time.time(), 3), **payload}, separators=(",", ":"))
+    f = events_file(session_id)
+    try:
+        with f.open("a") as fh:
+            fh.write(line + "\n")
+        if f.stat().st_size > 128 * 1024:
+            kept = f.read_text().splitlines()[-EVENTS_KEEP:]
+            tmp = f.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(kept) + "\n")
+            tmp.replace(f)
+    except OSError as exc:
+        print(f"[events] journal write failed: {exc}")
 
 
 def transcribe(audio_bytes: bytes) -> str:
@@ -379,6 +437,24 @@ def _mission_request(user_text: str) -> str | None:
     return None
 
 
+def _mission_prompt(title: str, history: list[dict]) -> str:
+    """A mission runs in its own Hermes session with no memory of the
+    conversation that spawned it — carry the recent exchange along."""
+    lines = []
+    for message in history[-6:]:
+        who = "Dave" if message.get("role") == "user" else "HAL"
+        lines.append(f"{who}: {str(message.get('content', ''))[:400]}")
+    context = "\n".join(lines) or "(no prior conversation)"
+    return (
+        "You are HAL running an autonomous background mission for Dave.\n"
+        f"Mission: {title}\n\n"
+        f"Recent conversation, for context:\n{context}\n\n"
+        "Work autonomously — do not ask questions; no one will answer. "
+        "When finished, reply with a concise spoken-style report of what "
+        "you did and what you found."
+    )
+
+
 async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str, int]]:
     """Inference + history — everything in a turn except audio synthesis.
     Mission triggers are parsed here so every transport honors them."""
@@ -390,18 +466,30 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
         pass  # a pending tool permission was just answered by voice/text
     elif mission_title is not None:
         if mission_title:
-            mission_control.manager.create_mission(
-                session_id, mission_title, f"Execute mission: {mission_title}"
-            )
-            hal_text = (
-                f"I've started the mission: {mission_title}. "
-                "I will let you know when it is done."
-            )
+            try:
+                mission_control.manager.create_mission(
+                    session_id,
+                    mission_title,
+                    _mission_prompt(mission_title, load_history(session_id)),
+                )
+                hal_text = (
+                    f"I've started the mission: {mission_title}. "
+                    "I will let you know when it is done."
+                )
+            except mission_control.MissionLimitError:
+                hal_text = (
+                    "I'm sorry, Dave. I'm already running as many missions as "
+                    "I allow myself. Let one finish first."
+                )
         else:
             hal_text = "I need a mission title, Dave. Tell me what the mission is."
     else:
+        # Completed-mission reports ride along on the next prompt so the
+        # brain can answer follow-up questions about them.
+        notes = mission_control.manager.drain_notes(session_id)
+        prompt_text = "\n\n".join([*notes, user_text]) if notes else user_text
         stage_start = time.perf_counter()
-        hal_text = await ask_hermes(user_text, session_id)
+        hal_text = await ask_hermes(prompt_text, session_id)
         timings["infer"] = _elapsed_ms(stage_start)
 
     stage_start = time.perf_counter()
@@ -642,8 +730,18 @@ async def systems(request: Request, refresh: int = 0):
 def history(request: Request):
     session_id = _valid_session_id(request.cookies.get("hal_session"))
     if session_id is None:
-        return {"history": []}
-    return {"history": load_history(session_id)}
+        return {"history": [], "events": []}
+    return {"history": load_history(session_id), "events": load_events(session_id)}
+
+
+@app.get("/api/missions")
+def missions(request: Request):
+    """This session's missions (plus trigger-created ones), newest first —
+    what the Bridge missions panel renders."""
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return {"missions": []}
+    return {"missions": mission_control.manager.list_missions(session_id)}
 
 
 @app.post("/api/talk")
@@ -747,6 +845,8 @@ def reset_session(request: Request):
     if old_id is not None:
         hermes_bridge.drop_session(old_id)
         session_file(old_id).unlink(missing_ok=True)
+        events_file(old_id).unlink(missing_ok=True)
+        mission_control.manager.drain_notes(old_id)
     new_id = str(uuid.uuid4())
     resp = JSONResponse({"session_id": new_id})
     _set_session_cookie(resp, new_id)
@@ -809,27 +909,35 @@ async def on_mission_complete(mission: mission_control.Mission) -> None:
     if mission.status == "failed":
         text = (
             f"Dave, I have completed the mission: {mission.title}. "
-            f"Unfortunately, it failed. {mission.result}"
+            f"Unfortunately, it failed. {_truncate_speech(mission.result or '', 300)}"
         )
     else:
+        summary = _truncate_speech(mission.result or "", 500)
         text = (
             f"Dave, I have completed the mission: {mission.title}. "
-            "I'm ready to review the results with you."
+            + (summary or "I'm ready to review the results with you.")
         )
 
-    # The report belongs in the scrollback whether or not anyone is listening.
-    async with _history_locks.hold(mission.cookie_id):
-        history = load_history(mission.cookie_id)
-        history.append({"role": "assistant", "content": text, "ts": time.time()})
-        save_history(mission.cookie_id, history[-MAX_HISTORY_MESSAGES:])
+    # Trigger missions belong to no browser session — report to whoever is
+    # on the Bridge right now. Owned missions report to their session whether
+    # or not it is connected (the report belongs in the scrollback either way).
+    if mission.cookie_id == mission_control.TRIGGER_COOKIE:
+        targets = list(active_websockets.keys())
+    else:
+        targets = [mission.cookie_id]
 
-    websocket = active_websockets.get(mission.cookie_id)
-    if websocket is None:
-        return
-    try:
-        await _speak_over_ws(mission.cookie_id, websocket, text)
-    except Exception as exc:
-        print(f"[ws] mission completion notify failed: {exc!r}")
+    for session_id in targets:
+        async with _history_locks.hold(session_id):
+            history = load_history(session_id)
+            history.append({"role": "assistant", "content": text, "ts": time.time()})
+            save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
+        websocket = active_websockets.get(session_id)
+        if websocket is None:
+            continue
+        try:
+            await _speak_over_ws(session_id, websocket, text)
+        except Exception as exc:
+            print(f"[ws] mission completion notify failed: {exc!r}")
 
 
 mission_control.manager.on_complete = on_mission_complete
@@ -854,8 +962,11 @@ async def _speak_prompt_safe(session_id: str, websocket: WebSocket, text: str) -
 
 def _on_bridge_event(cookie_id: str, payload: dict) -> None:
     """Observer for every published bridge event (runs on the event loop).
-    Speaks permission prompts over the live socket so ask-mode works by
-    voice, not just with the on-screen buttons."""
+    Journals terminal events so the Bridge log survives reloads, and speaks
+    permission prompts over the live socket so ask-mode works by voice, not
+    just with the on-screen buttons."""
+    if cookie_id != mission_control.TRIGGER_COOKIE:
+        _log_session_event(cookie_id, payload)
     if payload.get("type") == "permission_request":
         websocket = active_websockets.get(cookie_id)
         if websocket is not None:
