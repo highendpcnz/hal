@@ -1,3 +1,8 @@
+# VESTIGIAL — DOES NOT BUILD A WORKING IMAGE. Kept only for diffing against
+# the original Hugging Face Space this repo was forked from. main.py now
+# imports hermes_bridge.py and mission_control.py (not copied below) and
+# expects the Hermes Agent CLI plus the HAL Piper voice on the host.
+# See "Vestigial files" in README.md.
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

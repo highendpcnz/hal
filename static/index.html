@@ -657,6 +657,74 @@
   }
 
   /* ═══════════════════════════════════════════════════
+     BRIDGE: Missions panel (desktop only)
+     ═══════════════════════════════════════════════════ */
+  .missions-panel {
+    display: none;
+  }
+  .missions-title {
+    color: #555;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #151515;
+    margin-bottom: 6px;
+  }
+  .mission-empty {
+    color: #3a3a3a;
+    font-size: 11px;
+    padding: 6px 0;
+  }
+  .mission-card {
+    padding: 7px 4px;
+    border-bottom: 1px solid #0a0a0a;
+    cursor: pointer;
+  }
+  .mission-card:last-child { border-bottom: none; }
+  .mission-card-top {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+  }
+  .mission-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #333;
+    flex-shrink: 0;
+  }
+  .mission-card.st-active .mission-dot {
+    background: #b8862a;
+    box-shadow: 0 0 6px rgba(184, 134, 42, 0.6);
+    animation: breathe 2s ease-in-out infinite;
+  }
+  .mission-card.st-completed .mission-dot { background: #2a6e4a; }
+  .mission-card.st-failed .mission-dot { background: #b84b3b; }
+  .mission-card-title {
+    color: #999;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mission-card-meta {
+    color: #444;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    margin: 3px 0 0 13px;
+  }
+  .mission-card-result {
+    color: #777;
+    font-size: 11px;
+    line-height: 1.5;
+    margin: 5px 0 0 13px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* ═══════════════════════════════════════════════════
      BRIDGE: Telemetry bar (hidden on mobile)
      ═══════════════════════════════════════════════════ */
   .telemetry {
@@ -740,6 +808,50 @@
     border-color: #4a1710;
     color: #b84b3b;
   }
+
+  /* ═══════════════════════════════════════════════════
+     Permission bar — HAL asks before running a tool
+     (HAL_PERMISSION_MODE=ask); works on every layout.
+     ═══════════════════════════════════════════════════ */
+  .permbar {
+    position: fixed;
+    bottom: 96px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: none;
+    align-items: center;
+    gap: 10px;
+    max-width: 86vw;
+    background: rgba(10, 2, 2, 0.94);
+    border: 1px solid #4a1710;
+    border-radius: 999px;
+    padding: 8px 10px 8px 16px;
+    z-index: 60;
+    font-size: 12px;
+    color: #b84b3b;
+  }
+  .permbar.show { display: flex; }
+  .permbar-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 46vw;
+  }
+  .permbar button {
+    border: 1px solid #2a1210;
+    border-radius: 999px;
+    background: #050505;
+    color: #888;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    padding: 6px 12px;
+    text-transform: uppercase;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .permbar button.allow:hover { color: #2a9e5a; border-color: #1a4a2a; }
+  .permbar button.deny:hover { color: #b84b3b; border-color: #4a1710; }
 
   /* ═══════════════════════════════════════════════════
      RESPONSIVE: Mobile (default, < 760px)
@@ -849,6 +961,18 @@
       background: #030303;
       padding: 4px;
     }
+    .missions-panel {
+      display: block;
+      width: min(82%, 340px);
+      max-height: 26vh;
+      overflow-y: auto;
+      border: 1px solid #151515;
+      border-radius: 6px;
+      background: #030303;
+      padding: 8px 10px;
+    }
+    .missions-panel::-webkit-scrollbar { width: 4px; }
+    .missions-panel::-webkit-scrollbar-thumb { background: #1a1a1a; border-radius: 2px; }
 
     /* Right column: mission log */
     .mission-log {
@@ -922,6 +1046,10 @@
     <div class="waveform-wrap">
       <canvas id="waveform" class="waveform-canvas"></canvas>
     </div>
+    <div id="missions-panel" class="missions-panel">
+      <div class="missions-title">Missions</div>
+      <div id="mission-cards"></div>
+    </div>
   </div>
 
   <!-- Mission Log (visible on tablet + desktop) -->
@@ -943,6 +1071,11 @@
   <!-- Overlays (shared) -->
   <div id="caption" class="caption" aria-live="polite"></div>
   <div id="ticker" class="ticker"></div>
+  <div id="permbar" class="permbar" role="alertdialog" aria-live="assertive">
+    <span id="permbar-text" class="permbar-text"></span>
+    <button id="perm-allow" class="allow" type="button">Allow</button>
+    <button id="perm-deny" class="deny" type="button">Deny</button>
+  </div>
   <div class="hint">Hold the eye — or the space bar — to speak · "/" to type</div>
 
   <!-- Mobile command line (hidden on tablet/desktop) -->
@@ -1165,6 +1298,10 @@
     }
 
     mlogEntries.appendChild(el);
+    // Cap the DOM: a Bridge tab left open for days must not grow unbounded.
+    while (mlogEntries.childElementCount > 500) {
+      mlogEntries.firstElementChild.remove();
+    }
     // Auto-scroll if user is near the bottom
     const isNearBottom = mlogEntries.scrollHeight - mlogEntries.scrollTop - mlogEntries.clientHeight < 80;
     if (isNearBottom) {
@@ -1183,23 +1320,105 @@
     resetSession();
   });
 
-  // Load existing history into mission log on page load
+  // Load history + journaled tool/permission/mission events on page load,
+  // interleaved by timestamp so the log reads chronologically.
+  function renderLogEvent(evt) {
+    if (evt.type === 'tool_call_update') {
+      appendToMissionLog('tool', evt.title || 'tool', evt.status);
+    } else if (evt.type === 'permission_resolved') {
+      appendToMissionLog('tool',
+        (evt.title || 'a tool') + (evt.allowed ? ' — allowed' : ' — denied'),
+        evt.allowed ? 'completed' : 'denied');
+    } else if (evt.type === 'permission_denied') {
+      appendToMissionLog('tool', (evt.title || 'a tool') + ' — permission denied', 'denied');
+    } else if (evt.type === 'mission_update' && evt.mission) {
+      appendToMissionLog('system',
+        'Mission "' + (evt.mission.title || '?') + '": ' + (evt.mission.status || '?'));
+    }
+  }
+
   async function loadHistoryIntoLog() {
     try {
       const res = await fetch('/api/history');
       const data = await res.json();
-      if (data.history && data.history.length) {
-        data.history.forEach(m => {
-          appendToMissionLog(m.role === 'user' ? 'user' : 'hal', m.content);
-        });
-      } else {
+      const items = [];
+      (data.history || []).forEach(m => items.push({ ts: m.ts || 0, msg: m }));
+      (data.events || []).forEach(e => items.push({ ts: e.ts || 0, evt: e }));
+      items.sort((a, b) => a.ts - b.ts);
+      if (!items.length) {
         appendToMissionLog('system', 'Session started. Hold the eye to speak, or type below.');
+        return;
       }
+      items.forEach(it => {
+        if (it.msg) appendToMissionLog(it.msg.role === 'user' ? 'user' : 'hal', it.msg.content);
+        else renderLogEvent(it.evt);
+      });
     } catch (e) {
       appendToMissionLog('system', 'Session started.');
     }
   }
   loadHistoryIntoLog();
+
+  // ═══════════════════════════════════════════════════
+  // Missions panel — live cards for background missions
+  // ═══════════════════════════════════════════════════
+  const missionsById = new Map();  // id -> { m, tools, open }
+
+  function missionElapsed(m) {
+    const end = m.finished_at || (Date.now() / 1000);
+    const s = Math.max(0, Math.round(end - m.created_at));
+    if (s < 60) return s + 's';
+    const mins = Math.floor(s / 60);
+    return mins < 60 ? mins + 'm' : Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
+  }
+
+  function upsertMission(m) {
+    const cur = missionsById.get(m.id);
+    missionsById.set(m.id, { m, tools: cur ? cur.tools : 0, open: cur ? cur.open : false });
+  }
+
+  function renderMissions() {
+    const wrap = document.getElementById('mission-cards');
+    if (!wrap) return;
+    const entries = [...missionsById.values()]
+      .sort((a, b) => b.m.created_at - a.m.created_at)
+      .slice(0, 8);
+    wrap.innerHTML = '';
+    if (!entries.length) {
+      wrap.innerHTML = '<div class="mission-empty">No missions yet. Type /mission &lt;title&gt;.</div>';
+      return;
+    }
+    entries.forEach(entry => {
+      const m = entry.m;
+      const el = document.createElement('div');
+      el.className = 'mission-card st-' + m.status;
+      const meta = (m.status === 'active' ? 'running' : m.status) +
+        ' · ' + missionElapsed(m) + (entry.tools ? ' · ⚡' + entry.tools : '');
+      el.innerHTML =
+        '<div class="mission-card-top"><span class="mission-dot"></span>' +
+        '<span class="mission-card-title">' + escapeHtml(m.title) + '</span></div>' +
+        '<div class="mission-card-meta">' + escapeHtml(meta) + '</div>' +
+        (entry.open && m.result
+          ? '<div class="mission-card-result">' + escapeHtml(String(m.result).slice(0, 400)) + '</div>'
+          : '');
+      el.addEventListener('click', () => { entry.open = !entry.open; renderMissions(); });
+      wrap.appendChild(el);
+    });
+  }
+
+  async function refreshMissions() {
+    try {
+      const res = await fetch('/api/missions');
+      const data = await res.json();
+      (data.missions || []).forEach(upsertMission);
+      renderMissions();
+    } catch (e) {}
+  }
+  refreshMissions();
+  // Keep "running · 2m" fresh while anything is active.
+  setInterval(() => {
+    if ([...missionsById.values()].some(e => e.m.status === 'active')) renderMissions();
+  }, 10000);
 
   // ═══════════════════════════════════════════════════
   // Log + Caption (preserved, extended for mission log)
@@ -1261,6 +1480,16 @@
         if (msg.title) {
           appendToMissionLog('tool', msg.title, msg.status);
         }
+        // Attribute tool activity to its mission card
+        if (msg.mission_session && msg.type === 'tool_call') {
+          for (const entry of missionsById.values()) {
+            if (entry.m.session_id === msg.mission_session) {
+              entry.tools++;
+              renderMissions();
+              break;
+            }
+          }
+        }
         if (msg.status === 'completed' || msg.status === 'failed') {
           setToolKind(null);
         } else {
@@ -1270,11 +1499,22 @@
         showTicker(msg.title, 'failed');
         appendToMissionLog('tool', (msg.title || 'a tool') + ' — permission denied', 'denied');
         flashDenied();
+      } else if (msg.type === 'permission_request') {
+        showPermbar(msg);
+        appendToMissionLog('tool', (msg.title || 'a tool') + ' — awaiting permission');
+      } else if (msg.type === 'permission_resolved') {
+        if (msg.request_id === permRequestId) hidePermbar();
+        appendToMissionLog('tool',
+          (msg.title || 'a tool') + (msg.allowed ? ' — allowed' : ' — denied'),
+          msg.allowed ? 'completed' : 'denied');
+        if (!msg.allowed) flashDenied();
       } else if (msg.type === 'mission_update') {
         const m = msg.mission;
         const shortId = m.id.substring(0, 6);
         const statusText = m.status === 'active' ? 'running' : m.status;
         appendToMissionLog('system', `Mission [${shortId}] "${m.title}": ${statusText}`);
+        upsertMission(m);
+        renderMissions();
       }
     };
     events.onerror = () => {
@@ -1284,6 +1524,44 @@
     };
   }
   connectSSE();
+
+  // ═══════════════════════════════════════════════════
+  // Permission bar — Allow/Deny for pending tool requests
+  // (you can also just say or type "yes" / "no")
+  // ═══════════════════════════════════════════════════
+  const permbar = document.getElementById('permbar');
+  const permbarText = document.getElementById('permbar-text');
+  let permRequestId = null;
+  let permTimer = null;
+
+  function showPermbar(msg) {
+    permRequestId = msg.request_id;
+    permbarText.textContent = 'HAL requests permission: ' + (msg.title || 'a tool');
+    permbar.classList.add('show');
+    clearTimeout(permTimer);
+    // Server denies on its own timeout; +2s slack covers clock skew.
+    permTimer = setTimeout(hidePermbar, ((msg.timeout || 30) + 2) * 1000);
+  }
+  function hidePermbar() {
+    permRequestId = null;
+    permbar.classList.remove('show');
+    clearTimeout(permTimer);
+  }
+  async function decidePermission(allow) {
+    const id = permRequestId;
+    hidePermbar();
+    if (!id) return;
+    try {
+      await fetch('/api/permission/' + encodeURIComponent(id), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: allow ? 'allow' : 'deny' }),
+      });
+    } catch (e) {}
+  }
+  document.getElementById('perm-allow')?.addEventListener('click', () => decidePermission(true));
+  document.getElementById('perm-deny')?.addEventListener('click', () => decidePermission(false));
 
   // ═══════════════════════════════════════════════════
   // Waveform — WebAudio oscilloscope visualization
@@ -1408,12 +1686,21 @@
       setText('telem-bridge', (d.bridge_mode || '—').toUpperCase());
       setText('telem-stt', d.stt_model || '—');
       setText('telem-voice', d.voice || '—');
-      setText('telem-yolo', d.yolo ? 'YOLO' : 'Permissioned');
+      setText('telem-yolo',
+        ({ yolo: 'YOLO', ask: 'Ask Dave', deny: 'Denied' })[d.permission_mode] ||
+        (d.yolo ? 'YOLO' : 'Denied'));
       setText('telem-uptime', formatUptime(d.uptime_seconds));
     } catch (e) {}
   }
   refreshTelemetry();
-  setInterval(refreshTelemetry, 30000);
+  // Poll only where the bar is visible (tablet/desktop) and the tab is
+  // foreground — a hidden mobile tab shouldn't wake the server every 30s.
+  setInterval(() => {
+    if (!document.hidden && isBridgeMode()) refreshTelemetry();
+  }, 30000);
+  setInterval(() => {
+    if (!document.hidden && isBridgeMode()) refreshMissions();
+  }, 60000);
 
   // ═══════════════════════════════════════════════════
   // Turn lifecycle (preserved from original)
@@ -1685,14 +1972,21 @@
         } else if (msg.type === 'turn_aborted') {
           // The server had nothing to say (empty audio, over-long recording,
           // error) — without this the UI would wait on a reply forever.
-          showCaption(msg.text || "I didn't quite catch that, Dave.",
-                      { isError: msg.reason === 'error' });
+          // Wake-gated ambient speech is dropped without comment.
+          if (msg.reason !== 'no_wake_word') {
+            showCaption(msg.text || "I didn't quite catch that, Dave.",
+                        { isError: msg.reason === 'error' });
+          }
           turnDone();
+        } else if (msg.type === 'interim_transcript') {
+          // Live caption while a long utterance is still being recorded.
+          if (msg.text && isWsRecording) showCaption(msg.text + ' …', { holdMs: 4000 });
         }
       } else {
         await playWsChunk(e.data);
       }
     };
+    ws.onopen = () => { sendWakeMode(); };
     ws.onclose = () => {
       if (isWsRecording) {
         // Socket died while still capturing a duplex utterance — there will
@@ -1761,15 +2055,32 @@
   const VAD_SILENCE_FRAMES = 60;   // ~1s of quiet ends the utterance
   const VAD_BARGE_IN_FRAMES = 12;  // ~200ms of sustained speech cuts HAL off
 
+  // Duplex cycles OFF → ON → WAKE. In WAKE the mic stays hot but the server
+  // drops any utterance not addressed to HAL ("HAL, …" / "Hey HAL …").
+  const DUPLEX_LABELS = ['Duplex: OFF', 'Duplex: ON', 'Duplex: WAKE'];
+  let duplexMode = 0;
+
+  function sendWakeMode() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'set_mode', wake_word: duplexMode === 2 })); }
+      catch (e) {}
+    }
+  }
+
   const btnDuplex = document.getElementById('mlog-duplex');
   btnDuplex?.addEventListener('click', async () => {
-    duplexEnabled = !duplexEnabled;
-    btnDuplex.textContent = `Duplex: ${duplexEnabled ? 'ON' : 'OFF'}`;
-    btnDuplex.style.color = duplexEnabled ? '#ff2a1a' : '';
+    const prev = duplexMode;
+    duplexMode = (duplexMode + 1) % 3;
+    duplexEnabled = duplexMode > 0;
+    btnDuplex.textContent = DUPLEX_LABELS[duplexMode];
+    btnDuplex.style.color = duplexMode ? '#ff2a1a' : '';
+    sendWakeMode();
 
-    if (duplexEnabled) {
+    if (duplexMode === 1 && prev === 0) {
       await enableFullDuplex();
-    } else {
+    } else if (duplexMode === 2) {
+      appendToMissionLog('system', 'Wake-word mode: say "HAL, …" to be heard.');
+    } else if (duplexMode === 0) {
       if (vadRecorder && vadRecorder.state === 'recording') {
         vadRecorder.onstop = null;
         vadRecorder.ondataavailable = null;
@@ -1812,9 +2123,11 @@
       appendToMissionLog('system', 'Full-duplex mode active. Mic is hot.');
     } catch (e) {
       showCaption("Microphone access denied for full-duplex.", { isError: true });
+      duplexMode = 0;
       duplexEnabled = false;
-      btnDuplex.textContent = 'Duplex: OFF';
+      btnDuplex.textContent = DUPLEX_LABELS[0];
       btnDuplex.style.color = '';
+      sendWakeMode();
     }
   }
 
@@ -2091,7 +2404,9 @@
         stat('Session', shortId(local.session_id)) +
         stat('ACP', shortId(local.acp_session_id)) +
         stat('Bridge', local.bridge_mode || '(unknown)') +
-        stat('Tools', local.yolo ? 'auto-approved' : 'permissioned') +
+        stat('Tools',
+          ({ yolo: 'auto-approved', ask: 'ask Dave', deny: 'denied' })[local.permission_mode] ||
+          (local.yolo ? 'auto-approved' : 'denied')) +
         stat('Voice', local.voice || '(unknown)') +
         stat('STT', local.stt_model || '(unknown)') +
         stat('CWD', local.agent_cwd || '(unknown)') +

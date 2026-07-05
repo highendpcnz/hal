@@ -7,3 +7,8 @@ python-multipart>=0.0.9
 pydantic>=2
 piper-tts>=1.2.0
 faster-whisper>=1.0
+# The default ACP bridge (HAL_BRIDGE=acp) also needs the official ACP
+# library — in the Hermes venv it comes from the hermes-agent[acp] extra:
+# agent-client-protocol
+# The reflection loop experiment (reflection/reflection_loop.py) needs:
+# openai>=1.40
