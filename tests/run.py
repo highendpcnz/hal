@@ -155,6 +155,38 @@ check(
     repr((_keyed._locks, _keyed._refs)),
 )
 
+# --- pending permission registry ----------------------------------------------
+
+
+async def _exercise_permissions():
+    req_id, fut = hermes_bridge._register_permission("owner-1", "Run ls")
+    found = hermes_bridge.pending_permission_for("owner-1")
+    none_found = hermes_bridge.pending_permission_for("owner-2")
+    wrong_owner = hermes_bridge.resolve_permission(req_id, True, "owner-2")
+    unknown = hermes_bridge.resolve_permission("nope", True, "owner-1")
+    right = hermes_bridge.resolve_permission(req_id, True, "owner-1")
+    value = await fut
+    double = hermes_bridge.resolve_permission(req_id, False, "owner-1")
+    hermes_bridge._pending_permissions.pop(req_id, None)
+    return found == req_id, none_found is None, wrong_owner, unknown, right, value, double
+
+
+_found, _none, _wrong, _unknown, _right, _value, _double = asyncio.run(_exercise_permissions())
+check("pending permission is discoverable by owner", _found and _none)
+check("foreign session cannot resolve a permission", not _wrong and not _unknown)
+check("owner resolves the permission", _right and _value is True)
+check("a resolved permission cannot be re-answered", not _double)
+
+# --- spoken permission answers -------------------------------------------------
+
+check("voice allow matches", main._PERM_ALLOW_RE.match("Yes.") is not None)
+check("voice allow with address", main._PERM_ALLOW_RE.match("HAL, go ahead") is not None)
+check("voice deny matches", main._PERM_DENY_RE.match("no") is not None)
+check("voice deny abort", main._PERM_DENY_RE.match("Hal, abort!") is not None)
+check("ordinary speech is not an answer",
+      main._PERM_ALLOW_RE.match("yes we should think about this") is None
+      and main._PERM_DENY_RE.match("no idea what that means") is None)
+
 # --- SSE event aliasing (missions) -------------------------------------------
 
 q = hermes_bridge.register_event_queue("browser-1")

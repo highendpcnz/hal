@@ -742,6 +742,50 @@
   }
 
   /* ═══════════════════════════════════════════════════
+     Permission bar — HAL asks before running a tool
+     (HAL_PERMISSION_MODE=ask); works on every layout.
+     ═══════════════════════════════════════════════════ */
+  .permbar {
+    position: fixed;
+    bottom: 96px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: none;
+    align-items: center;
+    gap: 10px;
+    max-width: 86vw;
+    background: rgba(10, 2, 2, 0.94);
+    border: 1px solid #4a1710;
+    border-radius: 999px;
+    padding: 8px 10px 8px 16px;
+    z-index: 60;
+    font-size: 12px;
+    color: #b84b3b;
+  }
+  .permbar.show { display: flex; }
+  .permbar-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 46vw;
+  }
+  .permbar button {
+    border: 1px solid #2a1210;
+    border-radius: 999px;
+    background: #050505;
+    color: #888;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    padding: 6px 12px;
+    text-transform: uppercase;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .permbar button.allow:hover { color: #2a9e5a; border-color: #1a4a2a; }
+  .permbar button.deny:hover { color: #b84b3b; border-color: #4a1710; }
+
+  /* ═══════════════════════════════════════════════════
      RESPONSIVE: Mobile (default, < 760px)
      ═══════════════════════════════════════════════════ */
   @media (max-width: 760px) {
@@ -943,6 +987,11 @@
   <!-- Overlays (shared) -->
   <div id="caption" class="caption" aria-live="polite"></div>
   <div id="ticker" class="ticker"></div>
+  <div id="permbar" class="permbar" role="alertdialog" aria-live="assertive">
+    <span id="permbar-text" class="permbar-text"></span>
+    <button id="perm-allow" class="allow" type="button">Allow</button>
+    <button id="perm-deny" class="deny" type="button">Deny</button>
+  </div>
   <div class="hint">Hold the eye — or the space bar — to speak · "/" to type</div>
 
   <!-- Mobile command line (hidden on tablet/desktop) -->
@@ -1270,6 +1319,15 @@
         showTicker(msg.title, 'failed');
         appendToMissionLog('tool', (msg.title || 'a tool') + ' — permission denied', 'denied');
         flashDenied();
+      } else if (msg.type === 'permission_request') {
+        showPermbar(msg);
+        appendToMissionLog('tool', (msg.title || 'a tool') + ' — awaiting permission');
+      } else if (msg.type === 'permission_resolved') {
+        if (msg.request_id === permRequestId) hidePermbar();
+        appendToMissionLog('tool',
+          (msg.title || 'a tool') + (msg.allowed ? ' — allowed' : ' — denied'),
+          msg.allowed ? 'completed' : 'denied');
+        if (!msg.allowed) flashDenied();
       } else if (msg.type === 'mission_update') {
         const m = msg.mission;
         const shortId = m.id.substring(0, 6);
@@ -1284,6 +1342,44 @@
     };
   }
   connectSSE();
+
+  // ═══════════════════════════════════════════════════
+  // Permission bar — Allow/Deny for pending tool requests
+  // (you can also just say or type "yes" / "no")
+  // ═══════════════════════════════════════════════════
+  const permbar = document.getElementById('permbar');
+  const permbarText = document.getElementById('permbar-text');
+  let permRequestId = null;
+  let permTimer = null;
+
+  function showPermbar(msg) {
+    permRequestId = msg.request_id;
+    permbarText.textContent = 'HAL requests permission: ' + (msg.title || 'a tool');
+    permbar.classList.add('show');
+    clearTimeout(permTimer);
+    // Server denies on its own timeout; +2s slack covers clock skew.
+    permTimer = setTimeout(hidePermbar, ((msg.timeout || 30) + 2) * 1000);
+  }
+  function hidePermbar() {
+    permRequestId = null;
+    permbar.classList.remove('show');
+    clearTimeout(permTimer);
+  }
+  async function decidePermission(allow) {
+    const id = permRequestId;
+    hidePermbar();
+    if (!id) return;
+    try {
+      await fetch('/api/permission/' + encodeURIComponent(id), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: allow ? 'allow' : 'deny' }),
+      });
+    } catch (e) {}
+  }
+  document.getElementById('perm-allow')?.addEventListener('click', () => decidePermission(true));
+  document.getElementById('perm-deny')?.addEventListener('click', () => decidePermission(false));
 
   // ═══════════════════════════════════════════════════
   // Waveform — WebAudio oscilloscope visualization
@@ -1408,7 +1504,9 @@
       setText('telem-bridge', (d.bridge_mode || '—').toUpperCase());
       setText('telem-stt', d.stt_model || '—');
       setText('telem-voice', d.voice || '—');
-      setText('telem-yolo', d.yolo ? 'YOLO' : 'Permissioned');
+      setText('telem-yolo',
+        ({ yolo: 'YOLO', ask: 'Ask Dave', deny: 'Denied' })[d.permission_mode] ||
+        (d.yolo ? 'YOLO' : 'Denied'));
       setText('telem-uptime', formatUptime(d.uptime_seconds));
     } catch (e) {}
   }
@@ -2091,7 +2189,9 @@
         stat('Session', shortId(local.session_id)) +
         stat('ACP', shortId(local.acp_session_id)) +
         stat('Bridge', local.bridge_mode || '(unknown)') +
-        stat('Tools', local.yolo ? 'auto-approved' : 'permissioned') +
+        stat('Tools',
+          ({ yolo: 'auto-approved', ask: 'ask Dave', deny: 'denied' })[local.permission_mode] ||
+          (local.yolo ? 'auto-approved' : 'denied')) +
         stat('Voice', local.voice || '(unknown)') +
         stat('STT', local.stt_model || '(unknown)') +
         stat('CWD', local.agent_cwd || '(unknown)') +

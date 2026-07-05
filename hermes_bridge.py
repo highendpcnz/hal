@@ -26,6 +26,7 @@ import shlex
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -50,9 +51,18 @@ OFFLINE_CHECK_HOSTS = os.environ.get(
 )
 OFFLINE_CHECK_TIMEOUT = float(os.environ.get("HAL_OFFLINE_CHECK_TIMEOUT", "0.4"))
 OFFLINE_CHECK_TTL = float(os.environ.get("HAL_OFFLINE_CHECK_TTL", "30"))
-# Auto-approve tool permission requests (ACP mode) — voice-triggered shell
-# access. The subprocess mode equivalent is HAL_HERMES_ARGS="--yolo".
-YOLO = os.environ.get("HAL_YOLO", "") == "1"
+# Tool-permission handling (ACP mode): "deny" rejects every request (the
+# safe default), "ask" surfaces Allow/Deny to the browser — and to a spoken
+# yes/no — then waits, "yolo" auto-approves everything. HAL_YOLO=1 remains a
+# back-compat alias for yolo; the subprocess-mode equivalent of yolo is
+# HAL_HERMES_ARGS="--yolo".
+_mode = os.environ.get("HAL_PERMISSION_MODE", "").strip().lower()
+if not _mode:
+    _mode = "yolo" if os.environ.get("HAL_YOLO", "") == "1" else "deny"
+PERMISSION_MODE = _mode if _mode in {"deny", "ask", "yolo"} else "deny"
+# Seconds an "ask" waits for a decision before it is denied.
+PERMISSION_TIMEOUT = float(os.environ.get("HAL_PERMISSION_TIMEOUT", "30"))
+YOLO = PERMISSION_MODE == "yolo"
 SESSION_SOURCE = "hal-web"
 # Extra CLI args for subprocess mode, e.g. HAL_HERMES_ARGS="-m gpt-5.4 --yolo"
 EXTRA_ARGS = shlex.split(os.environ.get("HAL_HERMES_ARGS", ""))
@@ -239,15 +249,67 @@ def unalias_events(alias_id: str) -> None:
     _publish_aliases.pop(alias_id, None)
 
 
+# Optional observer for every published event, set by main.py (persistence,
+# spoken permission prompts). Called on the event loop; must not block.
+on_event = None  # Callable[[str, dict], None] | None
+
+
 def publish_event(cookie_id: str, payload: dict) -> None:
-    """Emit an SSE event for a browser session (aliases resolved)."""
-    cookie_id = _publish_aliases.get(cookie_id, cookie_id)
+    """Emit an SSE event for a browser session (aliases resolved). Events
+    published under a mission's alias are tagged with the originating
+    session so the UI can attribute tool calls to their mission."""
+    owner = _publish_aliases.get(cookie_id)
+    if owner is not None:
+        payload = {**payload, "mission_session": cookie_id}
+        cookie_id = owner
+    if on_event is not None:
+        try:
+            on_event(cookie_id, payload)
+        except Exception as exc:
+            print(f"[hermes_bridge] event observer failed: {exc!r}")
     data = json.dumps(payload)
     for q in list(_event_queues.get(cookie_id, ())):
         try:
             q.put_nowait(data)
         except asyncio.QueueFull:
             pass  # ticker/eye state is ephemeral — drop rather than block
+
+
+# ---------------------------------------------------------------------------
+# Pending permission requests (PERMISSION_MODE == "ask"). All access happens
+# on the event loop: request_permission awaits the future there, and the
+# resolvers are async endpoints / coroutine code — no cross-thread set_result.
+# ---------------------------------------------------------------------------
+
+_pending_permissions: dict[str, tuple[asyncio.Future, str, str]] = {}  # id -> (fut, owner, title)
+
+
+def _register_permission(owner_cookie: str, title: str) -> tuple[str, asyncio.Future]:
+    request_id = uuid.uuid4().hex
+    fut = asyncio.get_running_loop().create_future()
+    _pending_permissions[request_id] = (fut, owner_cookie, title)
+    return request_id, fut
+
+
+def pending_permission_for(owner_cookie: str) -> str | None:
+    """Oldest pending request id owned by this browser session, if any."""
+    for request_id, (_fut, owner, _title) in _pending_permissions.items():
+        if owner == owner_cookie:
+            return request_id
+    return None
+
+
+def resolve_permission(request_id: str, allow: bool, owner_cookie: str) -> bool:
+    """Answer a pending request. Ownership is checked so one browser session
+    cannot approve another session's tools. Returns False if unknown/foreign."""
+    entry = _pending_permissions.get(request_id)
+    if entry is None:
+        return False
+    fut, owner, _title = entry
+    if owner != owner_cookie or fut.done():
+        return False
+    fut.set_result(allow)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -311,22 +373,58 @@ class _HALClient:
 
     async def request_permission(self, options, session_id, tool_call, **kwargs):
         m = self._acp
-        if YOLO:
-            allow = next((o for o in options if o.kind == "allow_once"), None) or next(
-                (o for o in options if o.kind == "allow_always"), None
-            )
-            if allow is not None:
-                print(f"[hermes_bridge] auto-allowing tool call (HAL_YOLO=1): {allow.name}")
-                return m["RequestPermissionResponse"](
-                    outcome=m["AllowedOutcome"](outcome="selected", option_id=allow.option_id)
-                )
-        print("[hermes_bridge] denying tool permission request (set HAL_YOLO=1 to allow)")
+        title = getattr(tool_call, "title", None) or "a tool"
+        tool_call_id = getattr(tool_call, "tool_call_id", None)
         cookie_id = _acp_to_cookie.get(session_id)
+        allow_opt = next((o for o in options if o.kind == "allow_once"), None) or next(
+            (o for o in options if o.kind == "allow_always"), None
+        )
+
+        def allowed_response():
+            return m["RequestPermissionResponse"](
+                outcome=m["AllowedOutcome"](outcome="selected", option_id=allow_opt.option_id)
+            )
+
+        if PERMISSION_MODE == "yolo" and allow_opt is not None:
+            print(f"[hermes_bridge] auto-allowing tool call (permission mode yolo): {allow_opt.name}")
+            return allowed_response()
+
+        if PERMISSION_MODE == "ask" and allow_opt is not None and cookie_id is not None:
+            # A mission's events alias to the owning browser session; the
+            # pending entry must carry that owner or the browser can't answer.
+            owner = _publish_aliases.get(cookie_id, cookie_id)
+            request_id, fut = _register_permission(owner, title)
+            publish_event(cookie_id, {
+                "type": "permission_request",
+                "request_id": request_id,
+                "tool_call_id": tool_call_id,
+                "title": title,
+                "timeout": PERMISSION_TIMEOUT,
+            })
+            try:
+                allow = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT)
+            except asyncio.TimeoutError:
+                allow = False
+            finally:
+                _pending_permissions.pop(request_id, None)
+            publish_event(cookie_id, {
+                "type": "permission_resolved",
+                "request_id": request_id,
+                "title": title,
+                "allowed": allow,
+            })
+            if allow:
+                print(f"[hermes_bridge] Dave allowed: {title}")
+                return allowed_response()
+            print(f"[hermes_bridge] permission not granted (denied or timed out): {title}")
+            return m["RequestPermissionResponse"](outcome=m["DeniedOutcome"](outcome="cancelled"))
+
+        print("[hermes_bridge] denying tool permission request (HAL_PERMISSION_MODE=deny)")
         if cookie_id:
             publish_event(cookie_id, {
                 "type": "permission_denied",
-                "tool_call_id": getattr(tool_call, "tool_call_id", None),
-                "title": getattr(tool_call, "title", None) or "a tool",
+                "tool_call_id": tool_call_id,
+                "title": title,
             })
         return m["RequestPermissionResponse"](outcome=m["DeniedOutcome"](outcome="cancelled"))
 

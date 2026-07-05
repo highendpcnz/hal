@@ -337,6 +337,33 @@ def _log_latency(session_id: str, timings: dict[str, int]) -> None:
 # Spoken mission trigger, e.g. "HAL, start mission tidy the downloads folder."
 _MISSION_VOICE_RE = re.compile(r"^\s*hal[,.]?\s+start\s+mission[,:]?\s*(.*)$", re.I)
 
+# Spoken answers to a pending tool-permission request (HAL_PERMISSION_MODE=ask).
+_PERM_ALLOW_RE = re.compile(
+    r"^\s*(?:hal[,.!]?\s+)?(?:yes|yeah|yep|sure|go ahead|do it|proceed|allow(?:ed)?|"
+    r"approved?|permission granted|make it so)[.!]?\s*$",
+    re.I,
+)
+_PERM_DENY_RE = re.compile(
+    r"^\s*(?:hal[,.!]?\s+)?(?:no|nope|stop|deny|denied|negative|do not|don'?t|cancel|"
+    r"abort|permission denied)[.!]?\s*$",
+    re.I,
+)
+
+
+def _permission_reply(session_id: str, user_text: str) -> str | None:
+    """If a permission request is pending for this session and the utterance
+    answers it, resolve it and return HAL's acknowledgement; else None."""
+    pending = hermes_bridge.pending_permission_for(session_id)
+    if pending is None:
+        return None
+    if _PERM_ALLOW_RE.match(user_text):
+        hermes_bridge.resolve_permission(pending, True, session_id)
+        return "Very well, Dave. Proceeding."
+    if _PERM_DENY_RE.match(user_text):
+        hermes_bridge.resolve_permission(pending, False, session_id)
+        return "Understood, Dave. I won't."
+    return None
+
 
 def _mission_request(user_text: str) -> str | None:
     """Return the mission title if the utterance starts one, else None.
@@ -357,8 +384,11 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
     Mission triggers are parsed here so every transport honors them."""
     timings: dict[str, int] = {}
 
-    mission_title = _mission_request(user_text)
-    if mission_title is not None:
+    hal_text = _permission_reply(session_id, user_text)
+    mission_title = _mission_request(user_text) if hal_text is None else None
+    if hal_text is not None:
+        pass  # a pending tool permission was just answered by voice/text
+    elif mission_title is not None:
         if mission_title:
             mission_control.manager.create_mission(
                 session_id, mission_title, f"Execute mission: {mission_title}"
@@ -558,6 +588,7 @@ def status(request: Request):
         "bridge_mode": hermes_bridge.BRIDGE_MODE,
         "bridge": hermes_bridge.bridge_health(),
         "yolo": hermes_bridge.YOLO,
+        "permission_mode": hermes_bridge.PERMISSION_MODE,
         "voice": VOICE_PATH.name,
         "stt_model": STT_MODEL_NAME,
         "agent_cwd": hermes_bridge.AGENT_CWD,
@@ -597,6 +628,7 @@ async def systems(request: Request, refresh: int = 0):
             "acp_session_id": hermes_bridge.acp_session_for(session_id) if session_id else None,
             "bridge_mode": hermes_bridge.BRIDGE_MODE,
             "yolo": hermes_bridge.YOLO,
+            "permission_mode": hermes_bridge.PERMISSION_MODE,
             "voice": VOICE_PATH.name,
             "stt_model": STT_MODEL_NAME,
             "agent_cwd": Path(hermes_bridge.AGENT_CWD).name,
@@ -691,6 +723,22 @@ async def say(request: Request, body: SayRequest, stream: int = 0):
     return _turn_response(session_id, new_session, user_text, hal_text, wav, timings)
 
 
+class PermissionDecision(BaseModel):
+    decision: str  # "allow" | "deny"
+
+
+@app.post("/api/permission/{request_id}")
+async def permission_decision(request_id: str, body: PermissionDecision, request: Request):
+    """Answer a pending tool-permission request (HAL_PERMISSION_MODE=ask).
+    Async on purpose: resolution must happen on the event loop."""
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return JSONResponse({"ok": False}, status_code=403)
+    allow = body.decision.strip().lower() == "allow"
+    ok = hermes_bridge.resolve_permission(request_id, allow, session_id)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
 @app.post("/api/session/reset")
 def reset_session(request: Request):
     """Start fresh: drop the Hermes session mapping and transcript history,
@@ -740,6 +788,23 @@ async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) ->
     await _speak_over_ws(session_id, websocket, hal_text)
 
 
+async def _ws_turn_task(websocket: WebSocket, session_id: str, user_text: str) -> None:
+    """One turn as a background task. Turns run concurrently with the receive
+    loop so a spoken 'yes' can answer a permission request while the asking
+    turn is still blocked on it; real serialization lives in the per-session
+    inference/history/speech locks, not the socket loop."""
+    try:
+        await _ws_run_turn(websocket, session_id, user_text)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[ws] turn failed (session={session_id[:8]}): {exc!r}")
+        try:
+            await _ws_abort_turn(websocket, "error", "Something went wrong on my end, Dave.")
+        except Exception:
+            pass  # socket already gone
+
+
 async def on_mission_complete(mission: mission_control.Mission) -> None:
     if mission.status == "failed":
         text = (
@@ -768,6 +833,43 @@ async def on_mission_complete(mission: mission_control.Mission) -> None:
 
 
 mission_control.manager.on_complete = on_mission_complete
+
+# asyncio.create_task results must stay referenced or the task can be GC'd.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _speak_prompt_safe(session_id: str, websocket: WebSocket, text: str) -> None:
+    try:
+        await _speak_over_ws(session_id, websocket, text)
+    except Exception as exc:
+        print(f"[ws] spoken prompt failed: {exc!r}")
+
+
+def _on_bridge_event(cookie_id: str, payload: dict) -> None:
+    """Observer for every published bridge event (runs on the event loop).
+    Speaks permission prompts over the live socket so ask-mode works by
+    voice, not just with the on-screen buttons."""
+    if payload.get("type") == "permission_request":
+        websocket = active_websockets.get(cookie_id)
+        if websocket is not None:
+            title = payload.get("title") or "run a tool"
+            _spawn(
+                _speak_prompt_safe(
+                    cookie_id, websocket,
+                    f"Dave, I need your permission: {title}. Allow or deny?",
+                ),
+                name="permission-prompt",
+            )
+
+
+hermes_bridge.on_event = _on_bridge_event
 
 
 @app.websocket("/ws/conversation")
@@ -839,15 +941,10 @@ async def ws_conversation(websocket: WebSocket):
                         websocket, "no_speech", "I didn't quite catch that, Dave."
                     )
                     continue
-                try:
-                    await _ws_run_turn(websocket, session_id, user_text)
-                except WebSocketDisconnect:
-                    raise
-                except Exception as exc:
-                    print(f"[ws] turn failed (session={session_id[:8]}): {exc!r}")
-                    await _ws_abort_turn(
-                        websocket, "error", "Something went wrong on my end, Dave."
-                    )
+                _spawn(
+                    _ws_turn_task(websocket, session_id, user_text),
+                    name=f"ws-turn-{session_id[:8]}",
+                )
     except WebSocketDisconnect:
         pass
     finally:
