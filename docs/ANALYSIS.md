@@ -96,77 +96,97 @@ Cookie-auth paths were checked and are fine as-is: `SameSite=lax` covers
 CSRF for the POST endpoints, the WebSocket requires the session cookie, and
 session ids are regex-validated before becoming file paths (tested).
 
-## Known minor issues (documented, not yet fixed)
+## Known minor issues — fixed in the follow-up series
 
-Deliberately left alone to keep the fix series small; all are edge cases:
+All four were closed by the "serialize history, socket speech, and STT"
+change:
 
-- **History read-modify-write race.** `run_turn_text`'s load-append-save
-  runs outside the per-session inference lock, and mission-trigger turns
-  skip that lock entirely — two overlapping turns on one session can drop a
-  transcript entry. Worst case is a missing scrollback line; Hermes' own
-  memory is unaffected. Fix would be a per-session history lock (reusing
-  `_KeyedLocks`).
-- **WebSocket send interleaving.** A mission completion announcement can
-  fire while a normal reply is still streaming PCM on the same socket;
-  concurrent `send` calls can interleave frames and garble playback. Fix
-  would be a per-session outbound speech queue.
-- **No STT serialization.** Two simultaneous transcriptions (HTTP + WS)
-  are safe but thrash the CPU; a lock or small semaphore would smooth
-  worst-case latency.
-- **`speakable()` truncates mid-sentence** at 1,500 chars; truncating at
-  the last sentence boundary would sound better.
+- **History read-modify-write race** — per-session history locks
+  (`KeyedLocks`) now guard every load-append-save, including the
+  mission-trigger path that skipped the inference lock entirely.
+- **WebSocket send interleaving** — per-session speech locks serialize
+  reply/announcement TTS on a socket, so PCM frames can't interleave.
+- **STT serialization** — a lock keeps concurrent whisper decodes (HTTP +
+  WS + interim transcripts) from doubling each other's latency.
+- **Mid-sentence truncation** — `speakable()` truncates at a sentence (or
+  word) boundary via `_truncate_speech`.
 
-## Second pass: improvements and upgrades
+## Second pass: improvements and upgrades — implemented
 
-### Highest-value gaps
+Everything below shipped in the same series as this revision. Status notes
+mark the deliberate scope choices.
 
-1. **Mission results never reach HAL's brain.** A mission runs in its own
-   Hermes session, which is dropped on completion; the result lives only in
-   `data/missions/*.json` and one spoken line ("I'm ready to review the
-   results with you"). Ask "so what did you find?" and the main session's
-   Hermes has never heard of the mission. Feeding `mission.result` back into
-   the owning session (as a context turn on completion, or lazily on the
-   next prompt) would make the mission feature feel finished.
-2. **Interactive permission approvals.** `HAL_YOLO` is all-or-nothing.
-   The ACP `request_permission` callback plus the existing SSE/WS plumbing
-   is everything needed for HAL to *ask*: "Dave, may I run `git push`?" —
-   click or voice to approve, deny on timeout. This would replace the
-   binary trade-off (safe-but-toolless vs. unattended shell access) with
-   the interaction the HAL premise begs for.
-3. **Missions API + UI panel.** `MissionManager.list_missions` exists but
-   no endpoint exposes it; missions are only visible as transient SSE lines.
-   A `GET /api/missions` plus the "Active Missions" cards from the Discovery
-   One plan (status, elapsed time, result review) is mostly plumbing.
+### The three highest-value gaps ✓
 
-### Feature upgrades (Discovery One leftovers)
+1. **Mission results reach HAL's brain.** Completed/failed mission reports
+   queue as system notes injected into the owner's next Hermes prompt
+   (`MissionManager._notes` / `drain_notes`), so "what did you find?" is
+   answerable. Mission prompts also carry the recent conversation, and the
+   completion announcement speaks a sentence-truncated result summary.
+2. **Interactive permission approvals.** `HAL_PERMISSION_MODE=ask` sits
+   between `deny` and `yolo`: the ACP `request_permission` callback
+   publishes a `permission_request` event, HAL asks aloud over the live
+   socket, and the turn waits on a future resolved by the UI's Allow/Deny
+   bar (`POST /api/permission/{id}`) or a spoken/typed yes-or-no
+   (intercepted in `run_turn_text`), with deny-on-timeout
+   (`HAL_PERMISSION_TIMEOUT`, 30s). WebSocket turns now run as background
+   tasks so a spoken answer can arrive while the asking turn is blocked —
+   per-session inference/history/speech locks provide the real
+   serialization. Ownership checks stop one browser session from approving
+   another's tools.
+3. **Missions API + UI panel.** `GET /api/missions` plus a Missions panel
+   on the desktop Bridge: live cards with status dot, elapsed time,
+   per-mission tool counts (tool events are tagged `mission_session` when
+   published through an alias), and click-to-expand results.
 
-- **Wake word** ("HAL…") client-side — the plan's Pillar 2 leftover;
-  energy-VAD already exists, a keyword spotter (e.g. openWakeWord WASM)
-  would complete always-on mode.
-- **Streaming STT partial transcripts** over the WebSocket for live
-  captions while you speak.
-- **Multi-step missions with progress** (the plan's `MissionStep` design)
-  and richer mission prompts — currently a mission is one bare
-  `"Execute mission: <title>"` prompt with no conversational context.
-- **HAL-initiated triggers**: cron schedules and filesystem watchers that
-  open missions and report over the duplex channel — the "HAL speaks
-  first" infrastructure already works (mission completions prove it).
-- **Mission guardrails**: cap concurrent missions per session and consider
-  confirming voice-triggered missions — a misheard utterance currently
-  spawns an agent run silently.
+### Discovery One leftovers ✓ (with scope notes)
 
-### Smaller improvements
+- **Wake word** — implemented as server-side gating on the existing
+  duplex path (Duplex: OFF → ON → WAKE): local VAD segments speech, the
+  transcript must match "HAL, …"/"Hey HAL …" or the utterance is silently
+  dropped; a bare "HAL." earns a spoken "Yes, Dave?". *Scope note:* the
+  plan's client-side WASM keyword spotter was deliberately skipped — the
+  server is local, so audio never leaves the machine either way, and
+  transcript-level gating needs no new dependency.
+- **Interim transcripts** — while a duplex utterance records, the buffered
+  audio is re-transcribed every ~3s and captioned live. *Scope note:* true
+  incremental streaming STT isn't something faster-whisper offers; this is
+  caption polish at ~zero risk, flagged honestly as such (`HAL_INTERIM_STT`).
+- **HAL-initiated triggers** — `data/triggers.json` supports interval
+  (`every_minutes`) and filesystem-watch (`watch` glob) triggers; a
+  scheduler loop opens missions, which report over the duplex channel to
+  every connected session. The file is re-read each scan, so edits apply
+  live.
+- **Mission guardrails** — `HAL_MAX_ACTIVE_MISSIONS` (default 3) caps
+  concurrent missions per session; HAL declines in-register at the cap.
+- **Multi-step missions** — *deliberately not* built as the plan's
+  `MissionStep` chain: Hermes is already agentic within a single prompt
+  (multi-step tool use included), so step-chaining would duplicate the
+  agent's own planning. Progress visibility comes from live tool telemetry
+  on the mission cards instead.
 
-- Cap the Bridge mission-log DOM (it grows unboundedly in long-lived tabs);
-  stop the 30s telemetry poll while the bar is hidden (mobile).
-- Persist tool-call log entries into history so the Bridge log survives
-  reload, not just transcripts.
-- Bring the `hal` launcher script (README references `~/.local/bin/hal`)
-  into the repo, e.g. `bin/hal`.
-- CI: the zero-dependency test suite is ideal for a tiny GitHub Actions
-  workflow (`pip install -r requirements.txt`-lite + `python tests/run.py`).
-- Packaging/lint: a `pyproject.toml` with ruff config matching the current
-  style would keep contributions consistent.
-- Reflection loop: retarget from the Antigravity CLI to Hermes transcripts
-  (its docstring already flags this), and consider running it after failed
-  missions — that's where the signal is.
+### Smaller improvements ✓
+
+- Bridge mission-log DOM capped at 500 entries; telemetry/mission polling
+  pauses while the tab is hidden or the panels aren't rendered.
+- Terminal tool/permission/mission events journal per session
+  (`data/sessions/*.events.jsonl`, bounded), served via `/api/history`, and
+  interleaved into the Bridge log on reload.
+- `bin/hal` launcher lives in the repo (symlink to `~/.local/bin/hal`).
+- CI: GitHub Actions runs `ruff check .` + `tests/run.py` on every push;
+  `pyproject.toml` pins the ruff config.
+- Reflection loop: failed missions journal to `data/missions/failed.jsonl`,
+  ready for `reflection_loop.py --transcript`. Retargeting the loop's
+  transcript defaults to Hermes' own store remains open — it needs
+  knowledge of Hermes' transcript format that this repo doesn't have.
+
+### Still open (honest list)
+
+- Voice yes/no for permissions arrives over whichever transport is free;
+  in duplex the VAD only reopens the mic once HAL finishes asking — if you
+  answer over him, use barge-in or the buttons.
+- Trigger state (`next_run`, watch baselines) is in-memory: a restart
+  re-arms intervals and re-baselines watchers rather than firing missed
+  runs.
+- The interim-transcript pass re-transcribes the whole buffered utterance
+  each time — fine for spoken turns, quadratic for minute-long dictation.

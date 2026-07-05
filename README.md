@@ -6,9 +6,12 @@ red eye, speak, release — Hermes does the thinking (with full tool access),
 and the reply comes back in HAL's voice.
 
 On screens wider than 760px the eye sits in a **Bridge** layout — mission log,
-telemetry bar, live waveform, always-visible input — with an optional
-full-duplex mode (always-on mic with voice detection and barge-in) and
-background **missions** HAL reports on when they finish.
+telemetry bar, live waveform, mission cards, always-visible input — with an
+optional full-duplex mode (always-on mic with voice detection, barge-in, live
+interim captions, and an optional "HAL, …" wake-word gate) and background
+**missions** HAL reports on when they finish. With
+`HAL_PERMISSION_MODE=ask`, HAL asks out loud before running a tool and waits
+for your yes/no (or an on-screen Allow/Deny).
 
 Forked from [piclez/hal](https://huggingface.co/spaces/piclez/hal) and rewired
 to run fully local with zero cloud API keys:
@@ -47,10 +50,15 @@ The bridge speaks ACP through the official `agent-client-protocol` library
   (`hermes sessions list --source hal-web`). Clear the `hal_session` cookie
   for a fresh one. Hermes' builtin memory still carries facts across sessions.
 - **Tools**: it's real Hermes — "Hal, what's in my downloads folder?" works.
-  Dangerous-command permission requests are **denied by default**: the bridge
-  answers the ACP `session/request_permission` with a rejection and HAL tells
-  you the action was blocked. Set `HAL_YOLO=1` to auto-approve instead, if
-  you accept voice-triggered shell access.
+  Dangerous-command permission requests follow `HAL_PERMISSION_MODE`:
+  - `deny` (default) — every request is rejected and HAL tells you the
+    action was blocked.
+  - `ask` — HAL asks ("Dave, I need your permission: …") and waits up to
+    `HAL_PERMISSION_TIMEOUT` seconds. Answer by voice or text ("yes" /
+    "go ahead" / "no" / "deny"), or with the Allow/Deny bar in the UI.
+    Unanswered requests are denied.
+  - `yolo` — auto-approve everything (`HAL_YOLO=1` is the legacy alias),
+    if you accept voice-triggered shell access.
 
 ## Run
 
@@ -62,9 +70,13 @@ Runs inside the Hermes venv — no separate environment, no `.env`, no API keys.
 First start downloads the STT model (~75 MB) to the Hugging Face cache.
 `run.sh` is plain bash and works on macOS and Linux.
 
-Or just type `hal` anywhere (installed at `~/.local/bin/hal`) — it starts the
-server if needed, waits for it to become healthy, and opens the eye in your
-browser. `hal --no-open` starts it without opening a browser tab.
+Or just type `hal` anywhere — [bin/hal](bin/hal) starts the server if
+needed, waits for it to become healthy, and opens the eye in your browser
+(`hal --no-open` skips the tab). Install it once with:
+
+```
+ln -s "$(pwd)/bin/hal" ~/.local/bin/hal
+```
 
 ## Tests
 
@@ -73,10 +85,12 @@ browser. `hal --no-open` starts it without opening a browser tab.
 ```
 
 Zero-dependency (no pytest) checks of the pure-python parts — `speakable()`
-markdown stripping, session-id validation, history persistence, CLI output
-cleanup. Sets `HAL_SKIP_MODELS=1` internally so no models load; finishes in
-seconds. The audio/inference pipeline is still verified by running the
-server.
+markdown stripping, session-id validation, history persistence, mission
+lifecycle/caps/triggers, the permission registry, CLI output cleanup, and
+frontend/backend protocol-contract invariants. Sets `HAL_SKIP_MODELS=1`
+internally so no models load; finishes in seconds. The same suite plus
+`ruff check .` runs in CI on every push. The audio/inference pipeline is
+still verified by running the server.
 
 ## Configuration (env vars, all optional)
 
@@ -87,7 +101,12 @@ server.
 | `HAL_STT_MODEL` | `base.en` | any faster-whisper model; `small.en` = better accuracy, slower |
 | `HAL_VOICE` | `~/.hermes/voices/hal9000/hal9000.onnx` | Piper voice model |
 | `HAL_BRIDGE` | `acp` | `acp` = persistent agent process; `subprocess` = one CLI call per turn |
-| `HAL_YOLO` | *(unset)* | `1` auto-approves dangerous-tool permission requests (ACP mode) |
+| `HAL_PERMISSION_MODE` | `deny` | `deny` / `ask` / `yolo` — how ACP tool-permission requests are answered (see above) |
+| `HAL_PERMISSION_TIMEOUT` | `30` | seconds an `ask` waits before the request is denied |
+| `HAL_YOLO` | *(unset)* | legacy alias: `1` = `HAL_PERMISSION_MODE=yolo` |
+| `HAL_MAX_ACTIVE_MISSIONS` | `3` | per-session cap on concurrently running background missions |
+| `HAL_TRIGGERS_POLL` | `30` | seconds between `data/triggers.json` scans |
+| `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records; `0` disables |
 | `HAL_HERMES_ACP_BIN` | `~/hermes-agent/.venv/bin/hermes-acp` | ACP adapter path |
 | `HAL_HERMES_BIN` | `~/hermes-agent/.venv/bin/hermes` | Hermes CLI path (subprocess mode) |
 | `HAL_HERMES_ARGS` | *(empty)* | extra CLI args in subprocess mode, e.g. `-m gpt-5.4` or `--yolo` |
@@ -122,23 +141,58 @@ server.
 - `GET /api/health` — includes ACP bridge liveness (`status: degraded` if the
   agent process is down)
 - `GET /api/status` / `GET /api/systems` / `GET /api/history` — what the
-  Systems drawer reads; `/api/systems?refresh=1` bypasses its cache
-- `GET /api/events` — SSE stream of tool-call/permission/mission events for the eye
+  Systems drawer reads; `/api/systems?refresh=1` bypasses its cache.
+  `/api/history` also returns `events`: the journaled terminal
+  tool/permission/mission events that let the Bridge log survive a reload
+- `GET /api/missions` — this session's missions (plus trigger-created ones),
+  newest first; feeds the Missions cards on the desktop Bridge
+- `POST /api/permission/{request_id}` — `{"decision": "allow"|"deny"}`;
+  answers a pending `ask`-mode tool-permission request (the Allow/Deny bar)
+- `GET /api/events` — SSE stream of tool-call/permission/mission events for
+  the eye; mission-owned events carry a `mission_session` tag
 - `WS /ws/conversation` — full-duplex channel used by the Bridge UI and duplex
   mode: client sends `start_speech` + binary audio + `end_speech` (or
-  `text_input`), server answers with `transcript` frames, `tts_start`, raw PCM,
-  `tts_done` — or `turn_aborted` when there is nothing to say. HAL can speak
-  first on this channel (mission completion reports).
+  `text_input`, or `set_mode` to toggle the wake-word gate), server answers
+  with `transcript` frames, `tts_start`, raw PCM, `tts_done` — plus
+  `interim_transcript` while you're still speaking — or `turn_aborted` when
+  there is nothing to say (`reason: no_wake_word` for gated ambient speech).
+  HAL can speak first on this channel (mission reports, permission prompts).
 
 ## Missions (background tasks)
 
 Type `/mission <title>` in the Bridge input — or say "HAL, start mission
 <title>" — to run a task in the background. Each mission gets its own Hermes
-session; its tool calls stream into the Mission Log, the record persists in
-`data/missions/`, and HAL announces the result over the live connection when
-it finishes. Missions obey the same permission model as everything else:
-with denials as the default they can't run tools, so set `HAL_YOLO=1` only
-if you accept unattended tool access.
+session seeded with the recent conversation for context; its tool calls
+stream into the Mission Log and its card in the Missions panel (status,
+elapsed time, tool count — click to expand the result). The record persists
+in `data/missions/`, HAL announces a result summary over the live connection
+when it finishes, and the full report is fed back into your session's brain
+on the next turn — so "what did you find?" works. At most
+`HAL_MAX_ACTIVE_MISSIONS` run per session at once.
+
+Missions obey the same permission model as everything else: with `deny` they
+can't run tools; `ask` routes their permission prompts to your Bridge; set
+`yolo` only if you accept unattended tool access. Failed missions are also
+journaled to `data/missions/failed.jsonl` — food for
+`reflection/reflection_loop.py --transcript data/missions/failed.jsonl`.
+
+### Triggers (HAL starts missions on his own)
+
+Create `data/triggers.json` to have HAL open missions without being asked —
+on a schedule or when files change:
+
+```json
+[
+  {"title": "Morning systems check", "prompt": "Check disk space, memory, and recent errors. Report anomalies.", "every_minutes": 480},
+  {"title": "Downloads watcher", "prompt": "A new file arrived in Downloads. Identify it and suggest where it belongs.", "watch": "~/Downloads/*"}
+]
+```
+
+`every_minutes` fires on an interval (armed at boot, no startup storm);
+`watch` fires when the newest mtime under the glob advances; `"enabled":
+false` disables an entry. The file is re-read every `HAL_TRIGGERS_POLL`
+seconds, so edits apply without a restart. Trigger missions report to every
+connected Bridge session and show in everyone's Missions panel.
 
 ## Autostart at login (optional)
 
