@@ -60,6 +60,7 @@ The bridge speaks ACP through the official `agent-client-protocol` library
 
 Runs inside the Hermes venv — no separate environment, no `.env`, no API keys.
 First start downloads the STT model (~75 MB) to the Hugging Face cache.
+`run.sh` is plain bash and works on macOS and Linux.
 
 Or just type `hal` anywhere (installed at `~/.local/bin/hal`) — it starts the
 server if needed, waits for it to become healthy, and opens the eye in your
@@ -82,6 +83,7 @@ server.
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `HAL_PORT` / `HAL_HOST` | `8000` / `127.0.0.1` | bind address (keep loopback; there is no auth) |
+| `HAL_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Host-header allowlist (blocks DNS rebinding); add your hostname/IP — or `*` — if you bind beyond loopback |
 | `HAL_STT_MODEL` | `base.en` | any faster-whisper model; `small.en` = better accuracy, slower |
 | `HAL_VOICE` | `~/.hermes/voices/hal9000/hal9000.onnx` | Piper voice model |
 | `HAL_BRIDGE` | `acp` | `acp` = persistent agent process; `subprocess` = one CLI call per turn |
@@ -160,7 +162,10 @@ launchctl load ~/Library/LaunchAgents/com.hal9000.frontend.plist
 
 `Dockerfile`, `download_model.py`, `.env.example`, and `hal_prompt.py` are no
 longer used by this fork (persona and user context now live in `AGENTS.md`).
-They are kept for reference / upstream diffing.
+They are kept for reference / upstream diffing. In particular the Dockerfile
+predates the Hermes rewiring and **does not build a working image** — it
+neither copies `hermes_bridge.py`/`mission_control.py` nor provides the
+Hermes CLI or the HAL voice model.
 
 ## Notes
 

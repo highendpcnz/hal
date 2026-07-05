@@ -1,9 +1,10 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Launch the HAL 9000 web frontend for Hermes Agent.
 # Runs inside the Hermes venv — no separate environment needed.
+# Plain bash so it works on Linux as well as macOS (zsh runs it fine too).
 set -euo pipefail
 
-APP_DIR="${0:a:h}"
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 HERMES_VENV="${HAL_HERMES_VENV:-$HOME/hermes-agent/.venv}"
 PORT="${HAL_PORT:-8000}"
 HOST="${HAL_HOST:-127.0.0.1}"
