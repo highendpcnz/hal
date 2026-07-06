@@ -26,6 +26,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import asyncio
+from collections import deque
 
 from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -437,6 +438,7 @@ def _elapsed_ms(start: float) -> int:
 
 
 def _log_latency(session_id: str, timings: dict[str, int]) -> None:
+    _record_timing(timings)
     if not LATENCY_LOG:
         return
     parts = " ".join(f"{name}={duration}ms" for name, duration in timings.items())
@@ -1301,6 +1303,12 @@ def missions(request: Request):
     return {"missions": mission_control.manager.list_missions(session_id)}
 
 
+@app.get("/api/latency")
+def latency():
+    """Recent turn timings — feeds the telemetry sparkline."""
+    return {"turns": list(_recent_timings)}
+
+
 @app.get("/api/viewscreen")
 def viewscreen_list():
     return {"items": _viewscreen_items()}
@@ -1605,6 +1613,18 @@ def _boot_ritual_line() -> str:
         "All systems functional. I am at your service."
     )
 
+
+# Recent turn timings for the telemetry sparkline — every voice/text turn
+# lands here regardless of transport.
+_recent_timings: deque = deque(maxlen=40)
+
+
+def _record_timing(timings: dict[str, int]) -> None:
+    infer = timings.get("infer", 0)
+    turn = timings.get("turn") or timings.get("total") or infer
+    if turn or infer:
+        _recent_timings.append({"ts": round(time.time(), 1), "infer": infer, "turn": turn})
+
 # Running commentary: HAL speaks the reply sentence-by-sentence while the
 # agent is still working, instead of waiting for the turn to finish.
 # WS/duplex transport only — HTTP responses can't push early audio.
@@ -1677,6 +1697,7 @@ async def _ws_run_turn(
     await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
     if not COMMENTARY:
         hal_text, _timings = await run_turn_text(session_id, user_text, speaker)
+        _record_timing(_timings)
         await _speak_over_ws(session_id, websocket, hal_text)
         return
 
@@ -1719,6 +1740,7 @@ async def _ws_run_turn(
     hermes_bridge.set_commentary_sink(session_id, sink)
     try:
         hal_text, _timings = await run_turn_text(session_id, user_text, speaker)
+        _record_timing(_timings)
     finally:
         hermes_bridge.clear_commentary_sink(session_id, sink)
     tail = assembler.flush()

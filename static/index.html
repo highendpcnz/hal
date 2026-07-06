@@ -934,6 +934,13 @@
   .propbar { border-color: #3a2a10; bottom: 148px; }
   .propbar .permbar-text { color: #b8862a; }
 
+  .lat-spark {
+    display: inline-block;
+    vertical-align: middle;
+    width: 64px;
+    height: 14px;
+  }
+
   /* ═══════════════════════════════════════════════════
      RESPONSIVE: Mobile (default, < 760px)
      ═══════════════════════════════════════════════════ */
@@ -1231,6 +1238,11 @@
       <div class="telem-pill">
         <span class="telem-label">Uptime</span>
         <span id="telem-uptime" class="telem-value">—</span>
+      </div>
+      <div class="telem-pill">
+        <span class="telem-label">Lag</span>
+        <canvas id="lat-spark" class="lat-spark" width="64" height="14"></canvas>
+        <span id="telem-lag" class="telem-value">—</span>
       </div>
     </div>
   </div>
@@ -2068,6 +2080,36 @@
         (d.yolo ? 'YOLO' : 'Denied'));
       setText('telem-uptime', formatUptime(d.uptime_seconds));
     } catch (e) {}
+    drawLatencySpark();
+  }
+
+  // Latency sparkline — bar per recent turn (infer ms), label = last turn.
+  async function drawLatencySpark() {
+    const canvas = document.getElementById('lat-spark');
+    const label = document.getElementById('telem-lag');
+    if (!canvas) return;
+    let turns = [];
+    try {
+      const res = await fetch('/api/latency');
+      turns = (await res.json()).turns || [];
+    } catch (e) { return; }
+    const ctx2d = canvas.getContext('2d');
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+    if (!turns.length) { if (label) label.textContent = '—'; return; }
+    const recent = turns.slice(-32);
+    const max = Math.max(...recent.map(t => t.infer || t.turn || 0), 1);
+    const bw = canvas.width / 32;
+    recent.forEach((t, i) => {
+      const v = t.infer || t.turn || 0;
+      const h = Math.max(1, (v / max) * canvas.height);
+      ctx2d.fillStyle = v > 10000 ? '#b84b3b' : '#b8862a';
+      ctx2d.fillRect(i * bw, canvas.height - h, bw - 1, h);
+    });
+    const last = recent[recent.length - 1];
+    if (label) {
+      const ms = last.infer || last.turn || 0;
+      label.textContent = ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+    }
   }
   refreshTelemetry();
   // Poll only where the bar is visible (tablet/desktop) and the tab is
