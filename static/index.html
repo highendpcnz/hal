@@ -754,6 +754,31 @@
     margin-top: 5px;
     min-height: 12px;
   }
+
+  /* ═══════════════════════════════════════════════════
+     BRIDGE: Viewscreen panel (desktop only, shown when
+     the agent has written something to data/viewscreen/)
+     ═══════════════════════════════════════════════════ */
+  .viewscreen-panel { display: none; }
+  .vs-media { margin-top: 6px; }
+  .vs-media a { display: block; }
+  .vs-img {
+    display: block;
+    max-width: 100%;
+    max-height: 220px;
+    margin: 0 auto;
+    border: 1px solid #1a1a1a;
+    border-radius: 3px;
+    background: #060606;
+  }
+  .vs-frame {
+    display: block;
+    width: 100%;
+    height: 220px;
+    border: 1px solid #1a1a1a;
+    border-radius: 3px;
+    background: #060606;
+  }
   .mission-card-title {
     color: #999;
     font-size: 12px;
@@ -1033,6 +1058,14 @@
       background: #030303;
       padding: 8px 10px;
     }
+    .viewscreen-panel.on {
+      display: block;
+      width: min(82%, 340px);
+      border: 1px solid #151515;
+      border-radius: 6px;
+      background: #030303;
+      padding: 8px 10px;
+    }
 
     /* Right column: mission log */
     .mission-log {
@@ -1120,6 +1153,17 @@
       </div>
       <div id="chess-board" class="chess-board"></div>
       <div id="chess-status" class="chess-status"></div>
+    </div>
+    <div id="viewscreen-panel" class="viewscreen-panel">
+      <div class="missions-title chess-head">Viewscreen
+        <span class="chess-actions">
+          <button id="vs-prev" class="mission-card-act" title="Older">◀</button>
+          <button id="vs-next" class="mission-card-act" title="Newer">▶</button>
+          <button id="vs-clear" class="mission-card-act">CLEAR</button>
+        </span>
+      </div>
+      <div id="vs-media" class="vs-media"></div>
+      <div id="vs-caption" class="chess-status"></div>
     </div>
   </div>
 
@@ -1631,6 +1675,70 @@
   });
 
   // ═══════════════════════════════════════════════════
+  // Viewscreen — renders whatever the agent drops into
+  // data/viewscreen/; announced live via SSE.
+  // ═══════════════════════════════════════════════════
+  const vsPanel = document.getElementById('viewscreen-panel');
+  const vsMedia = document.getElementById('vs-media');
+  const vsCaption = document.getElementById('vs-caption');
+  let vsItems = [];
+  let vsIndex = 0;  // 0 = newest
+
+  function renderViewscreen() {
+    if (!vsPanel || !vsMedia) return;
+    if (!vsItems.length) { vsPanel.classList.remove('on'); return; }
+    vsPanel.classList.add('on');
+    vsIndex = Math.max(0, Math.min(vsIndex, vsItems.length - 1));
+    const item = vsItems[vsIndex];
+    const url = '/viewscreen/' + encodeURIComponent(item.name) + '?v=' + item.mtime;
+    const ext = item.name.split('.').pop().toLowerCase();
+    vsMedia.innerHTML = '';
+    let el;
+    if (ext === 'html' || ext === 'htm' || ext === 'pdf') {
+      el = document.createElement('iframe');
+      el.className = 'vs-frame';
+      // Sandboxed: agent HTML renders but runs no scripts in the Bridge.
+      // (PDF needs the viewer, which sandbox would block.)
+      if (ext !== 'pdf') el.setAttribute('sandbox', '');
+      el.src = url;
+      vsMedia.appendChild(el);
+    } else {
+      el = document.createElement('img');
+      el.className = 'vs-img';
+      el.src = url;
+      el.alt = item.name;
+      const link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.appendChild(el);
+      vsMedia.appendChild(link);
+    }
+    vsCaption.textContent = item.name + ' · ' + (vsIndex + 1) + '/' + vsItems.length;
+  }
+
+  async function loadViewscreen(showLatest) {
+    try {
+      const res = await fetch('/api/viewscreen');
+      vsItems = (await res.json()).items || [];
+      if (showLatest) vsIndex = 0;
+      renderViewscreen();
+    } catch (e) {}
+  }
+  loadViewscreen(true);
+
+  document.getElementById('vs-prev')?.addEventListener('click', () => {
+    vsIndex = Math.min(vsIndex + 1, vsItems.length - 1); renderViewscreen();
+  });
+  document.getElementById('vs-next')?.addEventListener('click', () => {
+    vsIndex = Math.max(vsIndex - 1, 0); renderViewscreen();
+  });
+  document.getElementById('vs-clear')?.addEventListener('click', async () => {
+    try { await fetch('/api/viewscreen/clear', { method: 'POST' }); } catch (e) {}
+    loadViewscreen(true);
+  });
+
+  // ═══════════════════════════════════════════════════
   // Log + Caption (preserved, extended for mission log)
   // ═══════════════════════════════════════════════════
   function updateLog(userText, halText) {
@@ -1727,6 +1835,8 @@
         renderMissions();
       } else if (msg.type === 'chess_update') {
         loadChess();  // a voice move (or another tab) changed the board
+      } else if (msg.type === 'viewscreen') {
+        loadViewscreen(true);  // the agent put something on the viewscreen
       }
     };
     events.onerror = () => {

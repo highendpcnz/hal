@@ -110,6 +110,7 @@ still verified by running the server.
 | `HAL_TRIGGERS_POLL` | `30` | seconds between `data/triggers.json` scans |
 | `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records; `0` disables |
 | `HAL_COMMENTARY` | `1` | speak-while-thinking on WS turns: HAL voices each sentence as the agent produces it; `0` restores speak-at-end |
+| `HAL_VIEWSCREEN_POLL` | `2` | seconds between scans of `data/viewscreen/` for new visuals |
 | `HAL_HERMES_ACP_BIN` | `~/hermes-agent/.venv/bin/hermes-acp` | ACP adapter path |
 | `HAL_HERMES_BIN` | `~/hermes-agent/.venv/bin/hermes` | Hermes CLI path (subprocess mode) |
 | `HAL_HERMES_ARGS` | *(empty)* | extra CLI args in subprocess mode, e.g. `-m gpt-5.4` or `--yolo` |
@@ -225,6 +226,19 @@ tool-permission requests (ACP mode) regardless of `HAL_PERMISSION_MODE` —
 this is what lets a briefing run shell and web tools under the default
 `deny`. You edit the trigger file, you grant the scope; leave it off for
 triggers that don't need tools.
+
+## The Viewscreen
+
+Anything the agent writes into `data/viewscreen/` (PNG/JPEG/GIF/WebP/SVG/
+HTML/PDF) appears in a Bridge panel within `HAL_VIEWSCREEN_POLL` seconds —
+"On the viewscreen, Dave." One drop-folder gives every Hermes toolset
+(image generation, screenshots, charts written by shell tools) a visual
+output channel with zero per-tool integration; the persona file teaches HAL
+the convention. ◀ ▶ flip through history (newest first), CLEAR empties the
+folder, clicking an image opens it full-size. Agent HTML renders in a
+sandboxed iframe (no scripts inside the Bridge). Endpoints:
+`GET /api/viewscreen`, `POST /api/viewscreen/clear`; files served under
+`/viewscreen/`.
 
 ## Chess
 

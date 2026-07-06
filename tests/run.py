@@ -656,6 +656,33 @@ check(
     repr(_reply),
 )
 
+# --- viewscreen: listing + broadcast ------------------------------------------------
+
+import time as _time_mod  # noqa: E402
+
+(main.VIEWSCREEN_DIR / "old_chart.png").write_bytes(b"png")
+_now = _time_mod.time()
+os.utime(main.VIEWSCREEN_DIR / "old_chart.png", (_now - 100, _now - 100))
+(main.VIEWSCREEN_DIR / "fresh_page.html").write_text("<b>hi</b>")
+(main.VIEWSCREEN_DIR / "notes.txt").write_text("not a visual")
+_vs = main._viewscreen_items()
+check(
+    "viewscreen lists supported files newest first",
+    [i["name"] for i in _vs] == ["fresh_page.html", "old_chart.png"],
+    repr(_vs),
+)
+check("viewscreen ignores unsupported extensions", all(i["name"] != "notes.txt" for i in _vs))
+
+_q1 = hermes_bridge.register_event_queue("vs-browser-1")
+_q2 = hermes_bridge.register_event_queue("vs-browser-2")
+hermes_bridge.publish_event_all({"type": "viewscreen", "name": "fresh_page.html", "count": 2})
+check(
+    "viewscreen broadcast reaches every session",
+    not _q1.empty() and not _q2.empty() and "fresh_page" in _q1.get_nowait(),
+)
+hermes_bridge.unregister_event_queue("vs-browser-1", _q1)
+hermes_bridge.unregister_event_queue("vs-browser-2", _q2)
+
 # --- chess engine (clean-room; perft pins move generation) -------------------------
 
 import chess_engine as ce  # noqa: E402
@@ -823,6 +850,8 @@ for token in (
     "chess_update",            # board refreshes on SSE chess events
     "commentary",              # speak-while-thinking sentence frames handled
     "turn_done",               # …and the commentary turn's unlock signal
+    'id="viewscreen-panel"',   # viewscreen panel exists
+    "/api/viewscreen",         # …and lists/clears via the endpoints
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(

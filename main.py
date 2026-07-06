@@ -20,7 +20,7 @@ import time
 import uuid
 import wave
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import quote
 
@@ -75,6 +75,12 @@ HERMES_CLI_TIMEOUT = float(os.environ.get("HAL_CLI_TIMEOUT", "12"))
 DATA_DIR = Path(os.environ.get("HAL_DATA_DIR", str(APP_DIR / "data")))
 SESSIONS_DIR = DATA_DIR / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+# The viewscreen: any image/HTML/PDF the agent writes here appears on the
+# Bridge — one drop-folder retrofits visual output onto every toolset.
+VIEWSCREEN_DIR = DATA_DIR / "viewscreen"
+VIEWSCREEN_DIR.mkdir(parents=True, exist_ok=True)
+VIEWSCREEN_POLL = float(os.environ.get("HAL_VIEWSCREEN_POLL", "2"))
+_VIEWSCREEN_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".html", ".htm", ".pdf"}
 hermes_bridge.init(DATA_DIR)
 mission_control.init(DATA_DIR)
 chess_control.init(DATA_DIR)
@@ -134,11 +140,46 @@ _ws_speech_locks = hermes_bridge.KeyedLocks()
 _BOOT_TIME = time.monotonic()
 
 
+def _viewscreen_items() -> list[dict]:
+    items = []
+    for f in VIEWSCREEN_DIR.iterdir():
+        if f.is_file() and f.suffix.lower() in _VIEWSCREEN_EXTS:
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            items.append({"name": f.name, "mtime": round(st.st_mtime, 3), "size": st.st_size})
+    items.sort(key=lambda item: item["mtime"], reverse=True)
+    return items[:50]
+
+
+async def _viewscreen_watch() -> None:
+    """Announce new or updated viewscreen files to every connected Bridge.
+    Baselines on boot — old files render in the panel but aren't announced."""
+    seen = {item["name"]: item["mtime"] for item in _viewscreen_items()}
+    while True:
+        await asyncio.sleep(VIEWSCREEN_POLL)
+        try:
+            items = _viewscreen_items()
+            fresh = [item for item in items if seen.get(item["name"]) != item["mtime"]]
+            seen = {item["name"]: item["mtime"] for item in items}
+            if fresh:
+                hermes_bridge.publish_event_all(
+                    {"type": "viewscreen", "name": fresh[0]["name"], "count": len(items)}
+                )
+        except Exception as exc:
+            print(f"[viewscreen] watch failed: {exc!r}")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await hermes_bridge.startup()
     mission_control.manager.start_scheduler()
+    viewscreen_task = asyncio.create_task(_viewscreen_watch(), name="viewscreen-watch")
     yield
+    viewscreen_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await viewscreen_task
     await mission_control.manager.stop_scheduler()
     await hermes_bridge.shutdown()
 
@@ -155,6 +196,7 @@ ALLOWED_HOSTS = [
 ]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+app.mount("/viewscreen", StaticFiles(directory=str(VIEWSCREEN_DIR)), name="viewscreen")
 
 
 def _valid_session_id(session_id: str | None) -> str | None:
@@ -946,6 +988,25 @@ def missions(request: Request):
     if session_id is None:
         return {"missions": []}
     return {"missions": mission_control.manager.list_missions(session_id)}
+
+
+@app.get("/api/viewscreen")
+def viewscreen_list():
+    return {"items": _viewscreen_items()}
+
+
+@app.post("/api/viewscreen/clear")
+def viewscreen_clear(request: Request):
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return JSONResponse({"ok": False}, status_code=403)
+    removed = 0
+    for f in VIEWSCREEN_DIR.iterdir():
+        if f.is_file() and f.suffix.lower() in _VIEWSCREEN_EXTS:
+            f.unlink(missing_ok=True)
+            removed += 1
+    hermes_bridge.publish_event_all({"type": "viewscreen", "name": None, "count": 0})
+    return {"ok": True, "removed": removed}
 
 
 def _chess_payload(session_id: str) -> dict:

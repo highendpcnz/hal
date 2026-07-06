@@ -268,6 +268,19 @@ def clear_commentary_sink(cookie_id: str) -> None:
     _commentary_sinks.pop(cookie_id, None)
 
 
+def publish_event_all(payload: dict) -> None:
+    """Emit an SSE event to every connected browser session — for global
+    surfaces (the viewscreen) that belong to no one session. Not journaled:
+    broadcasts are ephemeral UI signal."""
+    data = json.dumps(payload)
+    for queues in list(_event_queues.values()):
+        for q in list(queues):
+            try:
+                q.put_nowait(data)
+            except asyncio.QueueFull:
+                pass
+
+
 def publish_event(cookie_id: str, payload: dict) -> None:
     """Emit an SSE event for a browser session (aliases resolved). Events
     published under a mission's alias are tagged with the originating
