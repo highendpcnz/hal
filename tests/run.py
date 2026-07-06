@@ -656,6 +656,17 @@ check(
     repr(_reply),
 )
 
+_sink_a, _sink_b = (lambda t: None), (lambda t: None)
+hermes_bridge.set_commentary_sink("race-ck", _sink_a)
+hermes_bridge.set_commentary_sink("race-ck", _sink_b)  # barge-in turn replaces
+hermes_bridge.clear_commentary_sink("race-ck", _sink_a)  # old turn's finally
+check(
+    "stale sink clear leaves the newer turn's sink",
+    hermes_bridge._commentary_sinks.get("race-ck") is _sink_b,
+)
+hermes_bridge.clear_commentary_sink("race-ck", _sink_b)
+check("owner clear removes the sink", "race-ck" not in hermes_bridge._commentary_sinks)
+
 # --- care ledger: commands, storage, daily note -------------------------------------
 
 import ledger as ledger_mod  # noqa: E402

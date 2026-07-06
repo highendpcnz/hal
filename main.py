@@ -1533,7 +1533,7 @@ async def _ws_run_turn(
     try:
         hal_text, _timings = await run_turn_text(session_id, user_text, speaker)
     finally:
-        hermes_bridge.clear_commentary_sink(session_id)
+        hermes_bridge.clear_commentary_sink(session_id, sink)
     tail = assembler.flush()
     if tail:
         sentences.put_nowait(tail)

@@ -264,8 +264,12 @@ def set_commentary_sink(cookie_id: str, sink) -> None:
     _commentary_sinks[cookie_id] = sink
 
 
-def clear_commentary_sink(cookie_id: str) -> None:
-    _commentary_sinks.pop(cookie_id, None)
+def clear_commentary_sink(cookie_id: str, sink=None) -> None:
+    """Remove the sink — identity-checked, like the active_websockets
+    cleanup: a barged-in turn's finally must not evict the newer turn's
+    sink that replaced it."""
+    if sink is None or _commentary_sinks.get(cookie_id) is sink:
+        _commentary_sinks.pop(cookie_id, None)
 
 
 def publish_event_all(payload: dict) -> None:
