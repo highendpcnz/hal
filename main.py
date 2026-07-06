@@ -512,14 +512,16 @@ def _resolve_proposal(session_id: str, approve: bool) -> dict | None:
     proposal = _pending_proposal(session_id)
     if proposal is None:
         return None
-    del _pending_proposals[session_id]
     if approve:
+        # Create before forgetting: a MissionLimitError must leave the
+        # proposal pending so Dave can approve again once a slot frees.
         mission_control.manager.create_mission(
             session_id,
             proposal["title"],
             _mission_prompt(proposal["title"], load_history(session_id))
             + f"\n\nMission instructions: {proposal['prompt']}",
         )
+    del _pending_proposals[session_id]
     hermes_bridge.publish_event(session_id, {
         "type": "mission_proposal_resolved",
         "request_id": proposal["id"],

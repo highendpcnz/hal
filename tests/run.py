@@ -786,14 +786,30 @@ async def _exercise_proposals():
         declined = main._proposal_reply("prop-no", "no", speaker=None)
         not_created = [m.title for m in mission_control.manager.missions.values()]
         silent = main._proposal_reply("prop-none", "yes", speaker=None)
+        # Approval at the mission cap must keep the proposal pending — the
+        # cap is per session, and no await runs between creations, so the
+        # fake missions stay "active" until gathered below.
+        for i in range(mc.MAX_ACTIVE_MISSIONS):
+            main._register_proposal("cap-sess", f"filler {i}", "fill", source="brain")
+            main._proposal_reply("cap-sess", "yes", speaker=None)
+        main._register_proposal("cap-sess", "One too many", "overflow", source="brain")
+        capped_reply = main._proposal_reply("cap-sess", "yes", speaker=None)
+        still_pending = main._pending_proposal("cap-sess") is not None
+        main._pending_proposals.clear()
         await asyncio.gather(*list(mission_control.manager._tasks))
-        return approved, created, declined, not_created, silent
+        return approved, created, declined, not_created, silent, capped_reply, still_pending
     finally:
         hermes_bridge.ask_hermes = orig_ask
         mission_control.manager = orig_manager
 
 
-_approved, _created, _declined, _not_created, _silent = asyncio.run(_exercise_proposals())
+(_approved, _created, _declined, _not_created, _silent,
+ _capped_reply, _still_pending) = asyncio.run(_exercise_proposals())
+check(
+    "approval at the mission cap keeps the proposal pending",
+    _capped_reply is not None and "as many missions" in _capped_reply and _still_pending,
+    repr((_capped_reply, _still_pending)),
+)
 check(
     "voice yes approves the proposal into a mission",
     _approved is not None and "Mission underway" in _approved and _created == ["Scan the hull"],
