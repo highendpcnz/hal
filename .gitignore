@@ -7,4 +7,5 @@ models/*.json
 *.wav
 .DS_Store
 data/
-.claude/
+.claude/*
+!.claude/skills/
