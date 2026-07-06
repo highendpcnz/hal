@@ -628,6 +628,12 @@ check("chess spoken from-to with number words", _k == "move" and ce.move_uci(_m)
 _k, _m = _cmgr.resolve(_cgame, "Nf3", typed=True)
 check("chess typed SAN", _k == "move" and ce.move_uci(_m) == "g1f3")
 check("chess ignores plain talk", _cmgr.resolve(_cgame, "what's our status?", typed=False) is None)
+check(
+    "chess ignores square-like tokens in conversation",
+    _cmgr.resolve(_cgame, "meet me at gate b4 after lunch", typed=False) is None,
+)
+_k, _m = _cmgr.resolve(_cgame, "HAL, e4.", typed=False)
+check("chess bare square with address", _k == "move" and ce.move_uci(_m) == "e2e4")
 check("chess typed plain talk ignored", _cmgr.resolve(_cgame, "check the logs", typed=True) is None)
 _k, _m = _cmgr.resolve(_cgame, "knight to e4", typed=False)
 check("chess illegal attempt flagged", _k == "illegal", repr((_k, _m)))

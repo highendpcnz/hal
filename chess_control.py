@@ -170,13 +170,19 @@ class ChessManager:
             if piece:
                 matches = [mv for mv in matches if board.sq[mv[0]].upper() == piece]
             else:
-                # A bare square is a pawn move by convention — but only treat
-                # it as chess at all when it's unambiguous or clearly a move.
+                # A bare square is a pawn move by convention — but only when
+                # the utterance IS the square ("e4", "HAL, e4"), otherwise
+                # ordinary conversation that happens to contain a square-like
+                # token ("gate B4") would hijack the turn mid-game.
+                bare = re.fullmatch(
+                    r"(?:hey\s+|ok\s+|okay\s+)?(?:hal\s+)?(?:to\s+)?[a-h][1-8]",
+                    spoken.strip(),
+                )
+                if bare is None and not wants_capture:
+                    return None  # not clearly a move — leave it to the brain
                 pawn_matches = [mv for mv in matches if board.sq[mv[0]].upper() == "P"]
-                if pawn_matches:
+                if bare and pawn_matches:
                     matches = pawn_matches
-                elif not wants_capture and len(matches) != 1:
-                    return None
             if wants_capture:
                 capture_matches = [mv for mv in matches if board.is_capture(mv)]
                 if capture_matches:
