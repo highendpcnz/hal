@@ -2148,6 +2148,9 @@
   let wsTurn = false;  // the in-flight turn belongs to the WebSocket transport
   let wsPlaybackGen = 0;  // bumped when WS playback is torn down or superseded
   let announceSignalled = false;  // this socket has been told we can hear
+  // Running commentary: one tts cycle per sentence, so tts_done no longer
+  // means the turn is over — turn_done is the unlock signal instead.
+  let commentaryActive = false;
 
   // Tell the server we can actually play audio (socket open + AudioContext
   // running after a user gesture) so it can deliver queued trigger reports
@@ -2182,6 +2185,13 @@
           wsSampleRate = msg.sample_rate || 22050;
           wsNextTime = 0;
           wsStarted = false;
+        } else if (msg.type === 'commentary') {
+          // A sentence HAL is speaking while the turn still runs — caption
+          // it live; the full reply lands in the log via the final
+          // transcript frame.
+          commentaryActive = true;
+          setState('speaking');
+          if (msg.text) showCaption(msg.text, { holdMs: 8000 });
         } else if (msg.type === 'tts_done') {
           // tts_done races the async decode in playWsChunk (string frames are
           // handled while binary ones still await arrayBuffer), and it only
@@ -2193,12 +2203,26 @@
             await new Promise(r => setTimeout(r, 100));
           } while (wsPlaybackGen === gen && ctx && ctx.currentTime < wsNextTime);
           if (wsPlaybackGen !== gen) return;  // barge-in or a newer reply owns the state
+          if (commentaryActive) return;  // per-sentence cycle — turn_done unlocks
+          streamPlayback = null;
+          turnDone();
+        } else if (msg.type === 'turn_done') {
+          // Commentary turn finished server-side; wait for scheduled audio
+          // to drain, then unlock.
+          const gen = wsPlaybackGen;
+          const ctx = audioCtx;
+          do {
+            await new Promise(r => setTimeout(r, 100));
+          } while (wsPlaybackGen === gen && ctx && ctx.currentTime < wsNextTime);
+          commentaryActive = false;
+          if (wsPlaybackGen !== gen) return;
           streamPlayback = null;
           turnDone();
         } else if (msg.type === 'turn_aborted') {
           // The server had nothing to say (empty audio, over-long recording,
           // error) — without this the UI would wait on a reply forever.
           // Wake-gated ambient speech is dropped without comment.
+          commentaryActive = false;
           if (msg.reason !== 'no_wake_word') {
             showCaption(msg.text || "I didn't quite catch that, Dave.",
                         { isError: msg.reason === 'error' });
@@ -2215,6 +2239,7 @@
     ws.onopen = () => { sendWakeMode(); maybeAnnounceReady(); };
     ws.onclose = () => {
       announceSignalled = false;
+      commentaryActive = false;
       if (isWsRecording) {
         // Socket died while still capturing a duplex utterance — there will
         // be no end_speech reply to unlock on. Stop the recorder before

@@ -253,6 +253,20 @@ def unalias_events(alias_id: str) -> None:
 # spoken permission prompts). Called on the event loop; must not block.
 on_event = None  # Callable[[str, dict], None] | None
 
+# Commentary sinks: session key -> callable(chunk_text). Registered by the
+# transport around one turn's ask() so agent_message_chunk text can be
+# spoken while the turn is still running. Called on the event loop per
+# chunk; sinks must not block.
+_commentary_sinks: dict = {}
+
+
+def set_commentary_sink(cookie_id: str, sink) -> None:
+    _commentary_sinks[cookie_id] = sink
+
+
+def clear_commentary_sink(cookie_id: str) -> None:
+    _commentary_sinks.pop(cookie_id, None)
+
 
 def publish_event(cookie_id: str, payload: dict) -> None:
     """Emit an SSE event for a browser session (aliases resolved). Events
@@ -375,6 +389,13 @@ class _HALClient:
             text = getattr(getattr(update, "content", None), "text", "") or ""
             if text:
                 self._buffers.setdefault(session_id, []).append(text)
+                cookie_id = _acp_to_cookie.get(session_id)
+                sink = _commentary_sinks.get(cookie_id) if cookie_id else None
+                if sink is not None:
+                    try:
+                        sink(text)
+                    except Exception as exc:
+                        print(f"[hermes_bridge] commentary sink failed: {exc!r}")
         elif kind in ("tool_call", "tool_call_update"):
             cookie_id = _acp_to_cookie.get(session_id)
             if cookie_id is None:

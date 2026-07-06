@@ -1183,6 +1183,51 @@ def _drain_announcements() -> list[str]:
     _pending_announcements.clear()
     return drained
 
+# Running commentary: HAL speaks the reply sentence-by-sentence while the
+# agent is still working, instead of waiting for the turn to finish.
+# WS/duplex transport only — HTTP responses can't push early audio.
+COMMENTARY = os.environ.get("HAL_COMMENTARY", "1").strip().lower() not in {"0", "false", "no"}
+
+_SENTENCE_BOUNDARY = re.compile(r"[.!?](?:\s+|$)|\n+")
+
+
+class SentenceAssembler:
+    """Accumulates streamed chunk text and yields complete sentences.
+
+    Holds everything back while a ``` fence is open so speakable() sees the
+    whole code block and can replace it as one unit — a fence split across
+    sentences would leak backticks into speech.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, text: str) -> list[str]:
+        self._buf += text
+        if self._buf.count("```") % 2 == 1:
+            return []
+        sentences = []
+        pos = 0
+        while True:
+            match = _SENTENCE_BOUNDARY.search(self._buf, pos)
+            if match is None:
+                break
+            if self._buf.count("```", 0, match.start()) % 2 == 1:
+                # Boundary inside a completed fence — resume after its close.
+                pos = self._buf.find("```", match.start()) + 3
+                continue
+            sentence = self._buf[: match.end()].strip()
+            self._buf = self._buf[match.end():]
+            pos = 0
+            if sentence:
+                sentences.append(sentence)
+        return sentences
+
+    def flush(self) -> str:
+        tail, self._buf = self._buf.strip(), ""
+        return tail
+
+
 async def _ws_send_tts(websocket: WebSocket, text: str) -> None:
     """Speak one reply over the socket: tts_start, PCM frames, tts_done."""
     await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
@@ -1206,8 +1251,57 @@ async def _speak_over_ws(session_id: str, websocket: WebSocket, text: str) -> No
 
 async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) -> None:
     await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
-    hal_text, _timings = await run_turn_text(session_id, user_text)
-    await _speak_over_ws(session_id, websocket, hal_text)
+    if not COMMENTARY:
+        hal_text, _timings = await run_turn_text(session_id, user_text)
+        await _speak_over_ws(session_id, websocket, hal_text)
+        return
+
+    # Speak-while-thinking: agent chunks flow through a sentence assembler
+    # into a speaker task, so HAL's voice starts at his first sentence. The
+    # final transcript frame still carries the whole reply for the log, and
+    # turn_done (not tts_done) is the client's unlock signal — commentary
+    # produces one tts cycle per sentence.
+    sentences: asyncio.Queue = asyncio.Queue()
+    assembler = SentenceAssembler()
+    spoken_count = 0
+
+    def sink(chunk: str) -> None:
+        for sentence in assembler.feed(chunk):
+            sentences.put_nowait(sentence)
+
+    async def speaker() -> None:
+        nonlocal spoken_count
+        while True:
+            sentence = await sentences.get()
+            if sentence is None:
+                return
+            async with _ws_speech_locks.hold(session_id):
+                try:
+                    await websocket.send_json({"type": "commentary", "text": sentence})
+                    await _ws_send_tts(websocket, speakable(sentence))
+                    spoken_count += 1
+                except Exception:
+                    pass  # socket gone — keep draining so the turn can end
+
+    speaker_task = _spawn(speaker(), name=f"ws-commentary-{session_id[:8]}")
+    hermes_bridge.set_commentary_sink(session_id, sink)
+    try:
+        hal_text, _timings = await run_turn_text(session_id, user_text)
+    finally:
+        hermes_bridge.clear_commentary_sink(session_id)
+    tail = assembler.flush()
+    if tail:
+        sentences.put_nowait(tail)
+    sentences.put_nowait(None)
+    await speaker_task
+
+    async with _ws_speech_locks.hold(session_id):
+        await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
+        if spoken_count == 0:
+            # Nothing streamed (template reply, chess, error line) — speak
+            # the reply whole, as before.
+            await _ws_send_tts(websocket, speakable(hal_text))
+    await websocket.send_json({"type": "turn_done"})
 
 
 async def _ws_turn_task(websocket: WebSocket, session_id: str, user_text: str) -> None:

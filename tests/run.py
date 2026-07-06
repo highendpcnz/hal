@@ -592,6 +592,70 @@ check(
 )
 check("mission prompt tolerates empty history", "(no prior conversation)" in main._mission_prompt("x", []))
 
+# --- running commentary: sentence assembly + chunk sink ---------------------------
+
+_asm = main.SentenceAssembler()
+check("assembler holds a partial sentence", _asm.feed("I am checking the ") == [])
+check(
+    "assembler emits on the boundary",
+    _asm.feed("logs now. This may take") == ["I am checking the logs now."],
+)
+check("assembler flushes the tail", _asm.flush() == "This may take")
+_asm2 = main.SentenceAssembler()
+check(
+    "assembler treats newlines as boundaries",
+    _asm2.feed("First line\nSecond line. And") == ["First line", "Second line."],
+)
+_asm3 = main.SentenceAssembler()
+check("assembler holds inside a code fence", _asm3.feed("Look: ```py\nx = 1. y = 2.") == [])
+check(
+    "assembler releases the closed fence whole",
+    _asm3.feed("\n``` Done now.") == ["Look: ```py\nx = 1. y = 2.\n``` Done now."],
+)
+_asm4 = main.SentenceAssembler()
+check(
+    "assembler splits multiple sentences in one chunk",
+    _asm4.feed("One. Two! Three? Four") == ["One.", "Two!", "Three?"],
+)
+
+
+def _exercise_commentary_sink():
+    client = hermes_bridge._HALClient(None)
+    hermes_bridge._acp_to_cookie["acp-comm"] = "cookie-comm"
+    heard: list[str] = []
+    hermes_bridge.set_commentary_sink("cookie-comm", heard.append)
+
+    class _Chunk:
+        session_update = "agent_message_chunk"
+
+        class content:
+            text = "Hello, Dave. "
+
+    async def drive():
+        client.begin("acp-comm")
+        await client.session_update("acp-comm", _Chunk())
+        await client.session_update("acp-comm", _Chunk())
+        hermes_bridge.clear_commentary_sink("cookie-comm")
+        await client.session_update("acp-comm", _Chunk())
+        return client.finish("acp-comm")
+
+    reply = asyncio.run(drive())
+    hermes_bridge._acp_to_cookie.pop("acp-comm", None)
+    return heard, reply
+
+
+_heard, _reply = _exercise_commentary_sink()
+check(
+    "commentary sink hears chunks while registered",
+    _heard == ["Hello, Dave. ", "Hello, Dave. "],
+    repr(_heard),
+)
+check(
+    "buffered reply is unaffected by the sink",
+    _reply == "Hello, Dave. Hello, Dave. Hello, Dave.",
+    repr(_reply),
+)
+
 # --- chess engine (clean-room; perft pins move generation) -------------------------
 
 import chess_engine as ce  # noqa: E402
@@ -757,11 +821,17 @@ for token in (
     'id="chess-panel"',        # chess board panel exists
     "/api/chess/",             # …and drives the chess endpoints
     "chess_update",            # board refreshes on SSE chess events
+    "commentary",              # speak-while-thinking sentence frames handled
+    "turn_done",               # …and the commentary turn's unlock signal
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(
     "ws.onopen re-sends wake mode after reconnect",
     "ws.onopen" in _frontend_src and "sendWakeMode" in _frontend_src,
+)
+check(
+    "tts_done defers to turn_done during commentary",
+    "if (commentaryActive) return;" in _frontend_src,
 )
 
 # ----------------------------------------------------------------------------

@@ -109,6 +109,7 @@ still verified by running the server.
 | `HAL_CHESS_DEPTH` / `HAL_CHESS_TIME` | `3` / `4` | chess engine search depth and time budget (seconds) |
 | `HAL_TRIGGERS_POLL` | `30` | seconds between `data/triggers.json` scans |
 | `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records; `0` disables |
+| `HAL_COMMENTARY` | `1` | speak-while-thinking on WS turns: HAL voices each sentence as the agent produces it; `0` restores speak-at-end |
 | `HAL_HERMES_ACP_BIN` | `~/hermes-agent/.venv/bin/hermes-acp` | ACP adapter path |
 | `HAL_HERMES_BIN` | `~/hermes-agent/.venv/bin/hermes` | Hermes CLI path (subprocess mode) |
 | `HAL_HERMES_ARGS` | *(empty)* | extra CLI args in subprocess mode, e.g. `-m gpt-5.4` or `--yolo` |
