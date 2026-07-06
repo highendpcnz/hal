@@ -38,6 +38,7 @@ import chess_control
 import chess_engine
 import hermes_bridge
 from hermes_bridge import ask_hermes
+import ledger
 import mission_control
 import speaker_id
 
@@ -86,6 +87,7 @@ hermes_bridge.init(DATA_DIR)
 mission_control.init(DATA_DIR)
 chess_control.init(DATA_DIR)
 speaker_id.init(DATA_DIR)
+ledger.init(DATA_DIR)
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -449,6 +451,32 @@ _MISSION_CANCEL_RE = re.compile(
 )
 _MISSION_ASK_RE = re.compile(r"^\s*hal[,.]?\s+ask\s+the\s+mission[,:]?\s*(.*)$", re.I)
 
+# Care Ledger: instant voice commands. The nightly sweep and the briefing
+# read/write the same file; these are the zero-inference paths.
+_LEDGER_ADD_RE = re.compile(r"^\s*hal[,.]?\s+remember\s+(?:that\s+)?(.+?)[.!]?\s*$", re.I)
+_LEDGER_QUERY_RE = re.compile(
+    r"^\s*hal[,.]?\s+(?:what(?:'s| is)\s+(?:on\s+)?(?:my|the)\s+ledger|read\s+(?:me\s+)?"
+    r"(?:my|the)\s+ledger|what\s+are\s+my\s+open\s+loops?)\s*\??\s*$",
+    re.I,
+)
+_LEDGER_DONE_RE = re.compile(
+    r"^\s*hal[,.]?\s+mark\s+(.+?)\s+(?:as\s+)?done[.!]?\s*$|^\s*hal[,.]?\s+that(?:'s| is)\s+done[.!]?\s*$",
+    re.I,
+)
+_LEDGER_FORGET_RE = re.compile(
+    r"^\s*hal[,.]?\s+forget\s+(?:that|the\s+last\s+one)[.!]?\s*$"
+    r"|^\s*hal[,.]?\s+forget\s+the\s+one\s+about\s+(.+?)[.!]?\s*$",
+    re.I,
+)
+
+
+def _ledger_add_request(user_text: str) -> str | None:
+    if user_text.startswith("/remember"):
+        return user_text[len("/remember"):].strip() or None
+    match = _LEDGER_ADD_RE.match(user_text)
+    return match.group(1).strip() if match else None
+
+
 # Crew Manifest: enrollment by introduction. "this is X" needs the guard
 # below or "HAL, this is ridiculous" enrolls Ridiculous — whisper reliably
 # capitalizes proper names and lowercases adjectives, so require a leading
@@ -747,6 +775,23 @@ async def run_turn_text(
             hal_text = f"Very well. I no longer know {name}'s voice."
         else:
             hal_text = f"I don't have a voiceprint for {name}."
+    elif (ledger_text := _ledger_add_request(user_text)) is not None:
+        ledger.manager.add(ledger_text)
+        hal_text = "Noted, Dave. It's on the ledger."
+    elif _LEDGER_QUERY_RE.match(user_text) is not None:
+        hal_text = ledger.manager.spoken_summary()
+    elif (done_match := _LEDGER_DONE_RE.match(user_text)) is not None:
+        entry = ledger.manager.complete(done_match.group(1) or "")
+        hal_text = (
+            f"Marked done, Dave: {entry['text']}." if entry
+            else "I couldn't find that on the ledger, Dave."
+        )
+    elif (forget_ledger := _LEDGER_FORGET_RE.match(user_text)) is not None:
+        entry = ledger.manager.forget(forget_ledger.group(1))
+        hal_text = (
+            f"Forgotten, Dave: {entry['text']}." if entry
+            else "There's nothing on the ledger to forget, Dave."
+        )
     elif (mission_title := _mission_request(user_text)) is not None:
         if mission_title:
             try:
@@ -803,6 +848,9 @@ async def run_turn_text(
         # Completed-mission reports ride along on the next prompt so the
         # brain can answer follow-up questions about them.
         notes = mission_control.manager.drain_notes(session_id)
+        ledger_note = ledger.manager.daily_note()
+        if ledger_note:
+            notes = [*notes, ledger_note]
         tagged_text = user_text
         if speaker is not None and speaker_id.manager is not None and speaker_id.manager.enrolled():
             # Voice identity for the persona: it addresses crew by name and

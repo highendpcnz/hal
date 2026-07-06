@@ -656,6 +656,47 @@ check(
     repr(_reply),
 )
 
+# --- care ledger: commands, storage, daily note -------------------------------------
+
+import ledger as ledger_mod  # noqa: E402
+
+check("ledger add voice form", main._ledger_add_request("HAL, remember to renew the domain.") == "to renew the domain")
+check("ledger add that-form", main._ledger_add_request("Hal, remember that Frank owes me a report") == "Frank owes me a report")
+check("ledger add typed", main._ledger_add_request("/remember buy coffee") == "buy coffee")
+check("ledger add negative", main._ledger_add_request("HAL, do you remember the mission?") is None)
+check("ledger query matches", main._LEDGER_QUERY_RE.match("HAL, what's on my ledger?") is not None)
+check("ledger query loops form", main._LEDGER_QUERY_RE.match("Hal, what are my open loops?") is not None)
+check("ledger done bare", main._LEDGER_DONE_RE.match("HAL, that's done.") is not None)
+check("ledger done named", main._LEDGER_DONE_RE.match("HAL, mark the domain as done").group(1) == "the domain")
+check("ledger forget bare", main._LEDGER_FORGET_RE.match("HAL, forget that.") is not None)
+check("ledger forget about", main._LEDGER_FORGET_RE.match("Hal, forget the one about coffee").group(1) == "coffee")
+check("voice-forget still wins", main._FORGET_VOICE_RE.match("HAL, forget Frank's voice") is not None)
+
+_ldir = Path(_tmp.name) / "ledger-data"
+_ldir.mkdir()
+_led = ledger_mod.Ledger(_ldir)
+_led.add("renew the domain", due="2020-01-01")
+_led.add("call Frank about the server")
+_led.add("draft the report")
+check("ledger orders due first", _led.open_entries()[0]["text"] == "renew the domain")
+check("ledger due_today catches overdue", [e["text"] for e in _led.due_today()] == ["renew the domain"])
+_sum = _led.spoken_summary()
+check("ledger summary speaks counts and dues", "3 items" in _sum and "Due now: renew the domain" in _sum, _sum)
+check("ledger complete by query", _led.complete("domain")["text"] == "renew the domain")
+check("ledger complete keeps the record", any(e["status"] == "done" for e in _led._load()))
+check("ledger forget latest", _led.forget(None)["text"] == "draft the report")
+check("ledger forget by query", _led.forget("frank")["text"] == "call Frank about the server")
+check("ledger empty summary", "clear" in ledger_mod.Ledger(Path(_tmp.name) / "ledger-empty").spoken_summary())
+(_ldir / "ledger.json").write_text("{broken")
+check("ledger tolerates corrupt file", ledger_mod.Ledger(_ldir).open_entries() == [])
+
+_led2 = ledger_mod.Ledger(Path(_tmp.name) / "ledger-note")
+(Path(_tmp.name) / "ledger-note").mkdir(exist_ok=True)
+_led2.add("file taxes", due="2020-01-01")
+_first_note = _led2.daily_note()
+check("ledger daily note mentions due items", _first_note is not None and "file taxes" in _first_note)
+check("ledger daily note fires once per day", _led2.daily_note() is None)
+
 # --- crew manifest: enrollment grammar, profiles, permission gating ----------------
 
 import numpy as _np  # noqa: E402

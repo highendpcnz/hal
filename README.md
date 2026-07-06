@@ -228,6 +228,26 @@ this is what lets a briefing run shell and web tools under the default
 `deny`. You edit the trigger file, you grant the scope; leave it off for
 triggers that don't need tools.
 
+## The Care Ledger
+
+HAL keeps a ledger of promises, deadlines, and open loops in
+`data/ledger.json`. Three ways in and out:
+
+- **Voice, instantly (no inference):** "HAL, remember to renew the domain"
+  · "HAL, what's on my ledger?" / "what are my open loops?" · "HAL, that's
+  done" / "mark the domain as done" · "HAL, forget that" / "forget the one
+  about the domain". Typed `/remember <text>` works too. (Any "HAL,
+  remember …" sentence lands on the ledger — reminiscing counts; "forget
+  that" undoes.)
+- **The nightly sweep** — a trigger mission (see
+  [docs/triggers.example.json](docs/triggers.example.json)) whose prompt
+  teaches the agent the schema: it reads the day's conversations and
+  mission records, adds open loops conservatively, sets due dates, and
+  retires what got resolved. One inference pass per day.
+- **Back at you:** items due today ride into the first brain turn of the
+  day as a system note (mentioned once, not nagging), and the morning
+  briefing leads with them.
+
 ## The Crew Manifest (voiceprints)
 
 "HAL, this is Frank" (or "HAL, my name is …") enrolls a voiceprint: HAL asks
