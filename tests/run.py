@@ -667,6 +667,97 @@ check(
 hermes_bridge.clear_commentary_sink("race-ck", _sink_b)
 check("owner clear removes the sink", "race-ck" not in hermes_bridge._commentary_sinks)
 
+# --- the initiative: proposal marker, lifecycle, voice answer -----------------------
+
+_prop_text = main._extract_proposal(
+    "prop-sess",
+    "The registrar expires soon, Dave. Shall I handle it?\n"
+    "PROPOSE_MISSION: Renew the domain ::: Renew dave.example at the registrar.",
+)
+check(
+    "proposal marker is stripped from speech",
+    _prop_text == "The registrar expires soon, Dave. Shall I handle it?",
+    _prop_text,
+)
+_prop = main._pending_proposal("prop-sess")
+check(
+    "proposal is registered pending",
+    _prop is not None and _prop["title"] == "Renew the domain"
+    and "registrar" in _prop["prompt"],
+)
+check(
+    "reply without marker is untouched",
+    main._extract_proposal("prop-sess2", "All quiet, Dave.") == "All quiet, Dave."
+    and main._pending_proposal("prop-sess2") is None,
+)
+_prop["created_at"] -= main.PROPOSAL_TTL + 1
+check("proposals expire", main._pending_proposal("prop-sess") is None)
+
+
+async def _exercise_proposals():
+    orig_ask = hermes_bridge.ask_hermes
+    orig_manager = mission_control.manager
+
+    async def fake_ask(text, sid):
+        return "done"
+
+    hermes_bridge.ask_hermes = fake_ask
+    try:
+        mission_control.manager = mc.MissionManager(Path(_tmp.name) / "missions-prop")
+        main._register_proposal("prop-yes", "Scan the hull", "scan it", source="brain")
+        approved = main._proposal_reply("prop-yes", "go ahead", speaker=None)
+        created = [m.title for m in mission_control.manager.missions.values()]
+        main._register_proposal("prop-no", "Vent the pod bay", "vent", source="brain")
+        declined = main._proposal_reply("prop-no", "no", speaker=None)
+        not_created = [m.title for m in mission_control.manager.missions.values()]
+        silent = main._proposal_reply("prop-none", "yes", speaker=None)
+        await asyncio.gather(*list(mission_control.manager._tasks))
+        return approved, created, declined, not_created, silent
+    finally:
+        hermes_bridge.ask_hermes = orig_ask
+        mission_control.manager = orig_manager
+
+
+_approved, _created, _declined, _not_created, _silent = asyncio.run(_exercise_proposals())
+check(
+    "voice yes approves the proposal into a mission",
+    _approved is not None and "Mission underway" in _approved and _created == ["Scan the hull"],
+    repr((_approved, _created)),
+)
+check(
+    "voice no declines without creating",
+    _declined is not None and "leave it" in _declined and "Vent the pod bay" not in _not_created,
+)
+check("no pending proposal means no answer", _silent is None)
+
+
+def _exercise_daily_initiative():
+    import ledger as ledger_mod_local
+    orig_ledger = ledger_mod_local.manager
+    ldir = Path(_tmp.name) / "ledger-initiative"
+    ldir.mkdir(exist_ok=True)
+    ledger_mod_local.manager = ledger_mod_local.Ledger(ldir)
+    ledger_mod_local.manager.add("renew the domain", due="2020-01-01")
+    try:
+        main._INITIATIVE_STATE.unlink(missing_ok=True)
+        first = main._daily_initiative("init-sess")
+        pending = main._pending_proposal("init-sess")
+        again = main._daily_initiative("init-sess-2")
+        return first, pending, again
+    finally:
+        ledger_mod_local.manager = orig_ledger
+        main._pending_proposals.pop("init-sess", None)
+
+
+_first_offer, _init_pending, _again = _exercise_daily_initiative()
+check(
+    "overdue ledger prompts a daily offer",
+    _first_offer is not None and "renew the domain" in _first_offer
+    and _init_pending is not None,
+    repr(_first_offer),
+)
+check("the initiative offers once per day", _again is None)
+
 # --- care ledger: commands, storage, daily note -------------------------------------
 
 import ledger as ledger_mod  # noqa: E402
@@ -964,6 +1055,9 @@ for token in (
     "turn_done",               # …and the commentary turn's unlock signal
     'id="viewscreen-panel"',   # viewscreen panel exists
     "/api/viewscreen",         # …and lists/clears via the endpoints
+    'id="propbar"',            # mission proposal bar exists
+    "/api/proposal/",          # …and answers via the endpoint
+    "mission_proposal",        # …driven by the SSE event
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(

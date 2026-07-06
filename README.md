@@ -228,6 +228,24 @@ this is what lets a briefing run shell and web tools under the default
 `deny`. You edit the trigger file, you grant the scope; leave it off for
 triggers that don't need tools.
 
+## The Initiative (HAL proposes missions)
+
+HAL doesn't just accept missions — he offers them. Two sources:
+
+- **The brain:** when the agent notices something worth doing in the
+  background, it asks in prose and ends the reply with a
+  `PROPOSE_MISSION: <title> ::: <instructions>` marker line (taught in
+  [AGENTS.md](AGENTS.md)). The marker is stripped before speech and
+  history; an amber proposal bar appears with Approve/Decline.
+- **The ledger:** once a day, if items are due or overdue, HAL greets you
+  with an offer to open a mission and clear them.
+
+Answer by voice — the same yes/no grammar as tool permissions, including
+the commander rule once voiceprints are enrolled — or with the buttons
+(`POST /api/proposal/{id}`). One proposal pends at a time; unanswered ones
+expire after 10 minutes. Approved proposals become ordinary missions,
+subject to the usual mission cap and permission mode.
+
 ## The Care Ledger
 
 HAL keeps a ledger of promises, deadlines, and open loops in

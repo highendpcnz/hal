@@ -21,6 +21,7 @@ import uuid
 import wave
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from datetime import date
 from pathlib import Path
 from urllib.parse import quote
 
@@ -451,6 +452,137 @@ _MISSION_CANCEL_RE = re.compile(
 )
 _MISSION_ASK_RE = re.compile(r"^\s*hal[,.]?\s+ask\s+the\s+mission[,:]?\s*(.*)$", re.I)
 
+# The Initiative: HAL proposes missions instead of only accepting them.
+# Two sources — the brain ends a reply with a PROPOSE_MISSION marker when it
+# notices something worth doing, and a server-side rule offers to clear
+# overdue ledger items once a day. One pending proposal per session;
+# approval follows the same commander rule as tool permissions.
+PROPOSAL_TTL = 600.0
+_PROPOSAL_MARKER_RE = re.compile(
+    r"\n?^\s*PROPOSE_MISSION:\s*(.+?)\s*:::\s*(.+?)\s*$", re.M
+)
+_pending_proposals: dict[str, dict] = {}  # session -> {id,title,prompt,created_at}
+_INITIATIVE_STATE = DATA_DIR / "initiative_state.json"
+
+
+def _register_proposal(session_id: str, title: str, prompt: str, source: str) -> dict:
+    proposal = {
+        "id": uuid.uuid4().hex,
+        "title": title[:120],
+        "prompt": prompt,
+        "created_at": time.time(),
+        "source": source,
+    }
+    _pending_proposals[session_id] = proposal  # newest replaces
+    hermes_bridge.publish_event(session_id, {
+        "type": "mission_proposal",
+        "request_id": proposal["id"],
+        "title": proposal["title"],
+        "timeout": PROPOSAL_TTL,
+    })
+    return proposal
+
+
+def _pending_proposal(session_id: str) -> dict | None:
+    proposal = _pending_proposals.get(session_id)
+    if proposal is None:
+        return None
+    if time.time() - proposal["created_at"] > PROPOSAL_TTL:
+        del _pending_proposals[session_id]
+        return None
+    return proposal
+
+
+def _extract_proposal(session_id: str, hal_text: str) -> str:
+    """Strip a PROPOSE_MISSION marker from the reply and register it. The
+    marker is metadata — the reply's own prose carries the spoken offer."""
+    match = _PROPOSAL_MARKER_RE.search(hal_text)
+    if match is None:
+        return hal_text
+    _register_proposal(session_id, match.group(1), match.group(2), source="brain")
+    return _PROPOSAL_MARKER_RE.sub("", hal_text).strip()
+
+
+def _resolve_proposal(session_id: str, approve: bool) -> dict | None:
+    """Answer the pending proposal: create the mission or drop it."""
+    proposal = _pending_proposal(session_id)
+    if proposal is None:
+        return None
+    del _pending_proposals[session_id]
+    if approve:
+        mission_control.manager.create_mission(
+            session_id,
+            proposal["title"],
+            _mission_prompt(proposal["title"], load_history(session_id))
+            + f"\n\nMission instructions: {proposal['prompt']}",
+        )
+    hermes_bridge.publish_event(session_id, {
+        "type": "mission_proposal_resolved",
+        "request_id": proposal["id"],
+        "title": proposal["title"],
+        "approved": approve,
+    })
+    return proposal
+
+
+def _proposal_reply(session_id: str, user_text: str, speaker: str | None) -> str | None:
+    """Spoken yes/no answering a pending proposal — checked after permission
+    requests (those take precedence) and gated to the commander's voice the
+    same way."""
+    if _pending_proposal(session_id) is None:
+        return None
+    if _PERM_ALLOW_RE.match(user_text):
+        commander = speaker_id.manager.commander() if speaker_id.manager else None
+        if commander is not None and speaker is not None and speaker != commander:
+            return f"I'm sorry. Only {commander} can authorize that."
+        try:
+            proposal = _resolve_proposal(session_id, True)
+        except mission_control.MissionLimitError:
+            return (
+                "I'm sorry, Dave. I'm already running as many missions as "
+                "I allow myself. Let one finish first."
+            )
+        return f"Very well, Dave. Mission underway: {proposal['title']}."
+    if _PERM_DENY_RE.match(user_text):
+        proposal = _resolve_proposal(session_id, False)
+        return f"Understood, Dave. I'll leave it: {proposal['title']}."
+    return None
+
+
+def _daily_initiative(session_id: str) -> str | None:
+    """Once a day, offer to clear overdue ledger items — the server-side
+    proposal source. Returns the spoken offer, or None."""
+    due = ledger.manager.due_today() if ledger.manager else []
+    if not due or _pending_proposal(session_id) is not None:
+        return None
+    today = date.today().isoformat()
+    try:
+        state = json.loads(_INITIATIVE_STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if state.get("last_proposed") == today:
+        return None
+    tmp = _INITIATIVE_STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"last_proposed": today}))
+    tmp.replace(_INITIATIVE_STATE)
+    items = "; ".join(str(e.get("text", "")) for e in due[:4])
+    _register_proposal(
+        session_id,
+        "Clear the overdue ledger",
+        f"Work through Dave's overdue ledger items and do what can be done "
+        f"autonomously, reporting what needs him personally: {items}. The "
+        f"ledger file is data/ledger.json (see its schema in "
+        f"docs/triggers.example.json); mark what you complete as done.",
+        source="ledger",
+    )
+    first = str(due[0].get("text", "an item"))
+    return (
+        f"Dave, {first} is overdue on your ledger"
+        + (f", along with {len(due) - 1} more" if len(due) > 1 else "")
+        + ". Shall I open a mission and take care of it?"
+    )
+
+
 # Care Ledger: instant voice commands. The nightly sweep and the briefing
 # read/write the same file; these are the zero-inference paths.
 _LEDGER_ADD_RE = re.compile(r"^\s*hal[,.]?\s+remember\s+(?:that\s+)?(.+?)[.!]?\s*$", re.I)
@@ -759,6 +891,8 @@ async def run_turn_text(
 
     if (hal_text := _permission_reply(session_id, user_text, speaker)) is not None:
         pass  # a pending tool permission was just answered by voice/text
+    elif (hal_text := _proposal_reply(session_id, user_text, speaker)) is not None:
+        pass  # a pending mission proposal was just answered
     elif (enroll_name := _enroll_request(user_text)) is not None:
         if speaker_id.manager is None or not speaker_id.manager.available():
             hal_text = (
@@ -863,6 +997,7 @@ async def run_turn_text(
         stage_start = time.perf_counter()
         hal_text = await ask_hermes(prompt_text, session_id)
         timings["infer"] = _elapsed_ms(stage_start)
+        hal_text = _extract_proposal(session_id, hal_text)
 
     stage_start = time.perf_counter()
     now = time.time()
@@ -1387,6 +1522,29 @@ async def permission_decision(request_id: str, body: PermissionDecision, request
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 
+class ProposalDecision(BaseModel):
+    decision: str  # "approve" | "decline"
+
+
+@app.post("/api/proposal/{request_id}")
+async def proposal_decision(request_id: str, body: ProposalDecision, request: Request):
+    """Answer a pending mission proposal (the proposal bar's buttons)."""
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return JSONResponse({"ok": False}, status_code=403)
+    proposal = _pending_proposal(session_id)
+    if proposal is None or proposal["id"] != request_id:
+        return JSONResponse({"ok": False}, status_code=404)
+    approve = body.decision.strip().lower() == "approve"
+    try:
+        _resolve_proposal(session_id, approve)
+    except mission_control.MissionLimitError:
+        return JSONResponse({"ok": False, "error": "mission cap"}, status_code=409)
+    if approve:
+        _speak_if_connected(session_id, f"Very well, Dave. Mission underway: {proposal['title']}.")
+    return JSONResponse({"ok": True})
+
+
 @app.post("/api/session/reset")
 def reset_session(request: Request):
     """Start fresh: drop the Hermes session mapping and transcript history,
@@ -1516,10 +1674,18 @@ async def _ws_run_turn(
 
     async def speak_worker() -> None:
         nonlocal spoken_count
+        muted = False
         while True:
             sentence = await sentences.get()
             if sentence is None:
                 return
+            # The PROPOSE_MISSION marker is reply metadata (last line by
+            # contract) — latch mute so neither it nor anything after is
+            # spoken. The assembler buffers whole sentences, so the marker
+            # word can't be split across chunks here.
+            if muted or "PROPOSE_MISSION" in sentence:
+                muted = True
+                continue
             async with _ws_speech_locks.hold(session_id):
                 try:
                     await websocket.send_json({"type": "commentary", "text": sentence})
@@ -1649,13 +1815,21 @@ async def _speak_prompt_safe(session_id: str, websocket: WebSocket, text: str) -
 async def _deliver_announcements(session_id: str, websocket: WebSocket) -> None:
     """Speak queued trigger reports to the session that just became able to
     hear them, and land each in its history so the greeting survives a
-    reload."""
+    reload. Afterwards, the Initiative gets its once-a-day chance to offer
+    a mission for overdue ledger items."""
     for text in _drain_announcements():
         async with _history_locks.hold(session_id):
             history = load_history(session_id)
             history.append({"role": "assistant", "content": text, "ts": time.time()})
             save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
         await _speak_prompt_safe(session_id, websocket, text)
+    offer = _daily_initiative(session_id)
+    if offer is not None:
+        async with _history_locks.hold(session_id):
+            history = load_history(session_id)
+            history.append({"role": "assistant", "content": offer, "ts": time.time()})
+            save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
+        await _speak_prompt_safe(session_id, websocket, offer)
 
 
 def _on_bridge_event(cookie_id: str, payload: dict) -> None:
@@ -1763,12 +1937,12 @@ async def ws_conversation(websocket: WebSocket):
 
                 if kind == "announce_ready":
                     # Browser reports its audio is unlocked — deliver any
-                    # trigger reports that finished while the Bridge was empty.
-                    if _pending_announcements:
-                        _spawn(
-                            _deliver_announcements(session_id, websocket),
-                            name="announcements",
-                        )
+                    # trigger reports that finished while the Bridge was
+                    # empty, then let the Initiative make its daily offer.
+                    _spawn(
+                        _deliver_announcements(session_id, websocket),
+                        name="announcements",
+                    )
                     continue
 
                 from_speech = False

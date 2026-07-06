@@ -929,6 +929,10 @@
   }
   .permbar button.allow:hover { color: #2a9e5a; border-color: #1a4a2a; }
   .permbar button.deny:hover { color: #b84b3b; border-color: #4a1710; }
+  /* Proposal bar: same chrome, amber accent, one row above the permbar so
+     both can show at once (the base transform centers it — don't touch). */
+  .propbar { border-color: #3a2a10; bottom: 148px; }
+  .propbar .permbar-text { color: #b8862a; }
 
   /* ═══════════════════════════════════════════════════
      RESPONSIVE: Mobile (default, < 760px)
@@ -1190,6 +1194,11 @@
     <span id="permbar-text" class="permbar-text"></span>
     <button id="perm-allow" class="allow" type="button">Allow</button>
     <button id="perm-deny" class="deny" type="button">Deny</button>
+  </div>
+  <div id="propbar" class="permbar propbar" role="alertdialog" aria-live="polite">
+    <span id="propbar-text" class="permbar-text"></span>
+    <button id="prop-approve" class="allow" type="button">Approve</button>
+    <button id="prop-decline" class="deny" type="button">Decline</button>
   </div>
   <div class="hint">Hold the eye — or the space bar — to speak · "/" to type</div>
 
@@ -1837,6 +1846,14 @@
         loadChess();  // a voice move (or another tab) changed the board
       } else if (msg.type === 'viewscreen') {
         loadViewscreen(true);  // the agent put something on the viewscreen
+      } else if (msg.type === 'mission_proposal') {
+        showPropbar(msg);
+        appendToMissionLog('system', 'HAL proposes: ' + (msg.title || 'a mission'));
+      } else if (msg.type === 'mission_proposal_resolved') {
+        if (msg.request_id === propRequestId) hidePropbar();
+        appendToMissionLog('system',
+          'Proposal "' + (msg.title || '') + '" — ' + (msg.approved ? 'approved' : 'declined'));
+        if (msg.approved) refreshMissions();
       }
     };
     events.onerror = () => {
@@ -1884,6 +1901,44 @@
   }
   document.getElementById('perm-allow')?.addEventListener('click', () => decidePermission(true));
   document.getElementById('perm-deny')?.addEventListener('click', () => decidePermission(false));
+
+  // ═══════════════════════════════════════════════════
+  // Proposal bar — HAL offers a mission; Dave decides
+  // (voice yes/no works too, this is the visible half)
+  // ═══════════════════════════════════════════════════
+  const propbar = document.getElementById('propbar');
+  const propbarText = document.getElementById('propbar-text');
+  let propRequestId = null;
+  let propTimer = null;
+
+  function showPropbar(msg) {
+    propRequestId = msg.request_id;
+    propbarText.textContent = 'HAL proposes a mission: ' + (msg.title || 'untitled');
+    propbar.classList.add('show');
+    clearTimeout(propTimer);
+    propTimer = setTimeout(hidePropbar, ((msg.timeout || 600) + 2) * 1000);
+  }
+  function hidePropbar() {
+    propRequestId = null;
+    propbar.classList.remove('show');
+    clearTimeout(propTimer);
+  }
+  async function decideProposal(approve) {
+    const id = propRequestId;
+    hidePropbar();
+    if (!id) return;
+    try {
+      await fetch('/api/proposal/' + encodeURIComponent(id), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: approve ? 'approve' : 'decline' }),
+      });
+    } catch (e) {}
+    if (approve) refreshMissions();
+  }
+  document.getElementById('prop-approve')?.addEventListener('click', () => decideProposal(true));
+  document.getElementById('prop-decline')?.addEventListener('click', () => decideProposal(false));
 
   // ═══════════════════════════════════════════════════
   // Waveform — WebAudio oscilloscope visualization
