@@ -360,6 +360,94 @@ _mgr5 = mc.MissionManager(_tdir2)
 check("garbage triggers.json tolerated", _mgr5._load_triggers() == [])
 check("absent triggers.json tolerated", mc.MissionManager(Path(_tmp.name) / "missions-trig3")._load_triggers() == [])
 
+# --- daily "at" triggers, persisted state, per-trigger permissions ---------------
+
+check("at parses valid time", mc._parse_at("07:30") == (7, 30))
+check("at parses midnight", mc._parse_at("0:00") == (0, 0))
+check("at rejects junk", all(mc._parse_at(v) is None for v in ("25:00", "7:60", "0730", 730, None, "a:b")))
+
+
+async def _exercise_at_triggers():
+    orig_ask = hermes_bridge.ask_hermes
+    allow_seen: list[bool] = []
+
+    async def fake_ask(text, sid):
+        allow_seen.append(sid in hermes_bridge._tool_allowed_cookies)
+        return "briefed"
+
+    hermes_bridge.ask_hermes = fake_ask
+    try:
+        import time as _time
+        tdir = Path(_tmp.name) / "missions-at"
+        mgr = mc.MissionManager(tdir)
+        (tdir / "triggers.json").write_text(json.dumps([
+            {"title": "briefing", "prompt": "brief me", "at": "07:30", "permissions": "allow"},
+        ]))
+        base = _time.mktime((2026, 3, 10, 6, 0, 0, 0, 0, -1))  # a 06:00 local
+        state: dict = {}
+        mgr._scheduler_tick(state, now=base)                     # first sight: arm, no fire
+        armed_quiet = len(mgr.missions) == 0
+        mgr._scheduler_tick(state, now=base + 2 * 3600)          # 08:00 — 07:30 passed → fire
+        fired = len(mgr.missions) == 1
+        mgr._scheduler_tick(state, now=base + 3 * 3600)          # 09:00 — same day, no refire
+        no_refire = len(mgr.missions) == 1
+        # Server "down" across the next day's 07:30 — the 11:00 tick catches up.
+        mgr._scheduler_tick(state, now=base + 86400 + 5 * 3600)
+        caught_up = len(mgr.missions) == 2
+        await asyncio.gather(*list(mgr._tasks))
+        return mgr, armed_quiet, fired, no_refire, caught_up, allow_seen
+    finally:
+        hermes_bridge.ask_hermes = orig_ask
+
+
+_mgr_at, _armed_quiet, _fired, _no_refire, _caught_up, _allow_seen = asyncio.run(_exercise_at_triggers())
+check("at trigger arms on first sight", _armed_quiet)
+check("at trigger fires once when its time passes", _fired and _no_refire)
+check("at trigger catches up after downtime, once", _caught_up)
+check(
+    "trigger permissions allow tools during the mission only",
+    _allow_seen == [True, True] and not hermes_bridge._tool_allowed_cookies,
+    repr((_allow_seen, hermes_bridge._tool_allowed_cookies)),
+)
+check(
+    "at mission records allow_tools",
+    all(m.allow_tools for m in _mgr_at.missions.values()),
+)
+
+_state_mgr = mc.MissionManager(Path(_tmp.name) / "missions-state")
+_state_mgr._save_trigger_state({"briefing": {"last_at": 123.0}})
+check(
+    "trigger state persists across managers",
+    mc.MissionManager(Path(_tmp.name) / "missions-state")._load_trigger_state()
+    == {"briefing": {"last_at": 123.0}},
+)
+(Path(_tmp.name) / "missions-state" / "trigger_state.json").write_text("{bad")
+check("corrupt trigger state tolerated", _state_mgr._load_trigger_state() == {})
+
+# --- queued trigger announcements -------------------------------------------------
+
+main.active_websockets.clear()
+main._pending_announcements.clear()
+_trig_mission = mission_control.Mission(
+    id="t-ann", title="briefing", cookie_id=mc.TRIGGER_COOKIE, session_id="s-ann",
+    status="completed", result="Sky is clear, Dave.",
+)
+asyncio.run(main.on_mission_complete(_trig_mission))
+check(
+    "trigger report queues when the Bridge is empty",
+    len(main._pending_announcements) == 1 and "Sky is clear" in main._pending_announcements[0],
+    repr(main._pending_announcements),
+)
+for _i in range(main.MAX_PENDING_ANNOUNCEMENTS + 5):
+    main._pending_announcements.append(f"note {_i}")
+    del main._pending_announcements[:-main.MAX_PENDING_ANNOUNCEMENTS]
+check("announcement queue is capped", len(main._pending_announcements) == main.MAX_PENDING_ANNOUNCEMENTS)
+_drained = main._drain_announcements()
+check(
+    "announcements drain once",
+    len(_drained) == main.MAX_PENDING_ANNOUNCEMENTS and main._drain_announcements() == [],
+)
+
 # --- mission prompt context ------------------------------------------------------
 
 _mp = main._mission_prompt("fix the CI", [
@@ -435,6 +523,7 @@ for token in (
     "set_mode",                # wake-word toggle frame
     "interim_transcript",      # live caption frames handled
     "no_wake_word",            # gated utterances stay silent
+    "announce_ready",          # queued trigger reports delivered post-gesture
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(

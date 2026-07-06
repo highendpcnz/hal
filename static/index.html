@@ -1233,7 +1233,11 @@
         const Ctx = window.AudioContext || window.webkitAudioContext;
         if (Ctx) audioCtx = new Ctx();
       }
-      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume().then(maybeAnnounceReady).catch(() => {});
+      } else {
+        maybeAnnounceReady();
+      }
       if (!primedAudio) {
         primedAudio = new Audio();
         primedAudio.playsInline = true;
@@ -1935,6 +1939,20 @@
   let wsStarted = false;
   let wsTurn = false;  // the in-flight turn belongs to the WebSocket transport
   let wsPlaybackGen = 0;  // bumped when WS playback is torn down or superseded
+  let announceSignalled = false;  // this socket has been told we can hear
+
+  // Tell the server we can actually play audio (socket open + AudioContext
+  // running after a user gesture) so it can deliver queued trigger reports
+  // as a spoken greeting. Re-signalled per socket: the queue survives a
+  // reconnect, the flag must not.
+  function maybeAnnounceReady() {
+    if (announceSignalled) return;
+    if (!audioCtx || audioCtx.state !== 'running') return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    announceSignalled = true;
+    try { ws.send(JSON.stringify({ type: 'announce_ready' })); }
+    catch (e) { announceSignalled = false; }
+  }
 
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1986,8 +2004,9 @@
         await playWsChunk(e.data);
       }
     };
-    ws.onopen = () => { sendWakeMode(); };
+    ws.onopen = () => { sendWakeMode(); maybeAnnounceReady(); };
     ws.onclose = () => {
+      announceSignalled = false;
       if (isWsRecording) {
         // Socket died while still capturing a duplex utterance — there will
         // be no end_speech reply to unlock on. Stop the recorder before
@@ -2009,6 +2028,12 @@
     };
   }
   connectWS();
+
+  // Any first interaction (typing counts — Bridge users may never click the
+  // eye) unlocks audio and lets queued trigger reports through.
+  ['pointerdown', 'keydown'].forEach(evt =>
+    document.addEventListener(evt, primePlayback, { once: true, capture: true })
+  );
 
   async function playWsChunk(blob) {
     primePlayback();

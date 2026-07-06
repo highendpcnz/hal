@@ -275,6 +275,22 @@ def publish_event(cookie_id: str, payload: dict) -> None:
             pass  # ticker/eye state is ephemeral — drop rather than block
 
 
+# Session keys whose tool-permission requests are auto-allowed regardless of
+# PERMISSION_MODE (ACP mode only — subprocess mode has no permission
+# callback). Granted per mission by a trigger's "permissions": "allow";
+# data/triggers.json is the trust boundary. Keys are the synthetic
+# cookie-session ids missions run under, never a browser session.
+_tool_allowed_cookies: set[str] = set()
+
+
+def allow_tools_for(cookie_id: str) -> None:
+    _tool_allowed_cookies.add(cookie_id)
+
+
+def disallow_tools_for(cookie_id: str) -> None:
+    _tool_allowed_cookies.discard(cookie_id)
+
+
 # ---------------------------------------------------------------------------
 # Pending permission requests (PERMISSION_MODE == "ask"). All access happens
 # on the event loop: request_permission awaits the future there, and the
@@ -384,6 +400,10 @@ class _HALClient:
             return m["RequestPermissionResponse"](
                 outcome=m["AllowedOutcome"](outcome="selected", option_id=allow_opt.option_id)
             )
+
+        if cookie_id in _tool_allowed_cookies and allow_opt is not None:
+            print(f"[hermes_bridge] auto-allowing tool call (trigger permissions): {title}")
+            return allowed_response()
 
         if PERMISSION_MODE == "yolo" and allow_opt is not None:
             print(f"[hermes_bridge] auto-allowing tool call (permission mode yolo): {allow_opt.name}")

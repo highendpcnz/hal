@@ -34,6 +34,33 @@ class MissionLimitError(RuntimeError):
     """Raised when a session already has MAX_ACTIVE_MISSIONS running."""
 
 
+def _parse_at(raw) -> Optional[tuple[int, int]]:
+    """Validate a daily-trigger time of day; "07:30" -> (7, 30)."""
+    if not isinstance(raw, str):
+        return None
+    parts = raw.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hh, mm = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return hh, mm
+    return None
+
+
+def _last_occurrence(at: tuple[int, int], now: float) -> float:
+    """Epoch of the most recent local-time occurrence of HH:MM at or before
+    now. mktime resolves DST (tm_isdst=-1); the day-step back can be an hour
+    off across a DST switch, which for a daily trigger is acceptable."""
+    lt = time.localtime(now)
+    sched = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, at[0], at[1], 0, 0, 0, -1))
+    if sched > now:
+        sched -= 86400
+    return sched
+
+
 @dataclass
 class Mission:
     id: str
@@ -45,6 +72,10 @@ class Mission:
     result: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
+    # Tool-permission requests from this mission are auto-allowed (ACP mode),
+    # overriding HAL_PERMISSION_MODE. Granted only by a trigger's
+    # "permissions": "allow" — the trigger file is the trust boundary.
+    allow_tools: bool = False
 
 
 class MissionManager:
@@ -92,7 +123,9 @@ class MissionManager:
             if m.cookie_id == cookie_id and m.status == "active"
         )
 
-    def create_mission(self, cookie_id: str, title: str, prompt: str) -> Mission:
+    def create_mission(
+        self, cookie_id: str, title: str, prompt: str, allow_tools: bool = False
+    ) -> Mission:
         if self.active_count(cookie_id) >= MAX_ACTIVE_MISSIONS:
             raise MissionLimitError(
                 f"{cookie_id} already has {MAX_ACTIVE_MISSIONS} active missions"
@@ -103,6 +136,7 @@ class MissionManager:
             cookie_id=cookie_id,
             session_id=str(uuid.uuid4()),
             prompt=prompt,
+            allow_tools=allow_tools,
         )
         self.missions[mission.id] = mission
         self._save(mission)
@@ -135,6 +169,8 @@ class MissionManager:
         # The mission runs in its own Hermes session; alias it so the
         # tool-call events it generates reach the owning browser's SSE stream.
         hermes_bridge.alias_events(mission.session_id, mission.cookie_id)
+        if mission.allow_tools:
+            hermes_bridge.allow_tools_for(mission.session_id)
         try:
             result = await hermes_bridge.ask_hermes(mission.prompt, mission.session_id)
             mission.status = "completed"
@@ -144,6 +180,7 @@ class MissionManager:
             mission.result = str(exc)
         finally:
             mission.finished_at = time.time()
+            hermes_bridge.disallow_tools_for(mission.session_id)
             hermes_bridge.unalias_events(mission.session_id)
             # One-shot session: drop the cookie -> hermes-session mapping so
             # hermes_sessions.json doesn't accumulate an entry per mission.
@@ -185,9 +222,17 @@ class MissionManager:
     # Scheduled + filesystem-watch triggers: data/triggers.json is a list of
     #   {"title": "...", "prompt": "...", "every_minutes": 60}        (cron-ish)
     #   {"title": "...", "prompt": "...", "watch": "~/Downloads/*"}   (watcher)
-    # "enabled": false disables an entry. Interval triggers arm on first
-    # sight (no boot storm); watchers baseline on first sight and fire when
-    # the newest mtime under the glob advances.
+    #   {"title": "...", "prompt": "...", "at": "07:30"}              (daily)
+    # "enabled": false disables an entry; "permissions": "allow" auto-allows
+    # the mission's tool-permission requests (ACP mode) regardless of
+    # HAL_PERMISSION_MODE — the trigger file is the trust boundary.
+    # Interval triggers arm on first sight (no boot storm); watchers baseline
+    # on first sight and fire when the newest mtime under the glob advances;
+    # "at" triggers arm on first sight, then fire once per day — including a
+    # catch-up fire when a tick discovers the time passed while the server
+    # was down or the laptop asleep.
+    # Trigger state persists in data/trigger_state.json so a restart doesn't
+    # re-arm intervals or re-baseline watchers.
     # ------------------------------------------------------------------
 
     def _load_triggers(self) -> list[dict]:
@@ -209,12 +254,34 @@ class MissionManager:
             except (TypeError, ValueError):
                 every = 0.0
             watch = str(item.get("watch", "")).strip()
-            if not title or not prompt or (every <= 0 and not watch):
+            at = _parse_at(item.get("at"))
+            if not title or not prompt or (every <= 0 and not watch and at is None):
                 continue
-            triggers.append(
-                {"title": title, "prompt": prompt, "every_minutes": every, "watch": watch}
-            )
+            triggers.append({
+                "title": title,
+                "prompt": prompt,
+                "every_minutes": every,
+                "watch": watch,
+                "at": at,
+                "allow_tools": str(item.get("permissions", "")).strip().lower() == "allow",
+            })
         return triggers
+
+    def _load_trigger_state(self) -> dict[str, dict]:
+        try:
+            state = json.loads((self.data_dir / "trigger_state.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def _save_trigger_state(self, state: dict[str, dict]) -> None:
+        f = self.data_dir / "trigger_state.json"
+        tmp = f.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(state, indent=1))
+            tmp.replace(f)
+        except OSError as exc:
+            print(f"[mission_control] trigger state write failed: {exc}")
 
     @staticmethod
     def _watch_mtime(pattern: str) -> float:
@@ -248,18 +315,37 @@ class MissionManager:
                     st["watch_mtime"] = latest
                     fire = True
                     prompt = f"{prompt}\n(Trigger: files changed under {trig['watch']})"
+            if trig["at"] is not None:
+                # Fire when the most recent daily occurrence postdates the
+                # last fire. With persisted state this also catches up a time
+                # that passed while the server was down — once, not per day.
+                sched = _last_occurrence(trig["at"], now)
+                last = st.get("last_at")
+                if last is None:
+                    st["last_at"] = now  # arm on first sight — no boot storm
+                elif last < sched:
+                    st["last_at"] = now
+                    fire = True
             if fire:
                 try:
-                    self.create_mission(TRIGGER_COOKIE, trig["title"], prompt)
+                    self.create_mission(
+                        TRIGGER_COOKIE, trig["title"], prompt,
+                        allow_tools=trig["allow_tools"],
+                    )
                     print(f"[mission_control] trigger fired: {trig['title']}")
                 except MissionLimitError:
                     print(f"[mission_control] trigger skipped (at mission cap): {trig['title']}")
 
     async def scheduler_loop(self) -> None:
-        state: dict[str, dict] = {}
+        state = self._load_trigger_state()
+        saved = json.dumps(state, sort_keys=True)
         while True:
             try:
                 self._scheduler_tick(state)
+                snapshot = json.dumps(state, sort_keys=True)
+                if snapshot != saved:
+                    self._save_trigger_state(state)
+                    saved = snapshot
             except Exception as exc:
                 print(f"[mission_control] trigger tick failed: {exc!r}")
             await asyncio.sleep(TRIGGERS_POLL)

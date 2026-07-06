@@ -183,16 +183,32 @@ on a schedule or when files change:
 
 ```json
 [
+  {"title": "Morning briefing", "prompt": "Compile my morning briefing …", "at": "07:30", "permissions": "allow"},
   {"title": "Morning systems check", "prompt": "Check disk space, memory, and recent errors. Report anomalies.", "every_minutes": 480},
   {"title": "Downloads watcher", "prompt": "A new file arrived in Downloads. Identify it and suggest where it belongs.", "watch": "~/Downloads/*"}
 ]
 ```
 
+(A fuller starting point, including the full-digest briefing prompt, is in
+[docs/triggers.example.json](docs/triggers.example.json).)
+
 `every_minutes` fires on an interval (armed at boot, no startup storm);
-`watch` fires when the newest mtime under the glob advances; `"enabled":
-false` disables an entry. The file is re-read every `HAL_TRIGGERS_POLL`
-seconds, so edits apply without a restart. Trigger missions report to every
-connected Bridge session and show in everyone's Missions panel.
+`watch` fires when the newest mtime under the glob advances; `at` fires once
+a day at a local time — including a catch-up fire if the laptop was asleep
+or the server down at the scheduled moment. `"enabled": false` disables an
+entry. Trigger state persists in `data/trigger_state.json`, so restarts
+don't re-arm intervals or re-baseline watchers. The file is re-read every
+`HAL_TRIGGERS_POLL` seconds, so edits apply without a restart. Trigger
+missions report to every connected Bridge session and show in everyone's
+Missions panel; if nobody is on the Bridge when one finishes, HAL holds the
+report and greets the next session that arrives (first click or keypress —
+browsers block speech before a gesture).
+
+`"permissions": "allow"` on a trigger auto-approves that mission's
+tool-permission requests (ACP mode) regardless of `HAL_PERMISSION_MODE` —
+this is what lets a briefing run shell and web tools under the default
+`deny`. You edit the trigger file, you grant the scope; leave it off for
+triggers that don't need tools.
 
 ## Autostart at login (optional)
 

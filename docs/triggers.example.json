@@ -1,0 +1,19 @@
+[
+  {
+    "title": "Morning briefing",
+    "at": "07:30",
+    "permissions": "allow",
+    "prompt": "Good morning briefing for Dave. Compile, in this order: 1) any background missions that completed or failed since yesterday morning — read the recent records under data/missions/ in your working directory; 2) system vitals — free disk space, memory pressure, and battery level, via shell; 3) today's weather for my location; 4) two or three notable news headlines. Keep the whole spoken report under 120 words, calm HAL register, lead with the most important item. If a section has nothing to report, skip it silently."
+  },
+  {
+    "title": "Downloads watcher",
+    "watch": "~/Downloads/*",
+    "prompt": "A new file arrived in Downloads. Identify it and suggest where it belongs."
+  },
+  {
+    "title": "Systems check",
+    "every_minutes": 480,
+    "enabled": false,
+    "prompt": "Check disk space, memory, and recent errors. Report anomalies only."
+  }
+]

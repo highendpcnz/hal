@@ -873,6 +873,20 @@ def reset_session(request: Request):
 # older one; the older socket's cleanup must not evict its replacement.
 active_websockets: dict[str, WebSocket] = {}
 
+# Trigger-mission reports that finished while nobody was on the Bridge wait
+# here; the next session whose browser signals announce_ready (socket open
+# AND audio unlocked by a user gesture — autoplay policy blocks speech before
+# that) hears them as a greeting. In-memory: a restart loses the greeting,
+# never the mission record.
+MAX_PENDING_ANNOUNCEMENTS = 10
+_pending_announcements: list[str] = []
+
+
+def _drain_announcements() -> list[str]:
+    drained = list(_pending_announcements)
+    _pending_announcements.clear()
+    return drained
+
 async def _ws_send_tts(websocket: WebSocket, text: str) -> None:
     """Speak one reply over the socket: tts_start, PCM frames, tts_done."""
     await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
@@ -931,10 +945,16 @@ async def on_mission_complete(mission: mission_control.Mission) -> None:
         )
 
     # Trigger missions belong to no browser session — report to whoever is
-    # on the Bridge right now. Owned missions report to their session whether
-    # or not it is connected (the report belongs in the scrollback either way).
+    # on the Bridge right now, or queue the report as a greeting for the next
+    # arrival if the Bridge is empty. Owned missions report to their session
+    # whether or not it is connected (the report belongs in the scrollback
+    # either way).
     if mission.cookie_id == mission_control.TRIGGER_COOKIE:
         targets = list(active_websockets.keys())
+        if not targets:
+            _pending_announcements.append(text)
+            del _pending_announcements[:-MAX_PENDING_ANNOUNCEMENTS]
+            return
     else:
         targets = [mission.cookie_id]
 
@@ -970,6 +990,18 @@ async def _speak_prompt_safe(session_id: str, websocket: WebSocket, text: str) -
         await _speak_over_ws(session_id, websocket, text)
     except Exception as exc:
         print(f"[ws] spoken prompt failed: {exc!r}")
+
+
+async def _deliver_announcements(session_id: str, websocket: WebSocket) -> None:
+    """Speak queued trigger reports to the session that just became able to
+    hear them, and land each in its history so the greeting survives a
+    reload."""
+    for text in _drain_announcements():
+        async with _history_locks.hold(session_id):
+            history = load_history(session_id)
+            history.append({"role": "assistant", "content": text, "ts": time.time()})
+            save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
+        await _speak_prompt_safe(session_id, websocket, text)
 
 
 def _on_bridge_event(cookie_id: str, payload: dict) -> None:
@@ -1073,6 +1105,16 @@ async def ws_conversation(websocket: WebSocket):
 
                 if kind == "set_mode":
                     wake_gated = bool(data.get("wake_word"))
+                    continue
+
+                if kind == "announce_ready":
+                    # Browser reports its audio is unlocked — deliver any
+                    # trigger reports that finished while the Bridge was empty.
+                    if _pending_announcements:
+                        _spawn(
+                            _deliver_announcements(session_id, websocket),
+                            name="announcements",
+                        )
                     continue
 
                 from_speech = False
