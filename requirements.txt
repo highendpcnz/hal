@@ -12,3 +12,5 @@ faster-whisper>=1.0
 # agent-client-protocol
 # The reflection loop experiment (reflection/reflection_loop.py) needs:
 # openai>=1.40
+# The Crew Manifest (speaker_id.py voiceprints) needs — see README:
+# sherpa-onnx>=1.13

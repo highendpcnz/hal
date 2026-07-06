@@ -656,6 +656,65 @@ check(
     repr(_reply),
 )
 
+# --- crew manifest: enrollment grammar, profiles, permission gating ----------------
+
+import numpy as _np  # noqa: E402
+import speaker_id  # noqa: E402
+
+check("enroll matches this-is", main._enroll_request("HAL, this is Frank.") == "Frank")
+check("enroll matches my-name-is", main._enroll_request("Hal, my name is Dr. Chandra") == "Dr. Chandra")
+check("enroll rejects adjectives", main._enroll_request("HAL, this is ridiculous!") is None)
+check("enroll rejects stopword names", main._enroll_request("HAL, this is Important.") is None)
+check("enroll rejects long phrases", main._enroll_request("HAL, this is a real problem for us") is None)
+check("forget-voice matches", main._FORGET_VOICE_RE.match("HAL, forget Frank's voice.") is not None)
+
+_smgr = speaker_id.SpeakerID(Path(_tmp.name) / "speakers")
+(Path(_tmp.name) / "speakers").mkdir(exist_ok=True)
+_fake_vectors = {
+    b"dave-audio": _np.array([1.0, 0.0, 0.0], dtype=_np.float32),
+    b"frank-audio": _np.array([0.0, 1.0, 0.0], dtype=_np.float32),
+    b"davish-audio": _np.array([0.9, 0.1, 0.0], dtype=_np.float32),
+    b"noise": _np.array([0.3, 0.3, 0.906], dtype=_np.float32),
+}
+_smgr.embed = lambda audio: _fake_vectors.get(audio)  # inject: no model in tests
+
+check("enroll stores a profile", _smgr.enroll("dave", b"dave-audio") and _smgr.enrolled())
+check("first enrollment takes command", _smgr.commander() == "Dave")
+check("second enrollment does not", _smgr.enroll("Frank", b"frank-audio") and _smgr.commander() == "Dave")
+_who, _score = _smgr.identify(b"davish-audio")
+check("identify matches the near voice", _who == "Dave" and _score > 0.8, repr((_who, _score)))
+_who, _score = _smgr.identify(b"noise")
+check("identify rejects below threshold", _who is None, repr((_who, _score)))
+_smgr2 = speaker_id.SpeakerID(Path(_tmp.name) / "speakers")
+check("profiles persist across managers", _smgr2.commander() == "Dave" and _smgr2.names() == ["Dave", "Frank"])
+check("forget reassigns command", _smgr.forget("Dave") and _smgr.commander() == "Frank")
+check("forget unknown is false", not _smgr.forget("Nobody"))
+
+
+async def _exercise_voice_gating():
+    orig = speaker_id.manager
+    speaker_id.manager = _smgr  # commander is Frank now
+    try:
+        req_id, fut = hermes_bridge._register_permission("gate-sess", "Run rm")
+        refused = main._permission_reply("gate-sess", "go ahead", speaker="")
+        refused_named = main._permission_reply("gate-sess", "yes", speaker="Dave")
+        typed_ok = main._permission_reply("gate-sess", "yes", speaker=None)
+        value = await fut
+        hermes_bridge._pending_permissions.pop(req_id, None)
+        return refused, refused_named, typed_ok, value
+    finally:
+        speaker_id.manager = orig
+
+
+_refused, _refused_named, _typed_ok, _value = asyncio.run(_exercise_voice_gating())
+check(
+    "unknown voice cannot approve permissions",
+    _refused is not None and "Only Frank" in _refused,
+    repr(_refused),
+)
+check("non-commander voice cannot approve", _refused_named is not None and "Only Frank" in _refused_named)
+check("typed approval still works", _typed_ok == "Very well, Dave. Proceeding." and _value is True)
+
 # --- viewscreen: listing + broadcast ------------------------------------------------
 
 import time as _time_mod  # noqa: E402

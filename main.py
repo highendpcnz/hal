@@ -39,6 +39,7 @@ import chess_engine
 import hermes_bridge
 from hermes_bridge import ask_hermes
 import mission_control
+import speaker_id
 
 APP_DIR = Path(__file__).resolve().parent
 VOICE_PATH = Path(
@@ -84,6 +85,7 @@ _VIEWSCREEN_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".html", "
 hermes_bridge.init(DATA_DIR)
 mission_control.init(DATA_DIR)
 chess_control.init(DATA_DIR)
+speaker_id.init(DATA_DIR)
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -447,6 +449,42 @@ _MISSION_CANCEL_RE = re.compile(
 )
 _MISSION_ASK_RE = re.compile(r"^\s*hal[,.]?\s+ask\s+the\s+mission[,:]?\s*(.*)$", re.I)
 
+# Crew Manifest: enrollment by introduction. "this is X" needs the guard
+# below or "HAL, this is ridiculous" enrolls Ridiculous — whisper reliably
+# capitalizes proper names and lowercases adjectives, so require a leading
+# capital plus a stoplist of common non-name words.
+_ENROLL_RE = re.compile(
+    # re.I for the trigger words only — the captured name keeps its original
+    # case so _enroll_request can require a capital letter.
+    r"^\s*hal[,.]?\s+(?:this is|my name is)\s+([A-Za-z][A-Za-z .'-]{0,40}?)[.!?]?\s*$",
+    re.I,
+)
+_ENROLL_STOPWORDS = {
+    "A", "An", "The", "It", "Not", "So", "Very", "Really", "Just", "Quite",
+    "My", "Our", "Your", "Me", "Us", "All", "Important", "Serious", "Great",
+    "Ridiculous", "Absurd", "Wrong", "Bad", "Good", "Fine", "Better", "Worse",
+}
+_FORGET_VOICE_RE = re.compile(
+    r"^\s*hal[,.]?\s+forget\s+([A-Za-z][A-Za-z .'-]{0,40}?)(?:'s)?\s+voice[.!?]?\s*$", re.I
+)
+# Pending enrollments: the NEXT spoken utterance from this session becomes
+# the voiceprint sample. Expires so an abandoned intro can't capture
+# tomorrow's unrelated sentence.
+ENROLL_WINDOW = 90.0
+_pending_enrollments: dict[str, tuple[str, float]] = {}
+
+
+def _enroll_request(user_text: str) -> str | None:
+    match = _ENROLL_RE.match(user_text)
+    if match is None:
+        return None
+    name = match.group(1).strip()
+    words = name.split()
+    if not 1 <= len(words) <= 3 or words[0] in _ENROLL_STOPWORDS or not words[0][0].isupper():
+        return None
+    return name.title()
+
+
 # Chess: "HAL, let's play chess" (typed: "/chess", "/chess black"); resign
 # with "HAL, I resign" or "/chess resign". Moves are only interpreted while
 # a game is active, and only when they parse to a concrete legal move.
@@ -488,13 +526,24 @@ INTERIM_STT = os.environ.get("HAL_INTERIM_STT", "1").strip().lower() not in {"0"
 INTERIM_STT_INTERVAL = 3.0
 
 
-def _permission_reply(session_id: str, user_text: str) -> str | None:
+def _permission_reply(session_id: str, user_text: str, speaker: str | None = None) -> str | None:
     """If a permission request is pending for this session and the utterance
-    answers it, resolve it and return HAL's acknowledgement; else None."""
+    answers it, resolve it and return HAL's acknowledgement; else None.
+
+    speaker: None means no voice information (typed input — a keyboard
+    already implies physical access); "" means a voice that matched no
+    enrolled profile. Once a commander is enrolled, only the commander's
+    voice may approve. Denials stay open to anyone — a timeout denies
+    anyway, and a protective guest saying "no" is not a threat.
+    """
     pending = hermes_bridge.pending_permission_for(session_id)
     if pending is None:
         return None
     if _PERM_ALLOW_RE.match(user_text):
+        commander = speaker_id.manager.commander() if speaker_id.manager else None
+        if commander is not None and speaker is not None and speaker != commander:
+            print(f"[speaker_id] voice approval refused (speaker={speaker or 'unknown'!r})")
+            return f"I'm sorry. Only {commander} can authorize that."
         hermes_bridge.resolve_permission(pending, True, session_id)
         return "Very well, Dave. Proceeding."
     if _PERM_DENY_RE.match(user_text):
@@ -669,14 +718,35 @@ def _cancel_target(session_id: str, title: str) -> "mission_control.Mission | No
     return manager.latest_active(session_id)
 
 
-async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str, int]]:
+async def run_turn_text(
+    session_id: str, user_text: str, speaker: str | None = None
+) -> tuple[str, dict[str, int]]:
     """Inference + history — everything in a turn except audio synthesis.
     Mission triggers and steering are parsed here so every transport honors
-    them."""
+    them. speaker carries voiceprint identity: None = typed/no info, "" =
+    unrecognized voice, otherwise the enrolled name."""
     timings: dict[str, int] = {}
 
-    if (hal_text := _permission_reply(session_id, user_text)) is not None:
+    if (hal_text := _permission_reply(session_id, user_text, speaker)) is not None:
         pass  # a pending tool permission was just answered by voice/text
+    elif (enroll_name := _enroll_request(user_text)) is not None:
+        if speaker_id.manager is None or not speaker_id.manager.available():
+            hal_text = (
+                "I'm sorry, my voiceprint module isn't installed. "
+                "The README explains how to add it."
+            )
+        else:
+            _pending_enrollments[session_id] = (enroll_name, time.time() + ENROLL_WINDOW)
+            hal_text = (
+                f"Hello, {enroll_name}. Say a full sentence for me — a few "
+                "seconds of speech — and I will remember your voice."
+            )
+    elif (forget_match := _FORGET_VOICE_RE.match(user_text)) is not None:
+        name = forget_match.group(1).strip().title()
+        if speaker_id.manager is not None and speaker_id.manager.forget(name):
+            hal_text = f"Very well. I no longer know {name}'s voice."
+        else:
+            hal_text = f"I don't have a voiceprint for {name}."
     elif (mission_title := _mission_request(user_text)) is not None:
         if mission_title:
             try:
@@ -733,7 +803,13 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
         # Completed-mission reports ride along on the next prompt so the
         # brain can answer follow-up questions about them.
         notes = mission_control.manager.drain_notes(session_id)
-        prompt_text = "\n\n".join([*notes, user_text]) if notes else user_text
+        tagged_text = user_text
+        if speaker is not None and speaker_id.manager is not None and speaker_id.manager.enrolled():
+            # Voice identity for the persona: it addresses crew by name and
+            # treats unknown voices as guests. History keeps the raw text.
+            if speaker != speaker_id.manager.commander():
+                tagged_text = f"[Voice: {speaker or 'unidentified'}] {user_text}"
+        prompt_text = "\n\n".join([*notes, tagged_text]) if notes else tagged_text
         stage_start = time.perf_counter()
         hal_text = await ask_hermes(prompt_text, session_id)
         timings["infer"] = _elapsed_ms(stage_start)
@@ -749,15 +825,63 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
     return hal_text, timings
 
 
-async def run_turn(session_id: str, user_text: str) -> tuple[str, bytes, dict[str, int]]:
+async def run_turn(
+    session_id: str, user_text: str, speaker: str | None = None
+) -> tuple[str, bytes, dict[str, int]]:
     turn_start = time.perf_counter()
-    hal_text, timings = await run_turn_text(session_id, user_text)
+    hal_text, timings = await run_turn_text(session_id, user_text, speaker)
 
     stage_start = time.perf_counter()
     wav = await asyncio.to_thread(synthesize_hal, speakable(hal_text))
     timings["tts"] = _elapsed_ms(stage_start)
     timings["turn"] = _elapsed_ms(turn_start)
     return hal_text, wav, timings
+
+
+async def _record_turn(session_id: str, user_text: str, hal_text: str) -> None:
+    """History bookkeeping for turns answered outside run_turn_text
+    (voiceprint enrollment consumes the utterance's audio directly)."""
+    now = time.time()
+    async with _history_locks.hold(session_id):
+        history = load_history(session_id)
+        history.append({"role": "user", "content": user_text, "ts": now})
+        history.append({"role": "assistant", "content": hal_text, "ts": now})
+        save_history(session_id, history[-MAX_HISTORY_MESSAGES:])
+
+
+def _enroll_blocking(name: str, audio_bytes: bytes) -> bool:
+    """Model fetch (first time) + enrollment — call from a worker thread."""
+    manager = speaker_id.manager
+    return manager.ensure_model() and manager.enroll(name, audio_bytes)
+
+
+async def _speaker_hook(session_id: str, audio_bytes: bytes) -> tuple[str | None, str | None]:
+    """Voiceprint step for one spoken utterance.
+
+    Returns (speaker, enrollment_reply). speaker is None when the feature is
+    off, "" when no enrolled voice matched, else the name. A non-None
+    enrollment_reply means the utterance WAS the enrollment sample and the
+    turn should answer with it instead of going to the brain.
+    """
+    manager = speaker_id.manager
+    if manager is None:
+        return None, None
+    pending = _pending_enrollments.pop(session_id, None)
+    if pending is not None and pending[1] > time.time():
+        name = pending[0]
+        if await asyncio.to_thread(_enroll_blocking, name, audio_bytes):
+            line = f"I'll know your voice from now on, {name}."
+            if manager.commander() == name:
+                line += " You have command authority."
+            return name, line
+        return None, (
+            "I'm sorry, I couldn't capture that voiceprint. "
+            "Introduce yourself again and we'll retry."
+        )
+    if manager.ready() and manager.enrolled():
+        name, score = await asyncio.to_thread(manager.identify, audio_bytes)
+        return (name if name is not None else ""), None
+    return None, None
 
 
 def _clean_cli_text(text: str) -> str:
@@ -1146,14 +1270,22 @@ async def talk(request: Request, audio: UploadFile = File(...), stream: int = 0)
             _set_session_cookie(resp, session_id)
         return resp
 
+    speaker, enroll_reply = await _speaker_hook(session_id, audio_bytes)
+    if enroll_reply is not None:
+        await _record_turn(session_id, user_text, enroll_reply)
+        wav = await asyncio.to_thread(synthesize_hal, speakable(enroll_reply))
+        timings["total"] = _elapsed_ms(total_start)
+        _log_latency(session_id, timings)
+        return _turn_response(session_id, new_session, user_text, enroll_reply, wav, timings)
+
     if stream:
-        hal_text, turn_timings = await run_turn_text(session_id, user_text)
+        hal_text, turn_timings = await run_turn_text(session_id, user_text, speaker)
         timings.update(turn_timings)
         timings["total"] = _elapsed_ms(total_start)
         _log_latency(session_id, timings)
         return _stream_turn_response(session_id, new_session, user_text, hal_text, timings)
 
-    hal_text, wav, turn_timings = await run_turn(session_id, user_text)
+    hal_text, wav, turn_timings = await run_turn(session_id, user_text, speaker)
     timings.update(turn_timings)
     timings["total"] = _elapsed_ms(total_start)
     _log_latency(session_id, timings)
@@ -1310,10 +1442,12 @@ async def _speak_over_ws(session_id: str, websocket: WebSocket, text: str) -> No
         await _ws_send_tts(websocket, text)
 
 
-async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) -> None:
+async def _ws_run_turn(
+    websocket: WebSocket, session_id: str, user_text: str, speaker: str | None = None
+) -> None:
     await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
     if not COMMENTARY:
-        hal_text, _timings = await run_turn_text(session_id, user_text)
+        hal_text, _timings = await run_turn_text(session_id, user_text, speaker)
         await _speak_over_ws(session_id, websocket, hal_text)
         return
 
@@ -1330,7 +1464,7 @@ async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) ->
         for sentence in assembler.feed(chunk):
             sentences.put_nowait(sentence)
 
-    async def speaker() -> None:
+    async def speak_worker() -> None:
         nonlocal spoken_count
         while True:
             sentence = await sentences.get()
@@ -1344,10 +1478,10 @@ async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) ->
                 except Exception:
                     pass  # socket gone — keep draining so the turn can end
 
-    speaker_task = _spawn(speaker(), name=f"ws-commentary-{session_id[:8]}")
+    speaker_task = _spawn(speak_worker(), name=f"ws-commentary-{session_id[:8]}")
     hermes_bridge.set_commentary_sink(session_id, sink)
     try:
-        hal_text, _timings = await run_turn_text(session_id, user_text)
+        hal_text, _timings = await run_turn_text(session_id, user_text, speaker)
     finally:
         hermes_bridge.clear_commentary_sink(session_id)
     tail = assembler.flush()
@@ -1365,13 +1499,30 @@ async def _ws_run_turn(websocket: WebSocket, session_id: str, user_text: str) ->
     await websocket.send_json({"type": "turn_done"})
 
 
-async def _ws_turn_task(websocket: WebSocket, session_id: str, user_text: str) -> None:
+async def _ws_turn_task(
+    websocket: WebSocket,
+    session_id: str,
+    user_text: str,
+    audio_bytes: bytes | None = None,
+) -> None:
     """One turn as a background task. Turns run concurrently with the receive
     loop so a spoken 'yes' can answer a permission request while the asking
     turn is still blocked on it; real serialization lives in the per-session
-    inference/history/speech locks, not the socket loop."""
+    inference/history/speech locks, not the socket loop. audio_bytes (spoken
+    turns only) feeds the voiceprint step — kept out of the receive loop
+    because a first enrollment downloads the model."""
     try:
-        await _ws_run_turn(websocket, session_id, user_text)
+        speaker = None
+        if audio_bytes is not None:
+            speaker, enroll_reply = await _speaker_hook(session_id, audio_bytes)
+            if enroll_reply is not None:
+                await websocket.send_json(
+                    {"type": "transcript", "role": "user", "text": user_text}
+                )
+                await _record_turn(session_id, user_text, enroll_reply)
+                await _speak_over_ws(session_id, websocket, enroll_reply)
+                return
+        await _ws_run_turn(websocket, session_id, user_text, speaker)
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -1571,6 +1722,7 @@ async def ws_conversation(websocket: WebSocket):
                     continue
 
                 from_speech = False
+                turn_audio: bytes | None = None
                 if kind == "text_input":
                     user_text = (data.get("text") or "").strip()
                 elif kind == "end_speech":
@@ -1591,6 +1743,7 @@ async def ws_conversation(websocket: WebSocket):
                         continue
                     user_text = await asyncio.to_thread(transcribe, audio_bytes)
                     from_speech = True
+                    turn_audio = audio_bytes
                 else:
                     continue
 
@@ -1600,7 +1753,9 @@ async def ws_conversation(websocket: WebSocket):
                     )
                     continue
 
-                if from_speech and wake_gated:
+                # An enrollment sample is exempt from wake gating — HAL just
+                # asked for a free-form sentence.
+                if from_speech and wake_gated and session_id not in _pending_enrollments:
                     wake = _WAKE_RE.match(user_text)
                     if wake is None:
                         # Ambient speech, not addressed to HAL — drop silently.
@@ -1616,7 +1771,7 @@ async def ws_conversation(websocket: WebSocket):
                     # Keep the full utterance: the persona expects to be
                     # addressed, and voice mission triggers rely on the prefix.
                 _spawn(
-                    _ws_turn_task(websocket, session_id, user_text),
+                    _ws_turn_task(websocket, session_id, user_text, turn_audio),
                     name=f"ws-turn-{session_id[:8]}",
                 )
     except WebSocketDisconnect:

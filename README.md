@@ -111,6 +111,7 @@ still verified by running the server.
 | `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records; `0` disables |
 | `HAL_COMMENTARY` | `1` | speak-while-thinking on WS turns: HAL voices each sentence as the agent produces it; `0` restores speak-at-end |
 | `HAL_VIEWSCREEN_POLL` | `2` | seconds between scans of `data/viewscreen/` for new visuals |
+| `HAL_VOICE_THRESHOLD` | `0.5` | cosine similarity a voiceprint match must reach (see Crew Manifest) |
 | `HAL_HERMES_ACP_BIN` | `~/hermes-agent/.venv/bin/hermes-acp` | ACP adapter path |
 | `HAL_HERMES_BIN` | `~/hermes-agent/.venv/bin/hermes` | Hermes CLI path (subprocess mode) |
 | `HAL_HERMES_ARGS` | *(empty)* | extra CLI args in subprocess mode, e.g. `-m gpt-5.4` or `--yolo` |
@@ -226,6 +227,35 @@ tool-permission requests (ACP mode) regardless of `HAL_PERMISSION_MODE` —
 this is what lets a briefing run shell and web tools under the default
 `deny`. You edit the trigger file, you grant the scope; leave it off for
 triggers that don't need tools.
+
+## The Crew Manifest (voiceprints)
+
+"HAL, this is Frank" (or "HAL, my name is …") enrolls a voiceprint: HAL asks
+for one full sentence, learns the voice, and from then on tags utterances
+with the speaker's name so the persona addresses each person correctly.
+**The first enrolled voice becomes the commander** — once that happens,
+spoken approvals of tool-permission requests (`HAL_PERMISSION_MODE=ask`)
+are only accepted from the commander's voice; anyone else saying "yes, go
+ahead" is politely refused. Typed and on-screen approvals are unaffected (a
+keyboard already implies physical access), and denials stay open to anyone.
+"HAL, forget Frank's voice" removes a profile (command succession passes to
+the earliest remaining enrollment).
+
+Fully local, like STT and TTS: sherpa-onnx (Apache-2.0) with the 3D-Speaker
+CAM++ model (Apache-2.0, ~28MB, auto-downloaded to `data/speaker/` on first
+enrollment). Install the one dependency into the Hermes venv:
+
+```
+uv pip install --python ~/.hermes/hermes-agent/venv/bin/python sherpa-onnx
+```
+
+Without it, enrollment explains itself and everything else works as before.
+Measured on this machine: same voice ≈ 0.78 cosine similarity, different
+voices ≈ 0.12–0.29 (`HAL_VOICE_THRESHOLD`, default 0.5, splits them with
+wide margin). Piper's own HAL voice self-scores ≈ 0.17, so HAL's speech
+from the speakers can't false-accept as a crew member. Profiles live in
+`data/speakers.json`; treat voice identity as a soft second factor, not
+cryptography — a recording of the commander defeats it.
 
 ## The Viewscreen
 
