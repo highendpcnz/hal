@@ -394,6 +394,19 @@ def _log_latency(session_id: str, timings: dict[str, int]) -> None:
 # Spoken mission trigger, e.g. "HAL, start mission tidy the downloads folder."
 _MISSION_VOICE_RE = re.compile(r"^\s*hal[,.]?\s+start\s+mission[,:]?\s*(.*)$", re.I)
 
+# Steering a mission by voice: cancel it, ask the finished one a follow-up,
+# or get a status readout. Typed follow-up form: "/ask <question>".
+_MISSION_CANCEL_RE = re.compile(
+    r"^\s*hal[,.]?\s+(?:cancel|abort|stop)\s+(?:the\s+|that\s+)?mission\b[,:]?\s*(.*?)[.!?]?\s*$",
+    re.I,
+)
+_MISSION_ASK_RE = re.compile(r"^\s*hal[,.]?\s+ask\s+the\s+mission[,:]?\s*(.*)$", re.I)
+_MISSION_STATUS_RE = re.compile(
+    r"^\s*hal[,.]?\s+(?:missions?\s+status|how\s+(?:are|is)\s+(?:the\s+)?missions?"
+    r"(?:\s+(?:going|doing|coming(?:\s+along)?))?)\s*[.?!]?\s*$",
+    re.I,
+)
+
 # Spoken answers to a pending tool-permission request (HAL_PERMISSION_MODE=ask).
 _PERM_ALLOW_RE = re.compile(
     r"^\s*(?:hal[,.!]?\s+)?(?:yes|yeah|yep|sure|go ahead|do it|proceed|allow(?:ed)?|"
@@ -449,6 +462,66 @@ def _mission_request(user_text: str) -> str | None:
     return None
 
 
+def _cancel_request(user_text: str) -> str | None:
+    """The (possibly empty) title if the utterance cancels a mission, else None."""
+    match = _MISSION_CANCEL_RE.match(user_text)
+    return match.group(1).strip() if match is not None else None
+
+
+def _followup_request(user_text: str) -> str | None:
+    """The question if the utterance asks the last mission something, else None.
+
+    Typed form: "/ask <question>". Spoken form: "HAL, ask the mission: …".
+    """
+    if user_text == "/ask" or user_text.startswith("/ask "):
+        return user_text[len("/ask"):].strip()
+    match = _MISSION_ASK_RE.match(user_text)
+    if match is not None:
+        return match.group(1).strip()
+    return None
+
+
+def _spoken_elapsed(seconds: float) -> str:
+    minutes, secs = divmod(max(0, int(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} hour{'s' if hours != 1 else ''} {minutes} minute{'s' if minutes != 1 else ''}"
+    if minutes:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{secs} second{'s' if secs != 1 else ''}"
+
+
+def _missions_status_text(session_id: str) -> str:
+    """Spoken mission readout from live records — no inference needed."""
+    manager = mission_control.manager
+    now = time.time()
+    active = [
+        m for m in manager.missions.values()
+        if m.cookie_id in (session_id, mission_control.TRIGGER_COOKIE) and m.status == "active"
+    ]
+    if active:
+        active.sort(key=lambda m: m.created_at)
+        parts = [f"{m.title}, {_spoken_elapsed(now - m.created_at)} in" for m in active]
+        lead = (
+            "One mission is running, Dave: "
+            if len(active) == 1
+            else f"{len(active)} missions are running, Dave: "
+        )
+        return lead + "; ".join(parts) + "."
+    finished = [
+        m for m in manager.missions.values()
+        if m.cookie_id in (session_id, mission_control.TRIGGER_COOKIE)
+        and m.finished_at is not None
+    ]
+    last = max(finished, key=lambda m: m.finished_at, default=None)
+    if last is not None:
+        return (
+            f"No missions are running, Dave. The last one, {last.title}, "
+            f"{last.status} {_spoken_elapsed(now - last.finished_at)} ago."
+        )
+    return "There are no missions on the board, Dave."
+
+
 def _mission_prompt(title: str, history: list[dict]) -> str:
     """A mission runs in its own Hermes session with no memory of the
     conversation that spawned it — carry the recent exchange along."""
@@ -467,16 +540,30 @@ def _mission_prompt(title: str, history: list[dict]) -> str:
     )
 
 
+def _cancel_target(session_id: str, title: str) -> "mission_control.Mission | None":
+    """The active mission a cancel utterance refers to: title substring match
+    when one was spoken, otherwise the most recently started."""
+    manager = mission_control.manager
+    if title:
+        matches = [
+            m for m in manager.missions.values()
+            if m.cookie_id in (session_id, mission_control.TRIGGER_COOKIE)
+            and m.status == "active"
+            and title.casefold() in m.title.casefold()
+        ]
+        return max(matches, key=lambda m: m.created_at, default=None)
+    return manager.latest_active(session_id)
+
+
 async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str, int]]:
     """Inference + history — everything in a turn except audio synthesis.
-    Mission triggers are parsed here so every transport honors them."""
+    Mission triggers and steering are parsed here so every transport honors
+    them."""
     timings: dict[str, int] = {}
 
-    hal_text = _permission_reply(session_id, user_text)
-    mission_title = _mission_request(user_text) if hal_text is None else None
-    if hal_text is not None:
+    if (hal_text := _permission_reply(session_id, user_text)) is not None:
         pass  # a pending tool permission was just answered by voice/text
-    elif mission_title is not None:
+    elif (mission_title := _mission_request(user_text)) is not None:
         if mission_title:
             try:
                 mission_control.manager.create_mission(
@@ -495,6 +582,37 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
                 )
         else:
             hal_text = "I need a mission title, Dave. Tell me what the mission is."
+    elif (cancel_title := _cancel_request(user_text)) is not None:
+        target = _cancel_target(session_id, cancel_title)
+        if target is None:
+            hal_text = "There's no running mission to cancel, Dave."
+        elif await mission_control.manager.cancel_mission(target.id, session_id) is not None:
+            hal_text = f"Very well, Dave. I've cancelled the mission: {target.title}."
+        else:
+            hal_text = "That mission has already finished, Dave."
+    elif (followup := _followup_request(user_text)) is not None:
+        target = mission_control.manager.steerable_mission(session_id)
+        if target is None:
+            hal_text = "There's no recent mission for me to ask, Dave."
+        elif not followup:
+            hal_text = "What shall I ask the mission, Dave?"
+        else:
+            # Route the question into the mission's own session — it holds
+            # the full working context, not just the truncated report note.
+            hermes_bridge.alias_events(target.session_id, session_id)
+            try:
+                stage_start = time.perf_counter()
+                hal_text = await ask_hermes(
+                    f'Dave has a follow-up question about the mission you ran '
+                    f'("{target.title}"): {followup}\n'
+                    "Answer from what you actually did and found. Brief, spoken style.",
+                    target.session_id,
+                )
+                timings["infer"] = _elapsed_ms(stage_start)
+            finally:
+                hermes_bridge.unalias_events(target.session_id)
+    elif _MISSION_STATUS_RE.match(user_text) is not None:
+        hal_text = _missions_status_text(session_id)
     else:
         # Completed-mission reports ride along on the next prompt so the
         # brain can answer follow-up questions about them.
@@ -756,6 +874,26 @@ def missions(request: Request):
     return {"missions": mission_control.manager.list_missions(session_id)}
 
 
+@app.post("/api/missions/{mission_id}/cancel")
+async def mission_cancel(mission_id: str, request: Request):
+    """Interrupt a running mission (the card's Cancel control)."""
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return JSONResponse({"ok": False}, status_code=403)
+    mission = await mission_control.manager.cancel_mission(mission_id, session_id)
+    return JSONResponse({"ok": mission is not None}, status_code=200 if mission else 404)
+
+
+@app.post("/api/missions/{mission_id}/dismiss")
+def mission_dismiss(mission_id: str, request: Request):
+    """Drop a finished mission from the board and release its session."""
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return JSONResponse({"ok": False}, status_code=403)
+    ok = mission_control.manager.dismiss_mission(mission_id, session_id)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
 @app.post("/api/talk")
 async def talk(request: Request, audio: UploadFile = File(...), stream: int = 0):
     total_start = time.perf_counter()
@@ -932,6 +1070,8 @@ async def _ws_turn_task(websocket: WebSocket, session_id: str, user_text: str) -
 
 
 async def on_mission_complete(mission: mission_control.Mission) -> None:
+    if mission.status == "cancelled":
+        return  # Dave cancelled it and was acknowledged at the time
     if mission.status == "failed":
         text = (
             f"Dave, I have completed the mission: {mission.title}. "

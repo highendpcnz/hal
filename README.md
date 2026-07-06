@@ -105,6 +105,7 @@ still verified by running the server.
 | `HAL_PERMISSION_TIMEOUT` | `30` | seconds an `ask` waits before the request is denied |
 | `HAL_YOLO` | *(unset)* | legacy alias: `1` = `HAL_PERMISSION_MODE=yolo` |
 | `HAL_MAX_ACTIVE_MISSIONS` | `3` | per-session cap on concurrently running background missions |
+| `HAL_MISSION_STEERABLE_TTL` | `1800` | seconds a finished mission's session stays alive for `/ask` follow-ups |
 | `HAL_TRIGGERS_POLL` | `30` | seconds between `data/triggers.json` scans |
 | `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records; `0` disables |
 | `HAL_HERMES_ACP_BIN` | `~/hermes-agent/.venv/bin/hermes-acp` | ACP adapter path |
@@ -146,6 +147,9 @@ still verified by running the server.
   tool/permission/mission events that let the Bridge log survive a reload
 - `GET /api/missions` — this session's missions (plus trigger-created ones),
   newest first; feeds the Missions cards on the desktop Bridge
+- `POST /api/missions/{id}/cancel` / `POST /api/missions/{id}/dismiss` —
+  interrupt a running mission; drop a finished one from the board and
+  release its session (the cards' CANCEL/DISMISS controls)
 - `POST /api/permission/{request_id}` — `{"decision": "allow"|"deny"}`;
   answers a pending `ask`-mode tool-permission request (the Allow/Deny bar)
 - `GET /api/events` — SSE stream of tool-call/permission/mission events for
@@ -169,6 +173,16 @@ in `data/missions/`, HAL announces a result summary over the live connection
 when it finishes, and the full report is fed back into your session's brain
 on the next turn — so "what did you find?" works. At most
 `HAL_MAX_ACTIVE_MISSIONS` run per session at once.
+
+Missions are steerable. "HAL, cancel the mission" (or a title: "HAL, cancel
+mission downloads sweep"), or the card's CANCEL control, interrupts the
+agent turn and marks the mission cancelled. "HAL, missions status" gets a
+spoken readout of what's running, straight from the records — no inference.
+And for 30 minutes after a mission finishes (`HAL_MISSION_STEERABLE_TTL`),
+its Hermes session stays alive: "HAL, ask the mission: what exactly did you
+change?" — or typed `/ask <question>` — routes the follow-up into the
+session that did the work, which answers from its full context rather than
+the truncated report. DISMISS drops the card and releases the session early.
 
 Missions obey the same permission model as everything else: with `deny` they
 can't run tools; `ask` routes their permission prompts to your Bridge; set

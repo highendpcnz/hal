@@ -28,6 +28,9 @@ MAX_ACTIVE_MISSIONS = int(os.environ.get("HAL_MAX_ACTIVE_MISSIONS", "3"))
 TRIGGERS_POLL = float(os.environ.get("HAL_TRIGGERS_POLL", "30"))
 # Cap on queued mission reports waiting to be fed back to a session's brain.
 MAX_PENDING_NOTES = 5
+# Seconds a finished mission's Hermes session stays alive for follow-up
+# questions ("HAL, ask the mission: …") before the reaper drops it.
+STEERABLE_TTL = float(os.environ.get("HAL_MISSION_STEERABLE_TTL", str(30 * 60)))
 
 
 class MissionLimitError(RuntimeError):
@@ -67,7 +70,7 @@ class Mission:
     title: str
     cookie_id: str
     session_id: str
-    status: Literal["active", "completed", "failed"] = "active"
+    status: Literal["active", "completed", "failed", "cancelled"] = "active"
     prompt: str = ""
     result: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -76,6 +79,10 @@ class Mission:
     # overriding HAL_PERMISSION_MODE. Granted only by a trigger's
     # "permissions": "allow" — the trigger file is the trust boundary.
     allow_tools: bool = False
+    # A finished mission stays "steerable" — its Hermes session alive for
+    # follow-up questions — until dismissed or reaped (STEERABLE_TTL).
+    session_dropped: bool = False
+    dismissed_at: Optional[float] = None
 
 
 class MissionManager:
@@ -149,13 +156,84 @@ class MissionManager:
 
     def list_missions(self, cookie_id: str) -> list[dict]:
         """A session's own missions plus trigger-created ones (those belong
-        to everyone), newest first."""
+        to everyone), newest first. Dismissed missions stay on disk but
+        leave the board."""
         own = [
             m for m in self.missions.values()
-            if m.cookie_id in (cookie_id, TRIGGER_COOKIE)
+            if m.cookie_id in (cookie_id, TRIGGER_COOKIE) and m.dismissed_at is None
         ]
         own.sort(key=lambda m: m.created_at, reverse=True)
         return [asdict(m) for m in own[:50]]
+
+    def _visible_to(self, mission_id: str, cookie_id: str) -> Optional[Mission]:
+        """The mission, if this browser session may act on it. Trigger
+        missions belong to everyone — same visibility rule as list_missions."""
+        mission = self.missions.get(mission_id)
+        if mission is None or mission.cookie_id not in (cookie_id, TRIGGER_COOKIE):
+            return None
+        return mission
+
+    def latest_active(self, cookie_id: str) -> Optional[Mission]:
+        candidates = [
+            m for m in self.missions.values()
+            if m.cookie_id in (cookie_id, TRIGGER_COOKIE) and m.status == "active"
+        ]
+        return max(candidates, key=lambda m: m.created_at, default=None)
+
+    def steerable_mission(self, cookie_id: str) -> Optional[Mission]:
+        """Newest finished mission whose Hermes session is still alive —
+        the target for follow-up questions."""
+        now = time.time()
+        candidates = [
+            m for m in self.missions.values()
+            if m.cookie_id in (cookie_id, TRIGGER_COOKIE)
+            and m.status != "active"
+            and not m.session_dropped
+            and m.dismissed_at is None
+            and m.finished_at is not None
+            and now - m.finished_at <= STEERABLE_TTL
+        ]
+        return max(candidates, key=lambda m: m.finished_at, default=None)
+
+    async def cancel_mission(self, mission_id: str, cookie_id: str) -> Optional[Mission]:
+        """Mark a running mission cancelled and interrupt its agent turn.
+        run_mission's bookkeeping respects the flag when the turn returns."""
+        mission = self._visible_to(mission_id, cookie_id)
+        if mission is None or mission.status != "active":
+            return None
+        mission.status = "cancelled"
+        self._save(mission)
+        await hermes_bridge.cancel_session(mission.session_id)
+        return mission
+
+    def dismiss_mission(self, mission_id: str, cookie_id: str) -> bool:
+        """Drop a finished mission from the board and release its session."""
+        mission = self._visible_to(mission_id, cookie_id)
+        if mission is None or mission.status == "active":
+            return False
+        if not mission.session_dropped:
+            hermes_bridge.drop_session(mission.session_id)
+            mission.session_dropped = True
+        mission.dismissed_at = time.time()
+        self._save(mission)
+        hermes_bridge.publish_event(
+            mission.cookie_id, {"type": "mission_update", "mission": asdict(mission)}
+        )
+        return True
+
+    def _reap_sessions(self, now: float | None = None) -> None:
+        """Release Hermes sessions of missions past their steerable window."""
+        now = time.time() if now is None else now
+        for mission in self.missions.values():
+            if (
+                mission.status != "active"
+                and not mission.session_dropped
+                and mission.finished_at is not None
+                and now - mission.finished_at > STEERABLE_TTL
+            ):
+                hermes_bridge.drop_session(mission.session_id)
+                mission.session_dropped = True
+                self._save(mission)
 
     def drain_notes(self, cookie_id: str) -> list[str]:
         """Take (and clear) mission reports queued for this session's brain."""
@@ -173,18 +251,25 @@ class MissionManager:
             hermes_bridge.allow_tools_for(mission.session_id)
         try:
             result = await hermes_bridge.ask_hermes(mission.prompt, mission.session_id)
-            mission.status = "completed"
-            mission.result = result
+            # cancel_mission may have flipped the status while the turn was
+            # in flight — a cancelled mission must not report as completed.
+            if mission.status == "cancelled":
+                mission.result = "Cancelled by Dave."
+            else:
+                mission.status = "completed"
+                mission.result = result
         except Exception as exc:
-            mission.status = "failed"
-            mission.result = str(exc)
+            if mission.status == "cancelled":
+                mission.result = "Cancelled by Dave."
+            else:
+                mission.status = "failed"
+                mission.result = str(exc)
         finally:
             mission.finished_at = time.time()
             hermes_bridge.disallow_tools_for(mission.session_id)
             hermes_bridge.unalias_events(mission.session_id)
-            # One-shot session: drop the cookie -> hermes-session mapping so
-            # hermes_sessions.json doesn't accumulate an entry per mission.
-            hermes_bridge.drop_session(mission.session_id)
+            # The session stays alive for follow-up questions ("HAL, ask the
+            # mission: …"); dismiss_mission or _reap_sessions releases it.
             self._save(mission)
             if mission.status == "failed":
                 self._journal_failure(mission)
@@ -342,6 +427,7 @@ class MissionManager:
         while True:
             try:
                 self._scheduler_tick(state)
+                self._reap_sessions()
                 snapshot = json.dumps(state, sort_keys=True)
                 if snapshot != saved:
                     self._save_trigger_state(state)

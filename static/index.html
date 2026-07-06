@@ -702,6 +702,21 @@
   }
   .mission-card.st-completed .mission-dot { background: #2a6e4a; }
   .mission-card.st-failed .mission-dot { background: #b84b3b; }
+  .mission-card.st-cancelled .mission-dot { background: #555; }
+  .mission-card-act {
+    margin-left: auto;
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid #2a2a2a;
+    border-radius: 3px;
+    color: #666;
+    font: inherit;
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    padding: 1px 6px;
+    cursor: pointer;
+  }
+  .mission-card-act:hover { color: #c33; border-color: #532; }
   .mission-card-title {
     color: #999;
     font-size: 12px;
@@ -1377,6 +1392,10 @@
   }
 
   function upsertMission(m) {
+    if (m.dismissed_at) {  // dismissed elsewhere (another tab, SSE update)
+      missionsById.delete(m.id);
+      return;
+    }
     const cur = missionsById.get(m.id);
     missionsById.set(m.id, { m, tools: cur ? cur.tools : 0, open: cur ? cur.open : false });
   }
@@ -1398,14 +1417,25 @@
       el.className = 'mission-card st-' + m.status;
       const meta = (m.status === 'active' ? 'running' : m.status) +
         ' · ' + missionElapsed(m) + (entry.tools ? ' · ⚡' + entry.tools : '');
+      const act = m.status === 'active'
+        ? '<button class="mission-card-act" data-act="cancel">CANCEL</button>'
+        : '<button class="mission-card-act" data-act="dismiss">DISMISS</button>';
       el.innerHTML =
         '<div class="mission-card-top"><span class="mission-dot"></span>' +
-        '<span class="mission-card-title">' + escapeHtml(m.title) + '</span></div>' +
+        '<span class="mission-card-title">' + escapeHtml(m.title) + '</span>' + act + '</div>' +
         '<div class="mission-card-meta">' + escapeHtml(meta) + '</div>' +
         (entry.open && m.result
           ? '<div class="mission-card-result">' + escapeHtml(String(m.result).slice(0, 400)) + '</div>'
           : '');
       el.addEventListener('click', () => { entry.open = !entry.open; renderMissions(); });
+      el.querySelector('.mission-card-act').addEventListener('click', async (e) => {
+        e.stopPropagation();  // the card's own click toggles expansion
+        const act = e.target.dataset.act;
+        try { await fetch('/api/missions/' + m.id + '/' + act, { method: 'POST' }); }
+        catch (err) { return; }
+        if (act === 'dismiss') { missionsById.delete(m.id); renderMissions(); }
+        else refreshMissions();
+      });
       wrap.appendChild(el);
     });
   }

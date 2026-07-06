@@ -448,6 +448,138 @@ check(
     len(_drained) == main.MAX_PENDING_ANNOUNCEMENTS and main._drain_announcements() == [],
 )
 
+# --- steerable missions: voice grammar --------------------------------------------
+
+check("cancel matches bare form", main._cancel_request("HAL, cancel the mission.") == "")
+check("cancel matches with title", main._cancel_request("Hal, abort mission downloads sweep") == "downloads sweep")
+check("cancel matches stop-that", main._cancel_request("HAL, stop that mission!") == "")
+check("cancel rejects plain talk", main._cancel_request("HAL, why would anyone cancel christmas?") is None)
+check("followup voice form", main._followup_request("HAL, ask the mission: what did you change?") == "what did you change?")
+check("followup typed form", main._followup_request("/ask what did you find") == "what did you find")
+check("followup empty typed", main._followup_request("/ask") == "")
+check("followup rejects plain talk", main._followup_request("I need to ask you something") is None)
+check("status matches", main._MISSION_STATUS_RE.match("HAL, missions status") is not None)
+check("status matches how-going", main._MISSION_STATUS_RE.match("Hal, how are the missions going?") is not None)
+check("status rejects plain talk", main._MISSION_STATUS_RE.match("HAL, how are you?") is None)
+
+check("elapsed seconds", main._spoken_elapsed(42) == "42 seconds")
+check("elapsed minutes", main._spoken_elapsed(180) == "3 minutes")
+check("elapsed hours", main._spoken_elapsed(3720) == "1 hour 2 minutes")
+
+# --- steerable missions: lifecycle ------------------------------------------------
+
+
+async def _exercise_steering():
+    orig_ask = hermes_bridge.ask_hermes
+    gate = asyncio.Event()
+    prompts: list[tuple[str, str]] = []
+
+    async def fake_ask(text, sid):
+        prompts.append((sid, text))
+        await gate.wait()
+        return "I scanned the pod bay."
+
+    hermes_bridge.ask_hermes = fake_ask
+    main.ask_hermes = fake_ask
+    try:
+        mgr = mc.MissionManager(Path(_tmp.name) / "missions-steer")
+        running = mgr.create_mission("st-ck", "pod bay scan", "scan it")
+        await asyncio.sleep(0.01)  # let the mission task reach the gate
+        # Cancel while in flight: turn returns, status must stay cancelled.
+        cancelled = await mgr.cancel_mission(running.id, "st-ck")
+        foreign = await mgr.cancel_mission(running.id, "other-ck")
+        gate.set()
+        await asyncio.gather(*list(mgr._tasks))
+        after = mgr.missions[running.id]
+        journal_absent = not (mgr.missions_dir / "failed.jsonl").exists()
+
+        # A completed mission is steerable within the TTL…
+        done = mc.Mission(
+            id="st-done", title="probe", cookie_id="st-ck", session_id="st-sess",
+            status="completed", result="ok", finished_at=mc.time.time(),
+        )
+        mgr.missions[done.id] = done
+        steer = mgr.steerable_mission("st-ck")
+        # …not after dismissal (the cancelled mission is steerable too — its
+        # session survives — so both must go before steering runs dry).
+        ok_dismiss = mgr.dismiss_mission(done.id, "st-ck")
+        ok_dismiss = ok_dismiss and mgr.dismiss_mission(running.id, "st-ck")
+        steer_after_dismiss = mgr.steerable_mission("st-ck")
+        listed = [m["id"] for m in mgr.list_missions("st-ck")]
+        # …and the reaper releases stale sessions.
+        stale = mc.Mission(
+            id="st-stale", title="old", cookie_id="st-ck", session_id="st-old",
+            status="completed", result="ok", finished_at=mc.time.time() - mc.STEERABLE_TTL - 60,
+        )
+        mgr.missions[stale.id] = stale
+        mgr._reap_sessions()
+        return after, cancelled, foreign, journal_absent, steer, ok_dismiss, steer_after_dismiss, listed, stale
+    finally:
+        hermes_bridge.ask_hermes = orig_ask
+        main.ask_hermes = orig_ask
+
+
+(_after, _cancelled, _foreign, _journal_absent, _steer, _ok_dismiss,
+ _steer_after_dismiss, _listed, _stale) = asyncio.run(_exercise_steering())
+check("cancel interrupts an active mission", _cancelled is not None and _after.status == "cancelled")
+check("cancelled result is not the turn's reply", _after.result == "Cancelled by Dave.")
+check("foreign session cannot cancel", _foreign is None)
+check("cancelled missions do not journal as failures", _journal_absent)
+check("finished mission is steerable within TTL", _steer is not None and _steer.id == "st-done")
+check("dismiss releases and hides the mission", _ok_dismiss and _steer_after_dismiss is None)
+check("dismissed missions leave the board", "st-done" not in _listed)
+check("reaper releases sessions past the TTL", _stale.session_dropped)
+
+# --- steerable missions: turn routing ----------------------------------------------
+
+
+async def _exercise_followup_turn():
+    orig_ask = main.ask_hermes
+    seen: list[tuple[str, str]] = []
+
+    async def fake_ask(text, sid):
+        seen.append((sid, text))
+        return "I found nothing unusual, Dave."
+
+    main.ask_hermes = fake_ask
+    orig_manager = mission_control.manager
+    try:
+        mission_control.manager = mc.MissionManager(Path(_tmp.name) / "missions-turn")
+        done = mc.Mission(
+            id="ft-1", title="pod inspection", cookie_id="ft-ck", session_id="ft-sess",
+            status="completed", result="ok", finished_at=mc.time.time(),
+        )
+        mission_control.manager.missions[done.id] = done
+        reply, _t = await main.run_turn_text("ft-ck", "HAL, ask the mission: any anomalies?")
+        empty_reply, _t2 = await main.run_turn_text("ft-ck", "/ask")
+        no_target, _t3 = await main.run_turn_text("stranger-ck", "/ask anything?")
+        status_line, _t4 = await main.run_turn_text("ft-ck", "HAL, missions status")
+        return seen, reply, empty_reply, no_target, status_line
+    finally:
+        main.ask_hermes = orig_ask
+        mission_control.manager = orig_manager
+
+
+_seen, _reply, _empty_reply, _no_target, _status_line = asyncio.run(_exercise_followup_turn())
+check(
+    "followup routes into the mission session",
+    len(_seen) == 1 and _seen[0][0] == "ft-sess"
+    and "pod inspection" in _seen[0][1] and "any anomalies?" in _seen[0][1],
+    repr(_seen),
+)
+check("followup answer comes back", "nothing unusual" in _reply)
+check("empty followup asks for the question", "What shall I ask" in _empty_reply)
+check(
+    "followup without a steerable mission declines",
+    "no recent mission" in _no_target,
+    _no_target,
+)
+check(
+    "status readout speaks the last mission",
+    "pod inspection" in _status_line and "completed" in _status_line,
+    _status_line,
+)
+
 # --- mission prompt context ------------------------------------------------------
 
 _mp = main._mission_prompt("fix the CI", [
@@ -524,6 +656,9 @@ for token in (
     "interim_transcript",      # live caption frames handled
     "no_wake_word",            # gated utterances stay silent
     "announce_ready",          # queued trigger reports delivered post-gesture
+    'data-act="cancel"',       # mission cards can cancel a running mission
+    'data-act="dismiss"',      # …and dismiss a finished one
+    "st-cancelled",            # cancelled status is styled
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(

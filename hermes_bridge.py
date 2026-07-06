@@ -606,6 +606,16 @@ class ACPBridge:
             print(f"[hermes_bridge] giving up on ACP turn: {last_exc!r}")
         return FAILURE_LINE
 
+    async def cancel(self, cookie_id: str) -> None:
+        """Interrupt the in-flight prompt on a session (mission cancel).
+        Best-effort: an unmapped or unstarted session is a no-op."""
+        acp_id = _session_map.get(cookie_id) if _session_map is not None else None
+        if acp_id and self._alive():
+            try:
+                await self._conn.cancel(session_id=acp_id)
+            except Exception as exc:
+                print(f"[hermes_bridge] cancel {acp_id} failed: {exc!r}")
+
     async def _prompt(self, session_id: str, cookie_id: str, text: str) -> str:
         m = self._acp
         assert self._client is not None
@@ -708,6 +718,13 @@ def bridge_health() -> dict:
     else:
         info.update(_acp_bridge.health())
     return info
+
+
+async def cancel_session(cookie_id: str) -> None:
+    """Interrupt the turn running on this session key, if any (ACP mode only
+    — subprocess mode has no handle on its per-turn process)."""
+    if _acp_bridge is not None:
+        await _acp_bridge.cancel(cookie_id)
 
 
 def drop_session(cookie_id: str) -> None:
