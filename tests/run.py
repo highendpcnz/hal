@@ -667,6 +667,81 @@ check(
 hermes_bridge.clear_commentary_sink("race-ck", _sink_b)
 check("owner clear removes the sink", "race-ck" not in hermes_bridge._commentary_sinks)
 
+# --- bridge polish: boot ritual, latency ring, vitals triggers ----------------------
+
+check(
+    "boot ritual line reads like HAL",
+    "Boot sequence complete" in main._boot_ritual_line()
+    and "functional" in main._boot_ritual_line(),
+)
+
+main._recent_timings.clear()
+for _i in range(50):
+    main._record_timing({"infer": 100 + _i, "turn": 200 + _i})
+check("latency ring is bounded", len(main._recent_timings) == 40)
+check(
+    "latency ring keeps the newest",
+    main._recent_timings[-1]["infer"] == 149 and main._recent_timings[-1]["turn"] == 249,
+)
+main._record_timing({})
+check("empty timings are not recorded", main._recent_timings[-1]["infer"] == 149)
+main._recent_timings.clear()
+
+check("vitals parse valid", mc._parse_vitals({"disk_free_gb_below": 20}) == {"disk_free_gb_below": 20.0})
+check("vitals parse rejects junk", mc._parse_vitals({"disk_free_gb_below": "lots"}) is None)
+check("vitals parse rejects non-dict", mc._parse_vitals("20") is None)
+
+
+async def _exercise_vitals():
+    orig_ask = hermes_bridge.ask_hermes
+    orig_disk = mc._disk_free_gb
+    orig_batt = mc._battery_percent
+
+    async def fake_ask(text, sid):
+        return "vitals checked"
+
+    hermes_bridge.ask_hermes = fake_ask
+    disk_value = [50.0]
+    mc._disk_free_gb = lambda: disk_value[0]
+    mc._battery_percent = lambda: None
+    try:
+        tdir = Path(_tmp.name) / "missions-vitals"
+        mgr = mc.MissionManager(tdir)
+        (tdir / "triggers.json").write_text(json.dumps([
+            {"title": "vitals", "prompt": "check", "vitals": {"disk_free_gb_below": 20}},
+        ]))
+        state: dict = {}
+        mgr._scheduler_tick(state, now=1000.0)            # healthy — no fire
+        healthy = len(mgr.missions)
+        disk_value[0] = 8.0
+        mgr._scheduler_tick(state, now=1030.0)            # crossed — fires
+        crossed = len(mgr.missions)
+        mgr._scheduler_tick(state, now=1060.0)            # still bad — no refire
+        held = len(mgr.missions)
+        mgr._scheduler_tick(state, now=1060.0 + mc.VITALS_REALERT + 1)  # re-alert
+        realerted = len(mgr.missions)
+        disk_value[0] = 50.0
+        mgr._scheduler_tick(state, now=2000.0 + mc.VITALS_REALERT)      # recovered
+        disk_value[0] = 8.0
+        mgr._scheduler_tick(state, now=2030.0 + mc.VITALS_REALERT)      # crosses again
+        recrossed = len(mgr.missions)
+        await asyncio.gather(*list(mgr._tasks))
+        annotated = any("(Trigger: disk free" in m.prompt for m in mgr.missions.values())
+        return healthy, crossed, held, realerted, recrossed, annotated
+    finally:
+        hermes_bridge.ask_hermes = orig_ask
+        mc._disk_free_gb = orig_disk
+        mc._battery_percent = orig_batt
+
+
+(_healthy, _crossed, _held, _realerted, _recrossed, _annotated) = asyncio.run(_exercise_vitals())
+check("vitals quiet while healthy", _healthy == 0)
+check("vitals fire on crossing", _crossed == 1)
+check("vitals hold while still breached", _held == 1)
+check("vitals re-alert after the cooldown", _realerted == 2)
+check("vitals re-fire after recovery", _recrossed == 3)
+check("vitals prompts carry the breach details", _annotated)
+
 # --- the initiative: proposal marker, lifecycle, voice answer -----------------------
 
 _prop_text = main._extract_proposal(
@@ -1058,6 +1133,8 @@ for token in (
     'id="propbar"',            # mission proposal bar exists
     "/api/proposal/",          # …and answers via the endpoint
     "mission_proposal",        # …driven by the SSE event
+    'id="lat-spark"',          # latency sparkline canvas exists
+    "/api/latency",            # …fed from the timings endpoint
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(

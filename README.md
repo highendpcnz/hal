@@ -112,6 +112,8 @@ still verified by running the server.
 | `HAL_COMMENTARY` | `1` | speak-while-thinking on WS turns: HAL voices each sentence as the agent produces it; `0` restores speak-at-end |
 | `HAL_VIEWSCREEN_POLL` | `2` | seconds between scans of `data/viewscreen/` for new visuals |
 | `HAL_VOICE_THRESHOLD` | `0.5` | cosine similarity a voiceprint match must reach (see Crew Manifest) |
+| `HAL_BOOT_RITUAL` | `1` | speak a short self-test greeting to the first arrival after a server start |
+| `HAL_VITALS_REALERT` | `21600` | seconds before an unrecovered vitals trigger re-alerts |
 | `HAL_HERMES_ACP_BIN` | `~/hermes-agent/.venv/bin/hermes-acp` | ACP adapter path |
 | `HAL_HERMES_BIN` | `~/hermes-agent/.venv/bin/hermes` | Hermes CLI path (subprocess mode) |
 | `HAL_HERMES_ARGS` | *(empty)* | extra CLI args in subprocess mode, e.g. `-m gpt-5.4` or `--yolo` |
@@ -145,6 +147,7 @@ still verified by running the server.
   history, issue a fresh cookie (also a button in the Systems drawer)
 - `GET /api/health` — includes ACP bridge liveness (`status: degraded` if the
   agent process is down)
+- `GET /api/latency` — recent turn timings (the telemetry sparkline)
 - `GET /api/status` / `GET /api/systems` / `GET /api/history` — what the
   Systems drawer reads; `/api/systems?refresh=1` bypasses its cache.
   `/api/history` also returns `events`: the journaled terminal
@@ -213,8 +216,10 @@ on a schedule or when files change:
 `every_minutes` fires on an interval (armed at boot, no startup storm);
 `watch` fires when the newest mtime under the glob advances; `at` fires once
 a day at a local time — including a catch-up fire if the laptop was asleep
-or the server down at the scheduled moment. `"enabled": false` disables an
-entry. Trigger state persists in `data/trigger_state.json`, so restarts
+or the server down at the scheduled moment; `"vitals": {"disk_free_gb_below":
+20, "battery_below": 15}` fires when a threshold is first crossed
+(edge-triggered — re-alerts only after `HAL_VITALS_REALERT`, default 6h, if
+it never recovers). `"enabled": false` disables an entry. Trigger state persists in `data/trigger_state.json`, so restarts
 don't re-arm intervals or re-baseline watchers. The file is re-read every
 `HAL_TRIGGERS_POLL` seconds, so edits apply without a restart. Trigger
 missions report to every connected Bridge session and show in everyone's
