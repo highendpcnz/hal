@@ -592,6 +592,95 @@ check(
 )
 check("mission prompt tolerates empty history", "(no prior conversation)" in main._mission_prompt("x", []))
 
+# --- chess engine (clean-room; perft pins move generation) -------------------------
+
+import chess_engine as ce  # noqa: E402
+import chess_control  # noqa: E402
+
+check("chess fen roundtrip", ce.Board.from_fen(ce.START_FEN).to_fen() == ce.START_FEN)
+check("chess perft startpos d3", ce.perft(ce.Board.start(), 3) == 8902)
+_kiwi = ce.Board.from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+check("chess perft kiwipete d2 (castling)", ce.perft(_kiwi, 2) == 2039)
+_pos3 = ce.Board.from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1")
+check("chess perft position-3 d3 (en passant)", ce.perft(_pos3, 3) == 2812)
+
+_mate1 = ce.Board.from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1")
+_mv = ce.best_move(_mate1, depth=3)
+check(
+    "chess engine finds mate in one",
+    _mv is not None and ce.move_uci(_mv) == "f3f7" and ce.san(_mate1, _mv) == "Qxf7#",
+)
+_stale = ce.Board.from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
+check("chess stalemate detected", not _stale.legal_moves() and not _stale.in_check())
+
+# --- chess control: spoken/typed parsing --------------------------------------------
+
+_cmgr = chess_control.ChessManager(Path(_tmp.name) / "chess-data")
+_cgame, _cline = _cmgr.new_game("chess-ck", "w")
+check("chess new game speaks", "Your move" in _cline and _cgame["status"] == "active")
+
+_k, _m = _cmgr.resolve(_cgame, "Knight to f3", typed=False)
+check("chess spoken piece move", _k == "move" and ce.move_uci(_m) == "g1f3")
+_k, _m = _cmgr.resolve(_cgame, "e4", typed=False)
+check("chess bare square is a pawn move", _k == "move" and ce.move_uci(_m) == "e2e4")
+_k, _m = _cmgr.resolve(_cgame, "E two to E four.", typed=False)
+check("chess spoken from-to with number words", _k == "move" and ce.move_uci(_m) == "e2e4")
+_k, _m = _cmgr.resolve(_cgame, "Nf3", typed=True)
+check("chess typed SAN", _k == "move" and ce.move_uci(_m) == "g1f3")
+check("chess ignores plain talk", _cmgr.resolve(_cgame, "what's our status?", typed=False) is None)
+check("chess typed plain talk ignored", _cmgr.resolve(_cgame, "check the logs", typed=True) is None)
+_k, _m = _cmgr.resolve(_cgame, "knight to e4", typed=False)
+check("chess illegal attempt flagged", _k == "illegal", repr((_k, _m)))
+
+_twoknights = dict(_cgame, fen="k7/8/8/8/8/2N1N3/8/K7 w - - 0 1")
+_k, _m = _cmgr.resolve(_twoknights, "knight to d5", typed=False)
+check("chess ambiguous move detected", _k == "ambiguous" and len(_m) == 2)
+_castled = dict(_cgame, fen="r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+_k, _m = _cmgr.resolve(_castled, "castle kingside", typed=False)
+check("chess spoken castling", _k == "move" and ce.move_uci(_m) == "e1g1")
+
+# --- chess control: game flow --------------------------------------------------------
+
+_reply = _cmgr.advance("chess-ck", _cgame, (ce.parse_square("e2"), ce.parse_square("e4"), ""))
+check(
+    "chess advance plays both sides",
+    len(_cgame["moves"]) == 2 and _cgame["status"] == "active" and _reply,
+    repr((_cgame["moves"], _reply)),
+)
+
+_dave_mates, _ = _cmgr.new_game("chess-mate", "w")
+_dave_mates["fen"] = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1"
+_k, _m = _cmgr.resolve(_dave_mates, "queen takes f7", typed=False)
+_verdict = _cmgr.advance("chess-mate", _dave_mates, _m)
+check(
+    "chess recognizes Dave's mate",
+    "Checkmate" in _verdict and _dave_mates["outcome"] == "dave_wins",
+    _verdict,
+)
+
+# Fool's mate: after 1.f3 e5, Dave plays g4 and HAL must find Qh4#.
+_hal_mates, _ = _cmgr.new_game("chess-fools", "w")
+_hal_mates["fen"] = "rnbqkbnr/pppp1ppp/8/4p3/8/5P2/PPPPP1PP/RNBQKBNR w KQkq - 0 2"
+_verdict = _cmgr.advance("chess-fools", _hal_mates, (ce.parse_square("g2"), ce.parse_square("g4"), ""))
+check(
+    "chess HAL delivers the film line on mate",
+    "I think you missed it" in _verdict and _hal_mates["outcome"] == "hal_wins",
+    _verdict,
+)
+
+check("chess resign", _cmgr.resign("chess-ck") is not None)
+check("chess resign twice is a no-op", _cmgr.resign("chess-ck") is None)
+check("chess persists across managers",
+      chess_control.ChessManager(Path(_tmp.name) / "chess-data").load("chess-ck")["status"] == "finished")
+
+# --- chess main wiring: start/resign grammar ----------------------------------------
+
+check("chess start voice", main._CHESS_START_RE.match("HAL, let's play chess.") is not None)
+check("chess start play form", main._CHESS_START_RE.match("Hal, play a game of chess") is not None)
+check("chess start rejects chat about chess",
+      main._CHESS_START_RE.match("HAL, who invented chess?") is None)
+check("chess resign voice", main._CHESS_RESIGN_RE.match("HAL, I resign.") is not None)
+
 # --- session event journal -------------------------------------------------------
 
 main._log_session_event("evt-sess", {"type": "tool_call_update", "status": "completed", "title": "Read file"})
@@ -659,6 +748,9 @@ for token in (
     'data-act="cancel"',       # mission cards can cancel a running mission
     'data-act="dismiss"',      # …and dismiss a finished one
     "st-cancelled",            # cancelled status is styled
+    'id="chess-panel"',        # chess board panel exists
+    "/api/chess/",             # …and drives the chess endpoints
+    "chess_update",            # board refreshes on SSE chess events
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(

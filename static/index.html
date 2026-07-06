@@ -717,6 +717,43 @@
     cursor: pointer;
   }
   .mission-card-act:hover { color: #c33; border-color: #532; }
+
+  /* ═══════════════════════════════════════════════════
+     BRIDGE: Chess panel (desktop only, shown mid-game)
+     ═══════════════════════════════════════════════════ */
+  .chess-panel { display: none; }
+  .chess-head { display: flex; align-items: center; }
+  .chess-actions { margin-left: auto; display: flex; gap: 4px; }
+  .chess-board {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    border: 1px solid #1a1a1a;
+    margin-top: 6px;
+  }
+  .chess-sq {
+    aspect-ratio: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+  }
+  .chess-sq.light { background: #101010; }
+  .chess-sq.dark { background: #090909; }
+  .chess-sq.sel { outline: 1px solid #b8862a; outline-offset: -1px; }
+  .chess-sq.tgt { box-shadow: inset 0 0 0 999px rgba(184, 134, 42, 0.08); }
+  .chess-sq.last { box-shadow: inset 0 0 0 999px rgba(184, 42, 26, 0.12); }
+  .chess-sq .wp { color: #b9b2a3; }
+  .chess-sq .bp { color: #6e2a1e; }
+  .chess-status {
+    color: #555;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    margin-top: 5px;
+    min-height: 12px;
+  }
   .mission-card-title {
     color: #999;
     font-size: 12px;
@@ -988,6 +1025,14 @@
     }
     .missions-panel::-webkit-scrollbar { width: 4px; }
     .missions-panel::-webkit-scrollbar-thumb { background: #1a1a1a; border-radius: 2px; }
+    .chess-panel.on {
+      display: block;
+      width: min(82%, 340px);
+      border: 1px solid #151515;
+      border-radius: 6px;
+      background: #030303;
+      padding: 8px 10px;
+    }
 
     /* Right column: mission log */
     .mission-log {
@@ -1064,6 +1109,17 @@
     <div id="missions-panel" class="missions-panel">
       <div class="missions-title">Missions</div>
       <div id="mission-cards"></div>
+    </div>
+    <div id="chess-panel" class="chess-panel">
+      <div class="missions-title chess-head">Chess
+        <span class="chess-actions">
+          <button id="chess-new" class="mission-card-act"
+                  title="New game — shift-click to play black">NEW</button>
+          <button id="chess-resign" class="mission-card-act">RESIGN</button>
+        </span>
+      </div>
+      <div id="chess-board" class="chess-board"></div>
+      <div id="chess-status" class="chess-status"></div>
     </div>
   </div>
 
@@ -1455,6 +1511,126 @@
   }, 10000);
 
   // ═══════════════════════════════════════════════════
+  // Chess panel — renders the server's FEN; clicks post UCI moves.
+  // Voice moves arrive as chess_update SSE events and re-render.
+  // ═══════════════════════════════════════════════════
+  const chessPanel = document.getElementById('chess-panel');
+  const chessBoardEl = document.getElementById('chess-board');
+  const chessStatusEl = document.getElementById('chess-status');
+  const CHESS_GLYPHS = {
+    P: '♙', N: '♘', B: '♗', R: '♖', Q: '♕', K: '♔',
+    p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚',
+  };
+  let chessGame = null;
+  let chessSel = null;
+
+  function chessSquares(fen) {
+    const out = {};
+    const rows = fen.split(' ')[0].split('/');
+    for (let r = 0; r < 8; r++) {
+      const rank = 8 - r;
+      let file = 0;
+      for (const ch of rows[r]) {
+        if (/\d/.test(ch)) file += +ch;
+        else { out['abcdefgh'[file] + rank] = ch; file++; }
+      }
+    }
+    return out;
+  }
+
+  function renderChess() {
+    if (!chessPanel || !chessBoardEl) return;
+    if (!chessGame) { chessPanel.classList.remove('on'); return; }
+    chessPanel.classList.add('on');
+    const pieces = chessSquares(chessGame.fen);
+    const flipped = chessGame.dave_color === 'b';
+    const last = chessGame.last_move || '';
+    const targets = new Set(
+      chessSel ? chessGame.legal.filter(u => u.startsWith(chessSel)).map(u => u.slice(2, 4)) : []
+    );
+    chessBoardEl.innerHTML = '';
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const file = flipped ? 7 - col : col;
+        const rank = flipped ? row + 1 : 8 - row;
+        const name = 'abcdefgh'[file] + rank;
+        const el = document.createElement('div');
+        el.className = 'chess-sq ' + (((file + rank) % 2) ? 'light' : 'dark');
+        if (name === chessSel) el.className += ' sel';
+        if (targets.has(name)) el.className += ' tgt';
+        if (last.slice(0, 2) === name || last.slice(2, 4) === name) el.className += ' last';
+        const piece = pieces[name];
+        if (piece) {
+          const span = document.createElement('span');
+          span.className = piece === piece.toUpperCase() ? 'wp' : 'bp';
+          span.textContent = CHESS_GLYPHS[piece];
+          el.appendChild(span);
+        }
+        el.addEventListener('click', () => chessClick(name));
+        chessBoardEl.appendChild(el);
+      }
+    }
+    let status;
+    if (chessGame.status !== 'active') {
+      status = chessGame.outcome === 'draw' ? 'Draw.'
+        : chessGame.outcome === 'dave_wins' ? 'You won, Dave.' : 'HAL wins.';
+    } else if (chessGame.turn === chessGame.dave_color) {
+      status = 'Your move, Dave.' + (chessGame.check ? ' Check.' : '');
+    } else {
+      status = 'HAL is thinking…';
+    }
+    chessStatusEl.textContent = status;
+  }
+
+  async function chessClick(name) {
+    if (!chessGame || chessGame.status !== 'active') return;
+    if (chessGame.turn !== chessGame.dave_color) return;
+    if (chessSel && chessGame.legal.some(u => u.slice(0, 4) === chessSel + name)) {
+      const uci = chessSel + name;  // promotions default to queen server-side
+      chessSel = null;
+      chessStatusEl.textContent = 'HAL is thinking…';
+      try {
+        const res = await fetch('/api/chess/move', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ move: uci }),
+        });
+        const data = await res.json();
+        if (data.game) { chessGame = data.game; renderChess(); }
+      } catch (e) {}
+      return;
+    }
+    chessSel = chessGame.legal.some(u => u.startsWith(name)) ? name : null;
+    renderChess();
+  }
+
+  async function loadChess() {
+    try {
+      const res = await fetch('/api/chess/state');
+      const data = await res.json();
+      chessGame = data.game;
+      chessSel = null;
+      renderChess();
+    } catch (e) {}
+  }
+  loadChess();
+
+  document.getElementById('chess-new')?.addEventListener('click', async (e) => {
+    try {
+      await fetch('/api/chess/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ color: e.shiftKey ? 'black' : 'white' }),
+      });
+    } catch (err) {}
+    loadChess();
+  });
+  document.getElementById('chess-resign')?.addEventListener('click', async () => {
+    try { await fetch('/api/chess/resign', { method: 'POST' }); } catch (e) {}
+    loadChess();
+  });
+
+  // ═══════════════════════════════════════════════════
   // Log + Caption (preserved, extended for mission log)
   // ═══════════════════════════════════════════════════
   function updateLog(userText, halText) {
@@ -1549,6 +1725,8 @@
         appendToMissionLog('system', `Mission [${shortId}] "${m.title}": ${statusText}`);
         upsertMission(m);
         renderMissions();
+      } else if (msg.type === 'chess_update') {
+        loadChess();  // a voice move (or another tab) changed the board
       }
     };
     events.onerror = () => {

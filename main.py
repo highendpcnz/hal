@@ -34,6 +34,8 @@ from faster_whisper import WhisperModel
 from piper import PiperVoice, SynthesisConfig
 from pydantic import BaseModel
 
+import chess_control
+import chess_engine
 import hermes_bridge
 from hermes_bridge import ask_hermes
 import mission_control
@@ -75,6 +77,7 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 hermes_bridge.init(DATA_DIR)
 mission_control.init(DATA_DIR)
+chess_control.init(DATA_DIR)
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -401,6 +404,16 @@ _MISSION_CANCEL_RE = re.compile(
     re.I,
 )
 _MISSION_ASK_RE = re.compile(r"^\s*hal[,.]?\s+ask\s+the\s+mission[,:]?\s*(.*)$", re.I)
+
+# Chess: "HAL, let's play chess" (typed: "/chess", "/chess black"); resign
+# with "HAL, I resign" or "/chess resign". Moves are only interpreted while
+# a game is active, and only when they parse to a concrete legal move.
+_CHESS_START_RE = re.compile(
+    r"^\s*hal[,.]?\s+(?:let'?s\s+play|play|shall\s+we\s+play|fancy)\s+"
+    r"(?:a\s+(?:game|round)\s+of\s+)?chess\b",
+    re.I,
+)
+_CHESS_RESIGN_RE = re.compile(r"^\s*hal[,.]?\s+i\s+resign\b", re.I)
 _MISSION_STATUS_RE = re.compile(
     r"^\s*hal[,.]?\s+(?:missions?\s+status|how\s+(?:are|is)\s+(?:the\s+)?missions?"
     r"(?:\s+(?:going|doing|coming(?:\s+along)?))?)\s*[.?!]?\s*$",
@@ -522,6 +535,65 @@ def _missions_status_text(session_id: str) -> str:
     return "There are no missions on the board, Dave."
 
 
+# Chess turns must serialize per session: two rapid inputs racing advance()
+# would fork the game state.
+_chess_locks = hermes_bridge.KeyedLocks()
+
+
+def _speak_if_connected(session_id: str, text: str) -> None:
+    """Voice a line over the live socket, if there is one (board clicks and
+    API calls still get their reply in the response either way)."""
+    websocket = active_websockets.get(session_id)
+    if websocket is not None:
+        _spawn(_speak_prompt_safe(session_id, websocket, text), name="chess-line")
+
+
+async def _chess_turn(session_id: str, user_text: str) -> str | None:
+    """Interpret an utterance as chess (start/resign/move). None means it
+    wasn't chess and the turn falls through to the brain."""
+    manager = chess_control.manager
+    text = user_text.strip()
+    lowered = text.lower()
+
+    start = _CHESS_START_RE.match(text) is not None
+    dave_color = "w"
+    if lowered in ("/chess", "/chess new", "/chess white"):
+        start = True
+    elif lowered == "/chess black":
+        start, dave_color = True, "b"
+    if start:
+        async with _chess_locks.hold(session_id):
+            _game, line = await asyncio.to_thread(manager.new_game, session_id, dave_color)
+        hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+        return line
+
+    game = manager.load(session_id)
+    if game is None or game["status"] != "active":
+        return None
+
+    if _CHESS_RESIGN_RE.match(text) is not None or lowered in ("/chess resign", "/resign"):
+        line = manager.resign(session_id)
+        hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+        return line
+
+    async with _chess_locks.hold(session_id):
+        game = manager.load(session_id)
+        if game is None or game["status"] != "active":
+            return None
+        resolved = manager.resolve(game, text, typed=False)
+        if resolved is None:
+            return None
+        kind, payload = resolved
+        if kind == "illegal":
+            return f"I can't play {payload} from here, Dave."
+        if kind == "ambiguous":
+            squares = " or ".join(sorted({chess_engine.square_name(mv[0]) for mv in payload}))
+            return f"Which one, Dave — from {squares}?"
+        line = await asyncio.to_thread(manager.advance, session_id, game, payload)
+    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    return line
+
+
 def _mission_prompt(title: str, history: list[dict]) -> str:
     """A mission runs in its own Hermes session with no memory of the
     conversation that spawned it — carry the recent exchange along."""
@@ -613,6 +685,8 @@ async def run_turn_text(session_id: str, user_text: str) -> tuple[str, dict[str,
                 hermes_bridge.unalias_events(target.session_id)
     elif _MISSION_STATUS_RE.match(user_text) is not None:
         hal_text = _missions_status_text(session_id)
+    elif (chess_line := await _chess_turn(session_id, user_text)) is not None:
+        hal_text = chess_line
     else:
         # Completed-mission reports ride along on the next prompt so the
         # brain can answer follow-up questions about them.
@@ -874,6 +948,89 @@ def missions(request: Request):
     return {"missions": mission_control.manager.list_missions(session_id)}
 
 
+def _chess_payload(session_id: str) -> dict:
+    game = chess_control.manager.load(session_id)
+    if game is None:
+        return {"game": None}
+    board = chess_engine.Board.from_fen(game["fen"])
+    payload = {
+        key: game[key]
+        for key in ("fen", "dave_color", "status", "outcome", "moves", "last_move")
+    }
+    payload["turn"] = "w" if board.white_to_move else "b"
+    payload["check"] = board.in_check()
+    payload["legal"] = (
+        [chess_engine.move_uci(m) for m in board.legal_moves()]
+        if game["status"] == "active" else []
+    )
+    return {"game": payload}
+
+
+@app.get("/api/chess/state")
+def chess_state(request: Request):
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return {"game": None}
+    return _chess_payload(session_id)
+
+
+class ChessNewRequest(BaseModel):
+    color: str = "white"  # the color Dave plays
+
+
+@app.post("/api/chess/new")
+async def chess_new(request: Request, body: ChessNewRequest):
+    session_id, new_session = _session_from_request(request)
+    dave_color = "b" if body.color.strip().lower() == "black" else "w"
+    async with _chess_locks.hold(session_id):
+        _game, line = await asyncio.to_thread(
+            chess_control.manager.new_game, session_id, dave_color
+        )
+    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    _speak_if_connected(session_id, line)
+    resp = JSONResponse({**_chess_payload(session_id), "spoken": line})
+    if new_session:
+        _set_session_cookie(resp, session_id)
+    return resp
+
+
+class ChessMoveRequest(BaseModel):
+    move: str  # UCI, e.g. "e2e4"; promotions default to queen
+
+
+@app.post("/api/chess/move")
+async def chess_move(request: Request, body: ChessMoveRequest):
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return JSONResponse({"ok": False}, status_code=403)
+    async with _chess_locks.hold(session_id):
+        game = chess_control.manager.load(session_id)
+        if game is None or game["status"] != "active":
+            return JSONResponse({"ok": False, "error": "no active game"}, status_code=409)
+        board = chess_engine.Board.from_fen(game["fen"])
+        legal = {chess_engine.move_uci(m): m for m in board.legal_moves()}
+        move = legal.get(body.move.strip().lower()) or legal.get(body.move.strip().lower() + "q")
+        if move is None:
+            return JSONResponse({"ok": False, "error": "illegal move"}, status_code=400)
+        line = await asyncio.to_thread(chess_control.manager.advance, session_id, game, move)
+    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    _speak_if_connected(session_id, line)
+    return JSONResponse({**_chess_payload(session_id), "ok": True, "spoken": line})
+
+
+@app.post("/api/chess/resign")
+async def chess_resign(request: Request):
+    session_id = _valid_session_id(request.cookies.get("hal_session"))
+    if session_id is None:
+        return JSONResponse({"ok": False}, status_code=403)
+    line = chess_control.manager.resign(session_id)
+    if line is None:
+        return JSONResponse({"ok": False}, status_code=404)
+    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    _speak_if_connected(session_id, line)
+    return JSONResponse({**_chess_payload(session_id), "ok": True, "spoken": line})
+
+
 @app.post("/api/missions/{mission_id}/cancel")
 async def mission_cancel(mission_id: str, request: Request):
     """Interrupt a running mission (the card's Cancel control)."""
@@ -997,6 +1154,7 @@ def reset_session(request: Request):
         session_file(old_id).unlink(missing_ok=True)
         events_file(old_id).unlink(missing_ok=True)
         mission_control.manager.drain_notes(old_id)
+        chess_control.manager.drop(old_id)
     new_id = str(uuid.uuid4())
     resp = JSONResponse({"session_id": new_id})
     _set_session_cookie(resp, new_id)

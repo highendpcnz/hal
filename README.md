@@ -106,6 +106,7 @@ still verified by running the server.
 | `HAL_YOLO` | *(unset)* | legacy alias: `1` = `HAL_PERMISSION_MODE=yolo` |
 | `HAL_MAX_ACTIVE_MISSIONS` | `3` | per-session cap on concurrently running background missions |
 | `HAL_MISSION_STEERABLE_TTL` | `1800` | seconds a finished mission's session stays alive for `/ask` follow-ups |
+| `HAL_CHESS_DEPTH` / `HAL_CHESS_TIME` | `3` / `4` | chess engine search depth and time budget (seconds) |
 | `HAL_TRIGGERS_POLL` | `30` | seconds between `data/triggers.json` scans |
 | `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records; `0` disables |
 | `HAL_HERMES_ACP_BIN` | `~/hermes-agent/.venv/bin/hermes-acp` | ACP adapter path |
@@ -223,6 +224,26 @@ tool-permission requests (ACP mode) regardless of `HAL_PERMISSION_MODE` —
 this is what lets a briefing run shell and web tools under the default
 `deny`. You edit the trigger file, you grant the scope; leave it off for
 triggers that don't need tools.
+
+## Chess
+
+"HAL, let's play chess" (typed: `/chess`, or `/chess black` to give HAL
+white) opens a game against a small clean-room engine built into this repo —
+no GPL dependencies (python-chess and sunfish are both GPL), move generation
+pinned by perft counts in the test suite. A board panel appears on the
+desktop Bridge; play by clicking squares or by voice — "knight to f3",
+"e2 to e4", "castle kingside", "queen takes on d5" — and HAL speaks his
+replies in register. He reserves the film's line for delivering mate.
+
+"HAL, I resign" (or the panel's RESIGN button) ends the game; NEW starts
+another (shift-click to play black). One game per browser session, persisted
+in `data/chess/`, so it survives restarts. `HAL_CHESS_DEPTH` (default 3) and
+`HAL_CHESS_TIME` (seconds, default 4) set his strength; promotions from
+board clicks auto-queen, spoken promotions can name the piece.
+
+Endpoints: `GET /api/chess/state`, `POST /api/chess/new` `{"color":
+"white"|"black"}`, `POST /api/chess/move` `{"move": "e2e4"}`,
+`POST /api/chess/resign`.
 
 ## Autostart at login (optional)
 
