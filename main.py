@@ -483,8 +483,10 @@ def _ledger_add_request(user_text: str) -> str | None:
 # capital plus a stoplist of common non-name words.
 _ENROLL_RE = re.compile(
     # re.I for the trigger words only — the captured name keeps its original
-    # case so _enroll_request can require a capital letter.
-    r"^\s*hal[,.]?\s+(?:this is|my name is)\s+([A-Za-z][A-Za-z .'-]{0,40}?)[.!?]?\s*$",
+    # case so _enroll_request can require a capital letter. The address
+    # accepts whisper's stock mishearings of "HAL" (Hell/Hall/Hel) — an
+    # introduction misheard once is a feature that looks broken.
+    r"^\s*h[ae]l{1,2}[,.]?\s+(?:this is|my name is)\s+([A-Za-z][A-Za-z .'-]{0,40}?)[.!?]?\s*$",
     re.I,
 )
 _ENROLL_STOPWORDS = {

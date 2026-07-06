@@ -704,6 +704,7 @@ import speaker_id  # noqa: E402
 
 check("enroll matches this-is", main._enroll_request("HAL, this is Frank.") == "Frank")
 check("enroll matches my-name-is", main._enroll_request("Hal, my name is Dr. Chandra") == "Dr. Chandra")
+check("enroll survives HAL misheard as Hell", main._enroll_request("Hell, this is Sam.") == "Sam")
 check("enroll rejects adjectives", main._enroll_request("HAL, this is ridiculous!") is None)
 check("enroll rejects stopword names", main._enroll_request("HAL, this is Important.") is None)
 check("enroll rejects long phrases", main._enroll_request("HAL, this is a real problem for us") is None)
