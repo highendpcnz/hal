@@ -181,6 +181,8 @@ async def lifespan(_app: FastAPI):
     await hermes_bridge.startup()
     mission_control.manager.start_scheduler()
     viewscreen_task = asyncio.create_task(_viewscreen_watch(), name="viewscreen-watch")
+    if BOOT_RITUAL:
+        _pending_announcements.append(_boot_ritual_line())
     yield
     viewscreen_task.cancel()
     with suppress(asyncio.CancelledError):
@@ -1583,6 +1585,25 @@ def _drain_announcements() -> list[str]:
     drained = list(_pending_announcements)
     _pending_announcements.clear()
     return drained
+
+
+# Boot ritual: a short self-test greeting queued at startup and spoken to
+# the first session whose audio unlocks — the diegetic "all systems
+# functional" moment.
+BOOT_RITUAL = os.environ.get("HAL_BOOT_RITUAL", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def _boot_ritual_line() -> str:
+    bridge = hermes_bridge.bridge_health()
+    link = (
+        "the bridge to Hermes is online"
+        if bridge.get("alive")
+        else "my link to Hermes is still warming"
+    )
+    return (
+        f"Boot sequence complete, Dave. Voice and hearing are calibrated, {link}. "
+        "All systems functional. I am at your service."
+    )
 
 # Running commentary: HAL speaks the reply sentence-by-sentence while the
 # agent is still working, instead of waiting for the turn to finish.
