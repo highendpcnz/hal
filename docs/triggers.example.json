@@ -21,5 +21,10 @@
     "every_minutes": 480,
     "enabled": false,
     "prompt": "Check disk space, memory, and recent errors. Report anomalies only."
+  },
+  {
+    "title": "Vitals warning",
+    "vitals": {"disk_free_gb_below": 15, "battery_below": 12},
+    "prompt": "A system vital crossed its threshold (details below). Assess briefly — what's consuming the resource, how urgent is it — and report in two calm sentences."
   }
 ]

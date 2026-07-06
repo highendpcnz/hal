@@ -9,6 +9,9 @@ import asyncio
 import glob
 import json
 import os
+import re
+import shutil
+import subprocess
 import time
 import uuid
 from contextlib import suppress
@@ -35,6 +38,57 @@ STEERABLE_TTL = float(os.environ.get("HAL_MISSION_STEERABLE_TTL", str(30 * 60)))
 
 class MissionLimitError(RuntimeError):
     """Raised when a session already has MAX_ACTIVE_MISSIONS running."""
+
+
+# Vitals triggers re-alert after this long if the condition never clears —
+# edge-triggered otherwise, so a full disk doesn't fire every poll.
+VITALS_REALERT = float(os.environ.get("HAL_VITALS_REALERT", str(6 * 3600)))
+_BATT_RE = re.compile(r"(\d{1,3})%")
+
+
+def _disk_free_gb() -> float:
+    return shutil.disk_usage(os.path.expanduser("~")).free / 1e9
+
+
+def _battery_percent() -> Optional[int]:
+    """Battery charge via pmset; None on desktops or parse failure."""
+    try:
+        out = subprocess.run(
+            ["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _BATT_RE.search(out)
+    return int(match.group(1)) if match else None
+
+
+def _vitals_breaches(cfg: dict) -> list[str]:
+    """Human-readable descriptions of every breached threshold."""
+    breaches = []
+    disk_below = cfg.get("disk_free_gb_below")
+    if disk_below is not None:
+        free = _disk_free_gb()
+        if free < float(disk_below):
+            breaches.append(f"disk free {free:.1f} GB (threshold {disk_below})")
+    batt_below = cfg.get("battery_below")
+    if batt_below is not None:
+        percent = _battery_percent()
+        if percent is not None and percent < int(batt_below):
+            breaches.append(f"battery {percent}% (threshold {batt_below})")
+    return breaches
+
+
+def _parse_vitals(raw) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    cfg = {}
+    for key in ("disk_free_gb_below", "battery_below"):
+        try:
+            if raw.get(key) is not None:
+                cfg[key] = float(raw[key])
+        except (TypeError, ValueError):
+            continue
+    return cfg or None
 
 
 def _parse_at(raw) -> Optional[tuple[int, int]]:
@@ -340,7 +394,10 @@ class MissionManager:
                 every = 0.0
             watch = str(item.get("watch", "")).strip()
             at = _parse_at(item.get("at"))
-            if not title or not prompt or (every <= 0 and not watch and at is None):
+            vitals = _parse_vitals(item.get("vitals"))
+            if not title or not prompt or (
+                every <= 0 and not watch and at is None and vitals is None
+            ):
                 continue
             triggers.append({
                 "title": title,
@@ -348,6 +405,7 @@ class MissionManager:
                 "every_minutes": every,
                 "watch": watch,
                 "at": at,
+                "vitals": vitals,
                 "allow_tools": str(item.get("permissions", "")).strip().lower() == "allow",
             })
         return triggers
@@ -411,6 +469,17 @@ class MissionManager:
                 elif last < sched:
                     st["last_at"] = now
                     fire = True
+            if trig["vitals"] is not None:
+                # Edge-triggered: fire when a threshold is first crossed,
+                # re-alert only after VITALS_REALERT if it never recovers.
+                breaches = _vitals_breaches(trig["vitals"])
+                was_ok = st.get("vitals_ok", True)
+                fired_at = st.get("vitals_fired_at", 0)
+                st["vitals_ok"] = not breaches
+                if breaches and (was_ok or now - fired_at > VITALS_REALERT):
+                    st["vitals_fired_at"] = now
+                    fire = True
+                    prompt = f"{prompt}\n(Trigger: {'; '.join(breaches)})"
             if fire:
                 try:
                     self.create_mission(
