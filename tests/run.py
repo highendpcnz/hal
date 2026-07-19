@@ -1179,6 +1179,9 @@ _manifests = re.findall(
 )
 check("directions.ts declares three manifests", len(_manifests) == 3, repr(_manifests))
 _ready_ids = [mid for mid, ready in _manifests if ready == "true"]
+_default_match = re.search(r'ACTIVE_DIRECTION:\s*BridgeDirectionId\s*=\s*"([a-z]+)"', _directions_src)
+_default_id = _default_match.group(1) if _default_match else None
+check("directions.ts declares a default direction", _default_id in _ready_ids, repr(_default_id))
 
 _inline_ready = re.search(r"READY_DIRECTIONS\s*=\s*\[([^\]]*)\]", _frontend_src)
 _inline_ids = re.findall(r'"([a-z]+)"', _inline_ready.group(1)) if _inline_ready else []
@@ -1192,14 +1195,16 @@ for _mid, _ready in _manifests:
     check(f"direction stylesheet link for {_mid}", f'data-direction-style="{_mid}"' in _frontend_src)
     check(f"direction selector button for {_mid}", f'data-direction-id="{_mid}"' in _frontend_src)
     check(f"scene module wired for {_mid}", f'{_mid}: () => import("./optic-' in _entry_src)
-    if _ready == "true":
+    # Only the default direction's stylesheet parses enabled; the pre-paint
+    # script enables the stored selection before first render.
+    if _mid == _default_id:
         check(
-            f"stylesheet for ready direction {_mid} parses enabled",
+            f"stylesheet for default direction {_mid} parses enabled",
             f'data-direction-style="{_mid}" />' in _frontend_src,
         )
     else:
         check(
-            f"stylesheet for pending direction {_mid} parses disabled",
+            f"stylesheet for non-default direction {_mid} parses disabled",
             f'data-direction-style="{_mid}" disabled />' in _frontend_src,
         )
 

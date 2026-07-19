@@ -18,7 +18,7 @@ export const BRIDGE_DIRECTIONS: readonly BridgeDirectionManifest[] = [
     id: "orrery",
     label: "Cognitive Orrery",
     shortLabel: "02",
-    ready: false
+    ready: true
   },
   {
     id: "vault",

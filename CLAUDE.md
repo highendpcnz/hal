@@ -22,7 +22,7 @@ HAL_SKIP_MODELS=1 /Users/hal-9000/.hermes/hermes-agent/venv/bin/python tests/run
 
 ## Current product state
 
-Option 1, “Aperture Sentinel,” is implemented and selectable. It includes the live 3D optic, responsive desktop/tablet/mobile bridge, waveform energy, mission transcript, typed command input, systems drawer, chess, viewscreen switching, permissions, and voice controls. Options 2 and 3 are represented in `frontend/directions.ts` and are intentionally visible but disabled until developed as independent directions.
+Options 1 (“Aperture Sentinel”) and 2 (“Cognitive Orrery”) are implemented and selectable from the rail; option 3 (“Signal Vault”) remains visible but disabled in `frontend/directions.ts` until built (Phase 2 of `docs/plans/directions-2-3.md`). Option 1 QA: `design-qa.md`; option 2 QA: `design-qa-option2.md`. Direction-independent base/mobile styles live in `static/bridge-shared.css`; each direction owns its desktop/tablet shell stylesheet. Note: `static/index.html`'s inline styles still contain the legacy pre-directions tablet/desktop blocks — direction stylesheets must reset against them (see the option 2 QA iteration history).
 
 The direction runtime (Phase 0 of `docs/plans/directions-2-3.md`) is in place: selection persists in `localStorage` (`hal_direction`), a pre-paint inline script in `static/index.html` picks the direction stylesheet, and `frontend/hal-optic.ts` boots the direction’s scene module via dynamic import (`frontend/optic-aperture.ts` today; `optic-orrery.ts`/`optic-vault.ts` are stubs). The scene contract is `frontend/optic-api.ts`; `tests/run.py` pins the cross-file invariants.
 

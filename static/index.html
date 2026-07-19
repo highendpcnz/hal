@@ -1133,6 +1133,7 @@
     }
   }
 </style>
+<link rel="stylesheet" href="/static/bridge-shared.css" />
 <link rel="stylesheet" href="/static/bridge-option1.css" data-direction-style="aperture" />
 <link rel="stylesheet" href="/static/bridge-option2.css" data-direction-style="orrery" disabled />
 <link rel="stylesheet" href="/static/bridge-option3.css" data-direction-style="vault" disabled />
@@ -1142,7 +1143,7 @@
   // READY_DIRECTIONS and the storage key mirror frontend/directions.ts and
   // frontend/hal-optic.ts (asserted by tests/run.py) — keep them in sync.
   (function () {
-    var READY_DIRECTIONS = ["aperture"];
+    var READY_DIRECTIONS = ["aperture", "orrery"];
     var direction = READY_DIRECTIONS[0];
     try {
       var stored = localStorage.getItem("hal_direction");
