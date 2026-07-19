@@ -4313,5 +4313,5 @@ void main() {
 					float bloomAlpha = max( bloom.r, max( bloom.g, bloom.b ) );
 					gl_FragColor = vec4( bloom, bloomAlpha );
 
-				}`})}};yc.BlurDirectionX=new U(1,0),yc.BlurDirectionY=new U(0,1);export{U as A,vi as C,Er as D,Ir as E,Di as O,Tr as S,Nt as T,zn as _,ac as a,Ct as b,Cr as c,xi as d,Mt as f,Zn as g,je as h,mc as i,Dr as k,Z as l,lr as m,_c as n,Si as o,wt as p,gc as r,Sr as s,yc as t,wr as u,zr as v,k as w,gi as x,Rr as y};
+				}`})}};yc.BlurDirectionX=new U(1,0),yc.BlurDirectionY=new U(0,1);export{U as A,vi as C,Er as D,Ir as E,Di as O,Tr as S,Nt as T,zn as _,ac as a,Ct as b,Cr as c,xi as d,Mt as f,Zn as g,je as h,mc as i,G as j,Dr as k,Z as l,lr as m,_c as n,Si as o,wt as p,gc as r,Sr as s,yc as t,wr as u,zr as v,k as w,gi as x,Rr as y};
 //# sourceMappingURL=UnrealBloomPass.js.map

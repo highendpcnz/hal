@@ -24,7 +24,7 @@ export const BRIDGE_DIRECTIONS: readonly BridgeDirectionManifest[] = [
     id: "vault",
     label: "Signal Vault",
     shortLabel: "03",
-    ready: false
+    ready: true
   }
 ] as const;
 
