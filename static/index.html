@@ -1137,13 +1137,14 @@
 <link rel="stylesheet" href="/static/bridge-option1.css" data-direction-style="aperture" />
 <link rel="stylesheet" href="/static/bridge-option2.css" data-direction-style="orrery" disabled />
 <link rel="stylesheet" href="/static/bridge-option3.css" data-direction-style="vault" disabled />
+<link rel="stylesheet" href="/static/bridge-option4.css" data-direction-style="chorus" disabled />
 <script>
   // Pre-paint direction pick: enable the selected direction's stylesheet
   // before the body parses so switching never flashes the wrong shell.
   // READY_DIRECTIONS and the storage key mirror frontend/directions.ts and
   // frontend/hal-optic.ts (asserted by tests/run.py) — keep them in sync.
   (function () {
-    var READY_DIRECTIONS = ["aperture", "orrery", "vault"];
+    var READY_DIRECTIONS = ["aperture", "orrery", "vault", "chorus"];
     var direction = READY_DIRECTIONS[0];
     try {
       var stored = localStorage.getItem("hal_direction");
@@ -1301,6 +1302,7 @@
       <button class="direction-option" type="button" data-direction-id="aperture" aria-label="Select Aperture Sentinel">01</button>
       <button class="direction-option" type="button" data-direction-id="orrery" aria-label="Select Cognitive Orrery">02</button>
       <button class="direction-option" type="button" data-direction-id="vault" aria-label="Select Signal Vault">03</button>
+      <button class="direction-option" type="button" data-direction-id="chorus" aria-label="Select Ember Chorus">04</button>
     </div>
   </nav>
 

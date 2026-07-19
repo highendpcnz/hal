@@ -19,7 +19,8 @@ const DIRECTION_STORAGE_KEY = "hal_direction";
 const SCENE_LOADERS: Record<BridgeDirectionId, () => Promise<{ createOptic: CreateOptic }>> = {
   aperture: () => import("./optic-aperture"),
   orrery: () => import("./optic-orrery"),
-  vault: () => import("./optic-vault")
+  vault: () => import("./optic-vault"),
+  chorus: () => import("./optic-chorus")
 };
 
 function resolveDirection(): BridgeDirectionManifest {

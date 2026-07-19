@@ -1177,7 +1177,7 @@ _entry_src = (_frontend_dir / "hal-optic.ts").read_text()
 _manifests = re.findall(
     r'id:\s*"([a-z]+)".*?ready:\s*(true|false)', _directions_src, flags=re.S
 )
-check("directions.ts declares three manifests", len(_manifests) == 3, repr(_manifests))
+check("directions.ts declares four manifests", len(_manifests) == 4, repr(_manifests))
 _ready_ids = [mid for mid, ready in _manifests if ready == "true"]
 _default_match = re.search(r'ACTIVE_DIRECTION:\s*BridgeDirectionId\s*=\s*"([a-z]+)"', _directions_src)
 _default_id = _default_match.group(1) if _default_match else None

@@ -1,0 +1,535 @@
+/* Direction 04 — Ember Chorus: the summoned void.
+   The swarm owns the screen. Permanent chrome is a hairline top bar and
+   the docked command line; everything else materializes only when it is
+   real — log lines as decaying whispers, mission cards while missions
+   run, chess/viewscreen/permission on demand. One rule block covers
+   desktop and tablet (the layout is minimal; the direction-scoped
+   selectors out-rank the legacy inline blocks at any width). Scoped to
+   html[data-bridge-direction="chorus"]; base/mobile in bridge-shared.css.
+   Design: docs/plans/2026-07-19-ember-chorus-design.md. */
+
+@keyframes chorus-whisper {
+  0% { opacity: 0; transform: translateX(-8px); }
+  6% { opacity: 0.85; transform: translateX(0); }
+  70% { opacity: 0.55; }
+  100% { opacity: 0.13; }
+}
+
+@media (min-width: 761px) {
+  html[data-bridge-direction="chorus"] body {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 52px minmax(0, 1fr) 76px;
+    width: 100vw;
+    height: 100vh;
+    gap: 0;
+    padding: 0;
+    overflow: hidden;
+    align-items: stretch;
+    align-content: stretch;
+    justify-content: stretch;
+    justify-items: stretch;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-left {
+    display: contents;
+  }
+
+  /* --- the hairline top bar -------------------------------------------- */
+
+  html[data-bridge-direction="chorus"] .bridge-brand {
+    grid-area: 1 / 1 / 2 / 2;
+    display: flex;
+    flex-direction: row-reverse;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 14px;
+    padding: 0 28px;
+    border-bottom: 1px solid rgba(196, 189, 180, 0.09);
+    background: transparent;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-mark {
+    display: inline;
+    color: #8f8b85;
+    font-family: "Azeret Mono", monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-brand-title {
+    color: #4a4743;
+    font-size: 8px;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-rail {
+    grid-area: 1 / 2 / 2 / 3;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    border-top: 0;
+    border-bottom: 1px solid rgba(196, 189, 180, 0.09);
+    background: transparent;
+  }
+
+  html[data-bridge-direction="chorus"] .rail-actions {
+    display: flex;
+    align-items: stretch;
+    justify-content: flex-end;
+    gap: 2px;
+  }
+
+  html[data-bridge-direction="chorus"] .rail-action {
+    border-right: 0;
+    padding: 0 16px;
+    color: #55524d;
+    font-size: 9px;
+    letter-spacing: 0.2em;
+  }
+
+  html[data-bridge-direction="chorus"] .rail-action::before {
+    display: none;
+  }
+
+  html[data-bridge-direction="chorus"] .rail-action:hover {
+    background: transparent;
+    box-shadow: inset 0 -1px 0 var(--signal);
+  }
+
+  html[data-bridge-direction="chorus"] .direction-selector {
+    display: flex;
+  }
+
+  /* --- the stage is everything ----------------------------------------- */
+
+  html[data-bridge-direction="chorus"] .eye-module {
+    position: fixed;
+    inset: 52px 0 76px 0;
+    z-index: 0;
+    width: auto;
+    height: auto;
+    margin: 0;
+    aspect-ratio: auto;
+    border: 0;
+    border-radius: 0;
+    background: #010101;
+    box-shadow: none;
+    pointer-events: none;
+  }
+
+  html[data-bridge-direction="chorus"] .eye-module::before,
+  html[data-bridge-direction="chorus"] .eye-module::after,
+  html[data-bridge-direction="chorus"] .panel-slot,
+  html[data-bridge-direction="chorus"] .panel-screw,
+  html[data-bridge-direction="chorus"] .optic-retainer {
+    display: none;
+  }
+
+  html[data-bridge-direction="chorus"] .optic-stage {
+    inset: 0;
+    border-radius: 0;
+    pointer-events: none;
+  }
+
+  /* Hold anywhere: the whole void is the push-to-talk surface. */
+  html[data-bridge-direction="chorus"] .eye-module .eye,
+  html[data-bridge-direction="chorus"] .eye-module.webgl-ready .eye {
+    position: absolute;
+    inset: 0;
+    left: 0;
+    top: 0;
+    width: auto;
+    height: auto;
+    transform: none;
+    z-index: 5;
+    border-radius: 0;
+    pointer-events: auto;
+  }
+
+  /* WebGL fallback: without the swarm, center the shared CSS eye. */
+  html[data-bridge-direction="chorus"] .eye-module:not(.webgl-ready) .eye {
+    inset: auto;
+    left: 50%;
+    top: 50%;
+    width: min(40vh, 380px);
+    height: min(40vh, 380px);
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+  }
+
+  /* --- whisper voice chrome -------------------------------------------- */
+
+  html[data-bridge-direction="chorus"] .waveform-wrap {
+    position: fixed;
+    inset: 0;
+    z-index: 25;
+    display: block;
+    width: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    pointer-events: none;
+  }
+
+  html[data-bridge-direction="chorus"] .optic-status-row {
+    position: absolute;
+    left: 50%;
+    bottom: 96px;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 16px;
+  }
+
+  html[data-bridge-direction="chorus"] .voice-instruction {
+    position: absolute;
+    left: 50%;
+    bottom: 82px;
+    transform: translateX(-50%);
+    display: block;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    color: #383633;
+    font-family: "Azeret Mono", monospace;
+    font-size: 8px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  html[data-bridge-direction="chorus"] .waveform-canvas {
+    display: none;
+  }
+
+  html[data-bridge-direction="chorus"] .caption {
+    position: fixed;
+    left: 50%;
+    bottom: 140px;
+    top: auto;
+    right: auto;
+    transform: translateX(-50%);
+    max-width: 640px;
+    width: auto;
+    z-index: 30;
+    color: #b5b0a9;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    line-height: 1.6;
+    text-align: center;
+  }
+
+  html[data-bridge-direction="chorus"] .ticker {
+    position: fixed;
+    left: 50%;
+    bottom: 122px;
+    top: auto;
+    transform: translateX(-50%);
+    max-width: 560px;
+    z-index: 30;
+    color: #45423e;
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    text-align: center;
+    text-transform: uppercase;
+  }
+
+  /* --- the whisper log --------------------------------------------------- */
+
+  html[data-bridge-direction="chorus"] .mission-log {
+    position: fixed;
+    left: 28px;
+    top: 76px;
+    bottom: 130px;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    width: min(24vw, 340px);
+    max-width: none;
+    height: auto;
+    max-height: none;
+    min-height: 0;
+    margin: 0;
+    overflow: hidden;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    pointer-events: none;
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    min-height: 0;
+    margin: 0 0 8px;
+    padding: 0;
+    border-bottom: 0;
+    opacity: 0.25;
+    transition: opacity 240ms ease;
+    pointer-events: auto;
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log:hover .mission-log-header {
+    opacity: 1;
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log-title {
+    display: none;
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log-actions {
+    display: flex;
+    gap: 5px;
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log-action {
+    min-height: 24px;
+    padding: 0 8px;
+    border-color: rgba(196, 189, 180, 0.12);
+    border-radius: 5px;
+    background: transparent;
+    color: #55524d;
+    font-family: "Azeret Mono", monospace;
+    font-size: 8px;
+    white-space: nowrap;
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log-action:hover {
+    border-color: var(--hairline-hot);
+    color: var(--signal);
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log-entries {
+    margin: 0;
+    padding: 0;
+    border-left: 0;
+    overflow-y: auto;
+    pointer-events: auto;
+    mask-image: linear-gradient(to bottom, transparent, black 18%);
+  }
+
+  /* Each entry surfaces because it happened, then decays toward silence. */
+  html[data-bridge-direction="chorus"] .mlog-entry {
+    position: relative;
+    display: block;
+    padding: 6px 0;
+    border-bottom: 0;
+    color: #7a766f;
+    font-size: 10px;
+    line-height: 1.55;
+    animation: chorus-whisper 26s ease-out forwards;
+  }
+
+  html[data-bridge-direction="chorus"] .mission-log:hover .mlog-entry {
+    animation: none;
+    opacity: 0.8;
+  }
+
+  html[data-bridge-direction="chorus"] .mlog-entry .mlog-ts {
+    display: inline;
+    margin-right: 8px;
+    color: #45423e;
+    font-size: 8px;
+  }
+
+  html[data-bridge-direction="chorus"] .mlog-entry .mlog-role,
+  html[data-bridge-direction="chorus"] .mlog-entry .mlog-tool-icon {
+    color: var(--signal);
+  }
+
+  /* --- summoned cards ---------------------------------------------------- */
+
+  html[data-bridge-direction="chorus"] .missions-panel,
+  html[data-bridge-direction="chorus"] .bridge-left[data-active-surface="chess"] .chess-panel.on,
+  html[data-bridge-direction="chorus"] .bridge-left[data-active-surface="viewscreen"] .viewscreen-panel.on {
+    position: fixed;
+    right: 28px;
+    top: 76px;
+    z-index: 20;
+    display: block;
+    width: 320px;
+    max-height: 52vh;
+    overflow-y: auto;
+    border: 1px solid rgba(196, 189, 180, 0.12);
+    border-radius: 8px;
+    background: rgba(2, 2, 2, 0.9);
+    padding: 12px 14px;
+  }
+
+  /* The missions card exists only while missions do. */
+  html[data-bridge-direction="chorus"] .missions-panel:not(:has(.mission-card)) {
+    display: none;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-left[data-active-surface] .missions-panel {
+    display: none;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-left:not([data-active-surface="chess"]) .chess-panel.on,
+  html[data-bridge-direction="chorus"] .bridge-left:not([data-active-surface="viewscreen"]) .viewscreen-panel.on {
+    display: none;
+  }
+
+  html[data-bridge-direction="chorus"] .missions-title {
+    border-bottom-color: rgba(196, 189, 180, 0.12);
+    color: #5b5853;
+    font-family: "Azeret Mono", monospace;
+    letter-spacing: 0.18em;
+  }
+
+  html[data-bridge-direction="chorus"] .permbar,
+  html[data-bridge-direction="chorus"] .propbar {
+    left: auto;
+    right: 28px;
+    bottom: 120px;
+    transform: none;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    width: 300px;
+    max-width: none;
+    border: 1px solid var(--hairline-hot);
+    border-radius: 8px;
+    background: rgba(6, 1, 1, 0.94);
+    padding: 16px;
+    font-size: 11px;
+  }
+
+  html[data-bridge-direction="chorus"] .propbar {
+    bottom: auto;
+    top: 76px;
+    right: 372px;
+    border-color: rgba(255, 176, 66, 0.4);
+  }
+
+  html[data-bridge-direction="chorus"] .permbar::before {
+    content: "Permission required";
+    color: var(--signal);
+    font-family: "Azeret Mono", monospace;
+    font-size: 9px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="chorus"] .propbar::before {
+    content: "Proposed mission";
+    color: #d9a13e;
+    font-family: "Azeret Mono", monospace;
+    font-size: 9px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="chorus"] .permbar .allow,
+  html[data-bridge-direction="chorus"] .permbar .deny,
+  html[data-bridge-direction="chorus"] .propbar .allow,
+  html[data-bridge-direction="chorus"] .propbar .deny {
+    width: 100%;
+    padding: 10px 0;
+    border-radius: 6px;
+    font-family: "Azeret Mono", monospace;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+
+  /* --- the docked command line ------------------------------------------- */
+
+  /* Hidden but present: the scene reads its values. */
+  html[data-bridge-direction="chorus"] .telemetry {
+    position: fixed;
+    display: block;
+    width: 1px;
+    height: 1px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    background: transparent;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input {
+    grid-area: 3 / 1 / 4 / 3;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    padding: 12px 28px 16px;
+    border-top: 1px solid rgba(196, 189, 180, 0.09);
+    background: transparent;
+    z-index: 15;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input form {
+    width: 100%;
+    min-width: 0;
+    gap: 0;
+    border: 1px solid rgba(196, 189, 180, 0.12);
+    border-radius: 999px;
+    background: rgba(2, 2, 2, 0.7);
+    overflow: hidden;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input input {
+    min-width: 0;
+    height: 46px;
+    padding: 0 24px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: #b5b0a9;
+    font-family: "Azeret Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input input::placeholder {
+    color: #4a4743;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input input:focus {
+    border-color: transparent;
+    box-shadow: inset 2px 0 0 var(--signal);
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input button {
+    width: 60px;
+    border: 0;
+    border-left: 1px solid rgba(196, 189, 180, 0.12);
+    border-radius: 0;
+    background: transparent;
+    color: var(--signal);
+    font-size: 0;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input button::before {
+    content: "";
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+    box-shadow: inset 0 0 0 4px var(--void);
+    background: currentColor;
+  }
+
+  html[data-bridge-direction="chorus"] .bridge-input button:hover {
+    border-left-color: var(--hairline-hot);
+    color: #ff655a;
+  }
+
+  html[data-bridge-direction="chorus"] .monitor-tab,
+  html[data-bridge-direction="chorus"] .hint,
+  html[data-bridge-direction="chorus"] .log,
+  html[data-bridge-direction="chorus"] .cmdline {
+    display: none !important;
+  }
+}

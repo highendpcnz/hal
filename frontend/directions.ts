@@ -1,4 +1,4 @@
-export type BridgeDirectionId = "aperture" | "orrery" | "vault";
+export type BridgeDirectionId = "aperture" | "orrery" | "vault" | "chorus";
 
 export interface BridgeDirectionManifest {
   readonly id: BridgeDirectionId;
@@ -24,6 +24,12 @@ export const BRIDGE_DIRECTIONS: readonly BridgeDirectionManifest[] = [
     id: "vault",
     label: "Signal Vault",
     shortLabel: "03",
+    ready: true
+  },
+  {
+    id: "chorus",
+    label: "Ember Chorus",
+    shortLabel: "04",
     ready: true
   }
 ] as const;
