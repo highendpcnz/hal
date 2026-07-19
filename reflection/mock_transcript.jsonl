@@ -1,0 +1,9 @@
+{"type": "USER_INPUT", "content": "Can you format my Python file using black?"}
+{"type": "PLANNER_RESPONSE", "content": "I will format your Python file."}
+{"type": "TOOL_CALL", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "black missing_file.py"}}]}
+{"type": "TOOL_RESPONSE", "content": "Error: missing_file.py not found"}
+{"type": "PLANNER_RESPONSE", "content": "It seems the file is missing."}
+{"type": "USER_INPUT", "content": "The file is called app.py, not missing_file.py"}
+{"type": "PLANNER_RESPONSE", "content": "I apologize, I will format app.py instead."}
+{"type": "TOOL_CALL", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "black app.py"}}]}
+{"type": "TOOL_RESPONSE", "content": "Success"}

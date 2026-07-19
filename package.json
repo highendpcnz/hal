@@ -1,0 +1,21 @@
+{
+  "name": "hal-bridge-3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build"
+  },
+  "dependencies": {
+    "@fontsource/azeret-mono": "5.2.11",
+    "@fontsource/ibm-plex-mono": "5.2.7",
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "@types/three": "0.185.1",
+    "typescript": "7.0.2",
+    "vite": "8.1.5"
+  }
+}

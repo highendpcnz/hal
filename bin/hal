@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Start the HAL server if it isn't running, wait for it to become healthy,
+# and open the eye in a browser. Works on macOS and Linux.
+#
+# Install:  ln -s "$(pwd)/bin/hal" ~/.local/bin/hal
+# Usage:    hal [--no-open]
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  # Resolve a symlinked install back to the repo (BSD readlink lacks -f).
+  TARGET="$(readlink "$SELF" 2>/dev/null || true)"
+  [ -n "$TARGET" ] && SELF="$TARGET"
+fi
+APP_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+HOST="${HAL_HOST:-127.0.0.1}"
+PORT="${HAL_PORT:-8000}"
+URL="http://$HOST:$PORT"
+OPEN=1
+[ "${1:-}" = "--no-open" ] && OPEN=0
+
+healthy() { curl -sf -m 2 "$URL/api/health" >/dev/null 2>&1; }
+
+if ! healthy; then
+  mkdir -p "$APP_DIR/data"
+  echo "Starting HAL at $URL (log: $APP_DIR/data/server.log)"
+  nohup "$APP_DIR/run.sh" >> "$APP_DIR/data/server.log" 2>&1 &
+fi
+
+# First boot loads two ML models and warms the agent — allow up to 2 minutes.
+for _ in $(seq 1 120); do
+  healthy && break
+  sleep 1
+done
+if ! healthy; then
+  echo "HAL did not become healthy at $URL — see $APP_DIR/data/server.log" >&2
+  exit 1
+fi
+
+echo "HAL is online at $URL"
+if [ "$OPEN" = 1 ]; then
+  if command -v open >/dev/null 2>&1; then open "$URL"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL"
+  else echo "(no browser opener found — visit $URL)"
+  fi
+fi

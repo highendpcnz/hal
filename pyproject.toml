@@ -1,0 +1,14 @@
+[project]
+name = "hal-frontend"
+version = "0.1.0"
+description = "HAL 9000 voice frontend for Hermes Agent"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Defaults (pyflakes + a pycodestyle core) — enough to catch real mistakes
+# without fighting the codebase's existing style.
+select = ["E4", "E7", "E9", "F"]

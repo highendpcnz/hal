@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install "fastapi>=0.115" "python-multipart>=0.0.9" "pydantic>=2" \
+                      "piper-tts>=1.2.0" "faster-whisper>=1.0" ruff
+      - name: Lint
+        run: ruff check .
+      - name: Tests (HAL_SKIP_MODELS=1 — no model downloads)
+        run: python tests/run.py

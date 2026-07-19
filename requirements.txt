@@ -1,0 +1,16 @@
+# This app is designed to run inside the Hermes Agent venv
+# (~/hermes-agent/.venv), which already ships every dependency below.
+# Install these only if you want a standalone environment instead.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.9
+pydantic>=2
+piper-tts>=1.2.0
+faster-whisper>=1.0
+# The default ACP bridge (HAL_BRIDGE=acp) also needs the official ACP
+# library — in the Hermes venv it comes from the hermes-agent[acp] extra:
+# agent-client-protocol
+# The reflection loop experiment (reflection/reflection_loop.py) needs:
+# openai>=1.40
+# The Crew Manifest (speaker_id.py voiceprints) needs — see README:
+# sherpa-onnx>=1.13

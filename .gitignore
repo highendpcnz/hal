@@ -1,0 +1,14 @@
+.venv/
+node_modules/
+.vite/
+npm-debug.log*
+.env
+__pycache__/
+*.pyc
+models/*.onnx
+models/*.json
+*.wav
+.DS_Store
+data/
+.claude/*
+!.claude/skills/
