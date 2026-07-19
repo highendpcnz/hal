@@ -1,0 +1,6 @@
+/* Direction 03 — Signal Vault.
+   Placeholder: the desktop/tablet shell for this direction lands with
+   Phase 2 of docs/plans/directions-2-3.md, scoped under
+   html[data-bridge-direction="vault"]. Unreachable until directions.ts
+   marks the direction ready; the shared mobile styles live inline in
+   static/index.html and are direction-independent. */

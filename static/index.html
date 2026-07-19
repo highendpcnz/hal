@@ -1133,7 +1133,28 @@
     }
   }
 </style>
-<link rel="stylesheet" href="/static/bridge-option1.css" />
+<link rel="stylesheet" href="/static/bridge-option1.css" data-direction-style="aperture" />
+<link rel="stylesheet" href="/static/bridge-option2.css" data-direction-style="orrery" disabled />
+<link rel="stylesheet" href="/static/bridge-option3.css" data-direction-style="vault" disabled />
+<script>
+  // Pre-paint direction pick: enable the selected direction's stylesheet
+  // before the body parses so switching never flashes the wrong shell.
+  // READY_DIRECTIONS and the storage key mirror frontend/directions.ts and
+  // frontend/hal-optic.ts (asserted by tests/run.py) — keep them in sync.
+  (function () {
+    var READY_DIRECTIONS = ["aperture"];
+    var direction = READY_DIRECTIONS[0];
+    try {
+      var stored = localStorage.getItem("hal_direction");
+      if (stored && READY_DIRECTIONS.indexOf(stored) !== -1) direction = stored;
+    } catch (e) { /* storage unavailable — default direction */ }
+    document.documentElement.dataset.bridgeDirection = direction;
+    var links = document.querySelectorAll("link[data-direction-style]");
+    for (var i = 0; i < links.length; i++) {
+      links[i].disabled = links[i].getAttribute("data-direction-style") !== direction;
+    }
+  })();
+</script>
 </head>
 <body>
   <!-- Bridge left column wrapper (only used by desktop grid) -->
@@ -1277,8 +1298,8 @@
     <div class="direction-selector" aria-label="Visual direction selector">
       <span class="direction-selector-label">Direction</span>
       <button class="direction-option" type="button" data-direction-id="aperture" aria-label="Select Aperture Sentinel">01</button>
-      <button class="direction-option" type="button" data-direction-id="orrery" aria-label="Select Obsidian Orrery">02</button>
-      <button class="direction-option" type="button" data-direction-id="vault" aria-label="Select Monolith Vault">03</button>
+      <button class="direction-option" type="button" data-direction-id="orrery" aria-label="Select Cognitive Orrery">02</button>
+      <button class="direction-option" type="button" data-direction-id="vault" aria-label="Select Signal Vault">03</button>
     </div>
   </nav>
 

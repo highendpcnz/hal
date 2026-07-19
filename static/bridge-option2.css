@@ -1,0 +1,6 @@
+/* Direction 02 — Cognitive Orrery.
+   Placeholder: the desktop/tablet shell for this direction lands with
+   Phase 1 of docs/plans/directions-2-3.md, scoped under
+   html[data-bridge-direction="orrery"]. Unreachable until directions.ts
+   marks the direction ready; the shared mobile styles live inline in
+   static/index.html and are direction-independent. */

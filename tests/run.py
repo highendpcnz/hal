@@ -10,6 +10,7 @@ suite finishes in seconds and touches no audio, network, or inference.
 """
 import asyncio
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -1160,6 +1161,56 @@ check(
 check(
     "tts_done defers to turn_done during commentary",
     "if (commentaryActive) return;" in _frontend_src,
+)
+
+# --- direction runtime contract ---------------------------------------------
+# The visual-direction machinery spans three files that never import each
+# other at runtime: frontend/directions.ts (the manifest registry), the inline
+# pre-paint script in static/index.html (stylesheet pick), and
+# frontend/hal-optic.ts (selector + scene boot). These string-level checks pin
+# the contract they share so one file can't drift alone.
+
+_frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+_directions_src = (_frontend_dir / "directions.ts").read_text()
+_entry_src = (_frontend_dir / "hal-optic.ts").read_text()
+
+_manifests = re.findall(
+    r'id:\s*"([a-z]+)".*?ready:\s*(true|false)', _directions_src, flags=re.S
+)
+check("directions.ts declares three manifests", len(_manifests) == 3, repr(_manifests))
+_ready_ids = [mid for mid, ready in _manifests if ready == "true"]
+
+_inline_ready = re.search(r"READY_DIRECTIONS\s*=\s*\[([^\]]*)\]", _frontend_src)
+_inline_ids = re.findall(r'"([a-z]+)"', _inline_ready.group(1)) if _inline_ready else []
+check(
+    "inline pre-paint ready-list matches directions.ts",
+    _inline_ids == _ready_ids,
+    f"inline {_inline_ids} vs manifests {_ready_ids}",
+)
+
+for _mid, _ready in _manifests:
+    check(f"direction stylesheet link for {_mid}", f'data-direction-style="{_mid}"' in _frontend_src)
+    check(f"direction selector button for {_mid}", f'data-direction-id="{_mid}"' in _frontend_src)
+    check(f"scene module wired for {_mid}", f'{_mid}: () => import("./optic-' in _entry_src)
+    if _ready == "true":
+        check(
+            f"stylesheet for ready direction {_mid} parses enabled",
+            f'data-direction-style="{_mid}" />' in _frontend_src,
+        )
+    else:
+        check(
+            f"stylesheet for pending direction {_mid} parses disabled",
+            f'data-direction-style="{_mid}" disabled />' in _frontend_src,
+        )
+
+check(
+    "storage key shared by inline script and entry",
+    'localStorage.getItem("hal_direction")' in _frontend_src
+    and 'DIRECTION_STORAGE_KEY = "hal_direction"' in _entry_src,
+)
+check(
+    "not-ready selections are dropped, not persisted",
+    "localStorage.removeItem(DIRECTION_STORAGE_KEY)" in _entry_src,
 )
 
 # ----------------------------------------------------------------------------
