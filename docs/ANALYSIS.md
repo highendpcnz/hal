@@ -1,8 +1,9 @@
 # Repository Analysis
 
-*Written July 2026, against the state of `main` at `fcb7b99` plus the fixes
-landed alongside this document. A point-in-time review — file names are
-stable, line numbers are not.*
+*Written July 2026, against the state of `main` at `37250a4` — a follow-up
+pass over the one recorded at `0b5fc03` (~2,500 lines and eight features
+earlier). A point-in-time review — file names are stable, line numbers are
+not.*
 
 ## Overview
 
@@ -14,9 +15,11 @@ behind a single-file web UI centered on a CSS-rendered HAL eye.
 
 It began in April 2026 as a cloud-backed MVP (Groq Whisper + Claude API,
 forked from the `piclez/hal` Hugging Face Space), was rewired in July 2026 to
-run with zero cloud keys, then expanded with the "Discovery One" upgrade
-(`docs/plans/discovery_one_upgrade.md`): a desktop Bridge UI, full-duplex
-voice over WebSocket, and background missions.
+run with zero cloud keys, then expanded through the "Discovery One" upgrade
+(background missions, a desktop Bridge, full-duplex voice) and a second wave
+that gave HAL initiative and a body of "shipboard systems": chess, a Care
+Ledger, local voice enrollment (the Crew Manifest), a viewscreen for visual
+output, self-proposed missions, and vitals-triggered alerts.
 
 ## Architecture
 
@@ -26,167 +29,167 @@ A voice turn flows:
 browser (eye press / space bar / duplex VAD / typed input)
   └─ POST /api/talk | POST /api/say | WS /ws/conversation
        ├─ faster-whisper → transcript
-       ├─ hermes_bridge.ask_hermes()
-       │    · offline preflight (cached TCP probes)
-       │    · per-session lock — Hermes sessions are single-writer
-       │    · ACP mode: one persistent hermes-acp process, session/prompt
-       │      per turn; subprocess mode: one `hermes chat -Q` per turn
-       │    · tool-permission requests denied unless HAL_YOLO=1
+       ├─ run_turn_text() — command grammar first (permission/proposal
+       │    replies, enrollment, ledger, missions, chess), else:
+       │    hermes_bridge.ask_hermes()
+       │       · offline preflight (cached TCP probes)
+       │       · per-session lock — Hermes sessions are single-writer
+       │       · ACP mode: one persistent hermes-acp process, session/prompt
+       │         per turn; subprocess mode: one `hermes chat -Q` per turn
+       │       · tool-permission requests: deny / ask-and-wait / auto-allow
+       │         (yolo, or a trigger's "permissions": "allow")
        ├─ speakable() — strip markdown/tables/emoji for TTS
        └─ Piper → WAV, or sentence-by-sentence PCM streaming
 ```
 
 | Component | Role |
 |---|---|
-| `main.py` | FastAPI app: HTTP + SSE + WebSocket endpoints, STT/TTS pipeline, per-cookie history in `data/sessions/` |
-| `hermes_bridge.py` | Brain bridge (ACP default, subprocess fallback), cookie→Hermes session map, SSE event fan-out with mission aliasing |
-| `mission_control.py` | Background missions: own Hermes session each, persisted in `data/missions/`, completion spoken over the live WebSocket |
-| `static/index.html` | Entire frontend — vanilla JS, no build step; three responsive layouts (mobile eye, tablet, desktop Bridge) |
-| `tests/run.py` | Zero-dependency suite; `HAL_SKIP_MODELS=1` keeps it model-free and fast |
+| `main.py` | FastAPI app: HTTP + SSE + WebSocket endpoints, STT/TTS pipeline, per-cookie history, command-grammar dispatch (`run_turn_text`), boot ritual, latency telemetry |
+| `hermes_bridge.py` | Brain bridge (ACP default, subprocess fallback), cookie→Hermes session map, SSE event fan-out with mission aliasing, commentary sinks, per-mission tool-auto-allow |
+| `mission_control.py` | Background missions (own Hermes session each, steerable after completion), the trigger scheduler (interval/watch/daily/vitals), persisted trigger state |
+| `ledger.py` | The Care Ledger — promises/deadlines/open loops in `data/ledger.json`, written by voice commands, the nightly sweep mission, and read by the morning briefing |
+| `speaker_id.py` | The Crew Manifest — local voiceprint enrollment/identification (sherpa-onnx + CAM++), commander election for spoken permission approval |
+| `chess_control.py` / `chess_engine.py` | A clean-room chess engine (no GPL deps) plus spoken/typed move parsing, narration, and per-session persistence |
+| `static/index.html` | Entire frontend — vanilla JS, no build step; three responsive layouts (mobile eye, tablet, desktop Bridge) plus mission/chess/viewscreen/ledger panels |
+| `tests/run.py` | Zero-dependency suite (720+ lines); `HAL_SKIP_MODELS=1` keeps it model-free and fast |
 | `reflection/` | Documented experiment: LLM drafts skills from agent transcripts, promotion gated behind human confirmation |
-| `AGENTS.md` | The HAL persona, auto-injected because the agent runs with this directory as cwd |
-| `Dockerfile`, `hal_prompt.py`, `download_model.py`, `.env.example` | Vestigial (pre-rewiring); the Dockerfile does not build a working image |
+| `AGENTS.md` | The HAL persona — proposing missions, the viewscreen convention, voice-identity tags — auto-injected because the agent runs with this directory as cwd |
+| `Dockerfile`, `hal_prompt.py`, `download_model.py`, `.env.example` | Vestigial (pre-rewiring); the Dockerfile does not build a working image (documented in-file and in the README) |
 
 Design decisions worth knowing before touching the code:
 
 - **Sessions are three-layered**: browser cookie (`hal_session`) → Hermes/ACP
   session id (persisted map in `data/hermes_sessions.json`) → Hermes' own
-  state in `~/.hermes/state.db`. ACP `session/load` makes conversations
-  survive restarts of both the bridge and the agent.
-- **Concurrency is deliberate**: per-session turn locks (Hermes sessions are
-  single-writer), a global TTS lock (espeak-ng keeps global state), and
-  synthesis in a worker thread feeding a queue so the event loop never
-  blocks and a slow consumer never holds the TTS lock.
-- **Deny-by-default permissions**: the ACP `session/request_permission`
-  callback rejects unless `HAL_YOLO=1`; denials surface in the UI (eye
-  flicker + mission log entry).
+  state in `~/.hermes/state.db`. Missions get a fourth, disposable layer: a
+  synthetic UUID session that survives `STEERABLE_TTL` after completion for
+  follow-up questions, then is reaped.
+- **Concurrency is deliberate and keyed**: `hermes_bridge.KeyedLocks`
+  refcounts holders *and* waiters (fixing an earlier eviction race) and is
+  reused for history, chess, and WebSocket-speech locks — one correct
+  primitive, several call sites.
+- **Ownership is identity-checked, not just presence-checked.** Two
+  independent bugs this cycle were the same shape: a stale turn's cleanup
+  evicting state a newer turn had already replaced (`active_websockets`,
+  fixed earlier; `_commentary_sinks`, fixed in `cc14cbf`). Both fixes pass
+  the caller's own object and only clear if it still owns the slot — a
+  pattern worth following for any future single-slot-per-session state.
+- **Deny-by-default permissions, with two escape hatches, both scoped.**
+  `HAL_PERMISSION_MODE=ask` routes a spoken/on-screen yes-or-no through a
+  future; the commander-voice rule (Crew Manifest) restricts *spoken*
+  approval once enrollment exists, while typed/on-screen approval stays
+  open (a keyboard already implies physical presence). Trigger-level
+  `"permissions": "allow"` auto-allows tool calls, but only for that
+  mission's own synthetic session key (`_tool_allowed_cookies`) — verified
+  by tracing `allow_tools_for(mission.session_id)` through to the ACP
+  `request_permission` callback's `cookie_id` lookup; it cannot leak
+  auto-allow to a browser session or another mission.
 - **Failure paths speak in character** — timeout, offline, and error cases
-  all produce spoken HAL lines instead of silence.
+  all produce spoken HAL lines instead of silence; mission cancellation
+  during an in-flight turn is a first-class outcome, not an exception path
+  (`Mission.status` flips to `"cancelled"` and both the success and
+  exception branches of `run_mission` check it before overwriting).
+- **Every new persisted file follows the same safe-write shape**: load
+  defensively (`except (OSError, json.JSONDecodeError): return default`),
+  mutate in memory, write to a `.tmp` sibling, `rename`/`replace` onto the
+  real path. `ledger.json`, `speakers.json`, `trigger_state.json`, and each
+  `data/chess/<session>.json` all do this — no partial-write corruption on a
+  crash mid-save.
 
 ## Strengths
 
 - Comments explain *constraints*, not mechanics (why the TTS lock exists,
-  why transcript headers are capped, why mission task references must be
-  kept alive).
-- Docs match the code. The README's env table, endpoint list, and protocol
-  description are accurate — rare at any repo size.
-- The test suite is pragmatic: zero dependencies, seconds to run, and it
-  even statically asserts two frontend JS invariants (brace-matching
-  function bodies out of `index.html`) to pin a specific UI-wedge regression.
-- The reflection loop treats LLM output as untrusted input (slug-validated
-  skill names because the name becomes a directory) and is honest that its
-  "sandbox review" is advisory, with a human gate as the real control.
+  why a mission must be created before its proposal is forgotten, why
+  `clear_commentary_sink` takes the caller's own sink object).
+- Docs match the code. The README's env table, endpoint list, and Missions/
+  Ledger/Crew Manifest/Viewscreen/Chess sections are accurate against the
+  current `main.py`, `mission_control.py`, `ledger.py`, `speaker_id.py`, and
+  `chess_control.py` — rare at any repo size, rarer after eight features
+  landed in three days.
+- The test suite grew with the features rather than lagging them: chess is
+  pinned by perft counts (startpos, Kiwipete for castling, position 3 for en
+  passant) plus mate/stalemate/threefold/fifty-move and voice-parsing cases;
+  the Crew Manifest tests cover enrollment, threshold rejection, commander
+  succession, and that only the commander's *voice* (not typed input) can
+  approve; the mission-cap race for proposal approval added in the latest
+  commit is regression-tested, not just fixed.
+- The two lock-eviction bugs fixed this cycle were self-found and
+  self-fixed in small, well-explained commits with accompanying tests — a
+  good sign for a codebase's ongoing health, distinct from whether it has
+  bugs at all.
+- `ruff check .` and the full `tests/run.py` suite both pass clean on
+  `HEAD` as of this review (69 test groups, zero failures).
+- The reflection loop still treats LLM output as untrusted input
+  (slug-validated skill names because the name becomes a directory) and is
+  honest that its "sandbox review" is advisory, with a human gate as the
+  real control.
 
-## Review findings
+## This pass: what was checked, and what I found
 
-All of these were addressed in the same change series that added this
-document:
+Scope: everything added since the last analysis (`0b5fc03`) —
+mission proposals/"Initiative" (`c5284d8`, `37250a4`), the Care Ledger
+(`71c7687`), the Crew Manifest (`53c9ffc`), the viewscreen (`e23bf31`),
+chess (`9e5ec04`, `ad390d7`), speak-while-thinking commentary (`90832a4`,
+`cc14cbf`), steerable missions with cancel/dismiss (`456055d`), daily
+briefing/vitals triggers (`f38dde8`, `e90306e`), and the boot ritual /
+latency sparkline (`8eaf95e`, `eb8003c`) — plus a re-check of every item
+still open in the previous analysis.
 
-| # | Finding | Resolution |
-|---|---|---|
-| 1 | **Lock-eviction race** in `hermes_bridge.ask_hermes`: `lock.locked()` is `False` between `release()` and a waiter re-acquiring, so a lock with waiters could be evicted and a third turn would mint a fresh lock — two turns concurrently on a single-writer session | Replaced with `_KeyedLocks`, which refcounts holders *and* waiters and evicts only at zero; regression-tested in `tests/run.py` |
-| 2 | **Dockerfile silently broken**, not just vestigial: it never copied `hermes_bridge.py`/`mission_control.py`, so the image fails at import | Prominent "DOES NOT BUILD" header comment; README updated to say so |
-| 3 | **DNS-rebinding exposure**: loopback binding was the only boundary, but a hostile page whose hostname resolves to 127.0.0.1 could reach the API cookie-less (`POST /api/say` drives the agent; with `HAL_YOLO=1` that is shell access) | `TrustedHostMiddleware` with `HAL_ALLOWED_HOSTS` (default `localhost,127.0.0.1`); covers HTTP and WebSocket |
-| 4 | **TTS head-of-line blocking**: the HTTP `?stream=1` path iterated the sync Piper generator at the client's pace while holding the TTS lock, so one stalled reader delayed every other voice reply | `_stream_turn_response` now uses the async generator (worker thread + queue), holding the lock only at synthesis speed |
-| 5 | `MAX_HISTORY_TURNS = 40` actually counted messages (20 turns) | Renamed `MAX_HISTORY_MESSAGES` |
-| 6 | `run.sh` was zsh-only (`${0:a:h}`) | Now plain bash, works on macOS and Linux |
-| 7 | `requirements.txt` omitted the ACP library and the reflection loop's `openai` | Documented as commented optional lines (they normally come from the Hermes venv) |
+**No new correctness or security bugs found.** Specific things I chased
+that turned out fine:
 
-Cookie-auth paths were checked and are fine as-is: `SameSite=lax` covers
-CSRF for the POST endpoints, the WebSocket requires the session cookie, and
-session ids are regex-validated before becoming file paths (tested).
+- *Could the ledger's read-modify-write race the way session history once
+  did?* No — `Ledger.add/complete/forget` are fully synchronous (no
+  `await` between load and save), so within the single-threaded event loop
+  they can't interleave with each other the way an `await ask_hermes(...)`
+  held open the old history race. The module's own docstring already flags
+  the real, unavoidable multi-writer case (the nightly sweep mission edits
+  `ledger.json` with generic file tools, not through this class) as an
+  accepted design tradeoff — there's no lock that can cover a shell-level
+  file write from inside an agent's tool call anyway.
+- *Could a trigger's `"permissions": "allow"` leak beyond its own mission?*
+  No — traced end to end (see "Design decisions" above); the auto-allow set
+  is keyed on the mission's own disposable session id.
+- *Does `_resolve_proposal` still lose a proposal at the mission cap?* No —
+  fixed in the commit at `HEAD` (`37250a4`) and regression-tested.
+- Chess move parsing, session-id-as-filename validation
+  (`_SESSION_ID_RE`), and checkmate detection (`san()` appending `#`,
+  consumed by `chess_control._finish_if_over` via a string check rather
+  than recomputing) all check out against the perft/mate test cases.
 
-## Known minor issues — fixed in the follow-up series
+## Previously open items — now resolved
 
-All four were closed by the "serialize history, socket speech, and STT"
-change:
+- **Trigger state was in-memory** (a restart re-armed intervals and
+  re-baselined watchers). `e90306e`/`f38dde8` added
+  `data/trigger_state.json` with load-on-start, save-on-change, and a
+  catch-up fire for `"at"` triggers that were due while the server was
+  down — the daily-briefing trigger now behaves as the README describes.
 
-- **History read-modify-write race** — per-session history locks
-  (`KeyedLocks`) now guard every load-append-save, including the
-  mission-trigger path that skipped the inference lock entirely.
-- **WebSocket send interleaving** — per-session speech locks serialize
-  reply/announcement TTS on a socket, so PCM frames can't interleave.
-- **STT serialization** — a lock keeps concurrent whisper decodes (HTTP +
-  WS + interim transcripts) from doubling each other's latency.
-- **Mid-sentence truncation** — `speakable()` truncates at a sentence (or
-  word) boundary via `_truncate_speech`.
+## Still open (honest list)
 
-## Second pass: improvements and upgrades — implemented
-
-Everything below shipped in the same series as this revision. Status notes
-mark the deliberate scope choices.
-
-### The three highest-value gaps ✓
-
-1. **Mission results reach HAL's brain.** Completed/failed mission reports
-   queue as system notes injected into the owner's next Hermes prompt
-   (`MissionManager._notes` / `drain_notes`), so "what did you find?" is
-   answerable. Mission prompts also carry the recent conversation, and the
-   completion announcement speaks a sentence-truncated result summary.
-2. **Interactive permission approvals.** `HAL_PERMISSION_MODE=ask` sits
-   between `deny` and `yolo`: the ACP `request_permission` callback
-   publishes a `permission_request` event, HAL asks aloud over the live
-   socket, and the turn waits on a future resolved by the UI's Allow/Deny
-   bar (`POST /api/permission/{id}`) or a spoken/typed yes-or-no
-   (intercepted in `run_turn_text`), with deny-on-timeout
-   (`HAL_PERMISSION_TIMEOUT`, 30s). WebSocket turns now run as background
-   tasks so a spoken answer can arrive while the asking turn is blocked —
-   per-session inference/history/speech locks provide the real
-   serialization. Ownership checks stop one browser session from approving
-   another's tools.
-3. **Missions API + UI panel.** `GET /api/missions` plus a Missions panel
-   on the desktop Bridge: live cards with status dot, elapsed time,
-   per-mission tool counts (tool events are tagged `mission_session` when
-   published through an alias), and click-to-expand results.
-
-### Discovery One leftovers ✓ (with scope notes)
-
-- **Wake word** — implemented as server-side gating on the existing
-  duplex path (Duplex: OFF → ON → WAKE): local VAD segments speech, the
-  transcript must match "HAL, …"/"Hey HAL …" or the utterance is silently
-  dropped; a bare "HAL." earns a spoken "Yes, Dave?". *Scope note:* the
-  plan's client-side WASM keyword spotter was deliberately skipped — the
-  server is local, so audio never leaves the machine either way, and
-  transcript-level gating needs no new dependency.
-- **Interim transcripts** — while a duplex utterance records, the buffered
-  audio is re-transcribed every ~3s and captioned live. *Scope note:* true
-  incremental streaming STT isn't something faster-whisper offers; this is
-  caption polish at ~zero risk, flagged honestly as such (`HAL_INTERIM_STT`).
-- **HAL-initiated triggers** — `data/triggers.json` supports interval
-  (`every_minutes`) and filesystem-watch (`watch` glob) triggers; a
-  scheduler loop opens missions, which report over the duplex channel to
-  every connected session. The file is re-read each scan, so edits apply
-  live.
-- **Mission guardrails** — `HAL_MAX_ACTIVE_MISSIONS` (default 3) caps
-  concurrent missions per session; HAL declines in-register at the cap.
-- **Multi-step missions** — *deliberately not* built as the plan's
-  `MissionStep` chain: Hermes is already agentic within a single prompt
-  (multi-step tool use included), so step-chaining would duplicate the
-  agent's own planning. Progress visibility comes from live tool telemetry
-  on the mission cards instead.
-
-### Smaller improvements ✓
-
-- Bridge mission-log DOM capped at 500 entries; telemetry/mission polling
-  pauses while the tab is hidden or the panels aren't rendered.
-- Terminal tool/permission/mission events journal per session
-  (`data/sessions/*.events.jsonl`, bounded), served via `/api/history`, and
-  interleaved into the Bridge log on reload.
-- `bin/hal` launcher lives in the repo (symlink to `~/.local/bin/hal`).
-- CI: GitHub Actions runs `ruff check .` + `tests/run.py` on every push;
-  `pyproject.toml` pins the ruff config.
-- Reflection loop: failed missions journal to `data/missions/failed.jsonl`,
-  ready for `reflection_loop.py --transcript`. Retargeting the loop's
-  transcript defaults to Hermes' own store remains open — it needs
-  knowledge of Hermes' transcript format that this repo doesn't have.
-
-### Still open (honest list)
-
-- Voice yes/no for permissions arrives over whichever transport is free;
-  in duplex the VAD only reopens the mic once HAL finishes asking — if you
-  answer over him, use barge-in or the buttons.
-- Trigger state (`next_run`, watch baselines) is in-memory: a restart
-  re-arms intervals and re-baselines watchers rather than firing missed
-  runs.
-- The interim-transcript pass re-transcribes the whole buffered utterance
-  each time — fine for spoken turns, quadratic for minute-long dictation.
+- **Interim-transcript re-transcription is still quadratic.** Each ~3s
+  caption tick during a duplex utterance re-runs whisper over the *entire*
+  buffered audio (`b"".join(audio_chunks)`), not just the new tail — fine
+  for a normal spoken turn, wasteful for long dictation. Flagged as
+  acceptable scope in the previous analysis; still true, still acceptable
+  at current usage, worth a queue if duplex dictation of paragraphs becomes
+  a real use case.
+- **Voice yes/no for permissions and proposals arrives over whichever
+  transport is free**; in duplex mode the mic only reopens once HAL
+  finishes asking, so answering over him still needs barge-in or the
+  on-screen buttons.
+- **`vitals` battery checks are macOS-only** (`pmset -g batt`); on Linux or
+  Windows `battery_below` silently never fires (`_battery_percent` returns
+  `None` and the breach check short-circuits). This matches "None on
+  desktops or parse failure" in the code comment, but it's worth knowing
+  before writing a trigger that depends on it cross-platform — `disk_free_gb_below`
+  is platform-independent (`shutil.disk_usage`) and unaffected.
+- **Reflection loop retargeting is still open.** Failed missions journal to
+  `data/missions/failed.jsonl`, ready for `reflection_loop.py --transcript`,
+  but pointing the loop's default transcript source at Hermes' own store
+  remains open — it needs knowledge of Hermes' transcript format that this
+  repo doesn't have.
+- **The Care Ledger is one shared file for the whole household**, not
+  per-session like chess or history — correct for its purpose (Dave has one
+  ledger regardless of which device he's talking from), but worth
+  remembering if a future feature assumes ledger state is scoped to a
+  browser session the way missions and chess games are.
