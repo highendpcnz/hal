@@ -50,6 +50,16 @@ VOICE_PATH = Path(
 )
 STT_MODEL_NAME = os.environ.get("HAL_STT_MODEL", "base.en")
 STT_BEAM_SIZE = int(os.environ.get("HAL_STT_BEAM", "5"))
+# "auto" picks CUDA when a GPU is present and falls back to CPU otherwise —
+# previously hardcoded to "cpu", which silently left GPU acceleration on the
+# table. compute_type "auto" likewise picks the fastest type the resolved
+# device supports (int8 on CPU, float16 on GPU) — matches the old explicit
+# int8 default on CPU-only machines, so this is a no-op for them.
+STT_DEVICE = os.environ.get("HAL_STT_DEVICE", "auto")
+STT_COMPUTE_TYPE = os.environ.get("HAL_STT_COMPUTE_TYPE", "auto")
+# 0 = let ctranslate2 pick (usually all physical cores); set explicitly on a
+# shared/throttled box to stop STT from starving everything else.
+STT_CPU_THREADS = int(os.environ.get("HAL_STT_CPU_THREADS", "0"))
 # Skip loading the STT/TTS models — for tests of the pure-python parts only;
 # /api/talk and /api/say will not work.
 SKIP_MODELS = os.environ.get("HAL_SKIP_MODELS", "") == "1"
@@ -124,8 +134,13 @@ else:
     print("Loading HAL voice...")
     VOICE = PiperVoice.load(str(VOICE_PATH))
     print("HAL voice loaded")
-    print(f"Loading STT model ({STT_MODEL_NAME})...")
-    STT = WhisperModel(STT_MODEL_NAME, device="cpu", compute_type="int8")
+    print(f"Loading STT model ({STT_MODEL_NAME}, device={STT_DEVICE}, compute={STT_COMPUTE_TYPE})...")
+    STT = WhisperModel(
+        STT_MODEL_NAME,
+        device=STT_DEVICE,
+        compute_type=STT_COMPUTE_TYPE,
+        cpu_threads=STT_CPU_THREADS,
+    )
     print("STT model loaded")
 
 SAMPLE_RATE = VOICE.config.sample_rate if VOICE is not None else 22050
@@ -309,14 +324,21 @@ def _log_session_event(session_id: str, payload: dict) -> None:
         print(f"[events] journal write failed: {exc}")
 
 
-def transcribe(audio_bytes: bytes) -> str:
+def _stt_device() -> str:
+    """The device faster-whisper actually resolved "auto" to (cuda/cpu) —
+    for /api/status and /api/systems, so a GPU that silently isn't being
+    used shows up without reading server logs."""
+    return STT.model.device if STT is not None else "n/a"
+
+
+def transcribe(audio_bytes: bytes, beam_size: int | None = None) -> str:
     with _STT_LOCK:
         segments, _info = STT.transcribe(
             io.BytesIO(audio_bytes),
             language="en",
             vad_filter=True,
             initial_prompt=STT_PROMPT,
-            beam_size=STT_BEAM_SIZE,
+            beam_size=beam_size if beam_size is not None else STT_BEAM_SIZE,
         )
         # segments is lazy — decoding happens here, so join inside the lock.
         return " ".join(seg.text.strip() for seg in segments).strip()
@@ -688,10 +710,15 @@ _PERM_DENY_RE = re.compile(
 _WAKE_RE = re.compile(r"^\s*(?:hey|ok|okay)?[,\s]*hal\b[,.!?:]*\s*(.*)$", re.I | re.S)
 
 # Interim transcripts while a duplex utterance records (HAL_INTERIM_STT=0
-# disables). Each pass re-transcribes the buffered audio, so keep the
-# interval generous — this is caption polish, not streaming STT.
+# disables). Each pass re-transcribes the whole buffered audio so far, so
+# keep the interval generous — this is caption polish, not streaming STT.
+# Greedy decoding (beam=1) here regardless of HAL_STT_BEAM: the interim
+# result is disposable (overwritten by the next tick, then by the real
+# end-of-utterance transcript), so there's nothing to buy from a wider beam
+# — only less time spent holding _STT_LOCK away from that real transcribe.
 INTERIM_STT = os.environ.get("HAL_INTERIM_STT", "1").strip().lower() not in {"0", "false", "no"}
 INTERIM_STT_INTERVAL = 3.0
+INTERIM_STT_BEAM = 1
 
 
 def _permission_reply(session_id: str, user_text: str, speaker: str | None = None) -> str | None:
@@ -1197,6 +1224,7 @@ def health():
         "status": "operational" if bridge["alive"] else "degraded",
         "voice": VOICE_PATH.name,
         "stt": STT_MODEL_NAME,
+        "stt_device": _stt_device(),
         "brain": f"hermes-agent ({hermes_bridge.BRIDGE_MODE})",
         "bridge": bridge,
     }
@@ -1240,6 +1268,7 @@ def status(request: Request):
         "permission_mode": hermes_bridge.PERMISSION_MODE,
         "voice": VOICE_PATH.name,
         "stt_model": STT_MODEL_NAME,
+        "stt_device": _stt_device(),
         "agent_cwd": hermes_bridge.AGENT_CWD,
         "uptime_seconds": round(time.monotonic() - _BOOT_TIME),
     }
@@ -1280,6 +1309,7 @@ async def systems(request: Request, refresh: int = 0):
             "permission_mode": hermes_bridge.PERMISSION_MODE,
             "voice": VOICE_PATH.name,
             "stt_model": STT_MODEL_NAME,
+        "stt_device": _stt_device(),
             "agent_cwd": Path(hermes_bridge.AGENT_CWD).name,
             "uptime_seconds": round(time.monotonic() - _BOOT_TIME),
         },
@@ -1924,7 +1954,7 @@ async def ws_conversation(websocket: WebSocket):
 
     async def send_interim(snapshot: bytes, gen: int) -> None:
         try:
-            text = await asyncio.to_thread(transcribe, snapshot)
+            text = await asyncio.to_thread(transcribe, snapshot, INTERIM_STT_BEAM)
         except Exception:
             return  # partial containers can fail to decode — never fatal
         if gen != interim_gen or not text:
