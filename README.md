@@ -96,11 +96,25 @@ still verified by running the server.
 
 ## Configuration (env vars, all optional)
 
+**STT feels slow?** On CPU (no CUDA GPU — check `stt_device` in `/api/status`
+after a restart to confirm), the two levers with real impact are model size
+and beam width: `HAL_STT_MODEL=tiny.en` decodes noticeably faster than the
+`base.en` default at some accuracy cost, and `HAL_STT_BEAM=1` (greedy) is
+roughly 2x faster than the default beam of 5, also with a small accuracy
+cost — try beam first, since it's cheaper on accuracy than dropping model
+size. In full-duplex mode, interim captions already decode greedily
+regardless of `HAL_STT_BEAM` so they hold the shared STT lock briefly; if
+captions still aren't worth it to you, `HAL_INTERIM_STT=0` removes them
+entirely and frees the whole STT pipeline for the real transcript.
+
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `HAL_PORT` / `HAL_HOST` | `8000` / `127.0.0.1` | bind address (keep loopback; there is no auth) |
 | `HAL_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Host-header allowlist (blocks DNS rebinding) **and** the `Origin` allowlist for state-changing requests (see Security); add your hostname/IP — or `*` — if you bind beyond loopback |
-| `HAL_STT_MODEL` | `base.en` | any faster-whisper model; `small.en` = better accuracy, slower |
+| `HAL_STT_MODEL` | `base.en` | any faster-whisper model; `tiny.en` = fastest, `small.en` = better accuracy, slower |
+| `HAL_STT_DEVICE` | `auto` | `auto` uses a CUDA GPU if present, else CPU; force with `cpu`/`cuda` |
+| `HAL_STT_COMPUTE_TYPE` | `auto` | quantization for the resolved device (int8 on CPU, float16 on GPU); override with e.g. `int8_float16` |
+| `HAL_STT_CPU_THREADS` | `0` | CPU threads for decoding; `0` = ctranslate2 picks (usually all cores) |
 | `HAL_VOICE` | `~/.hermes/voices/hal9000/hal9000.onnx` | Piper voice model |
 | `HAL_BRIDGE` | `acp` | `acp` = persistent agent process; `subprocess` = one CLI call per turn |
 | `HAL_PERMISSION_MODE` | `deny` | `deny` / `ask` / `yolo` — how ACP tool-permission requests are answered (see above) |
@@ -110,7 +124,7 @@ still verified by running the server.
 | `HAL_MISSION_STEERABLE_TTL` | `1800` | seconds a finished mission's session stays alive for `/ask` follow-ups |
 | `HAL_CHESS_DEPTH` / `HAL_CHESS_TIME` | `3` / `4` | chess engine search depth and time budget (seconds) |
 | `HAL_TRIGGERS_POLL` | `30` | seconds between `data/triggers.json` scans |
-| `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records; `0` disables |
+| `HAL_INTERIM_STT` | `1` | live interim captions while a duplex utterance records (always greedy-decoded, cheap); `0` disables |
 | `HAL_COMMENTARY` | `1` | speak-while-thinking on WS turns: HAL voices each sentence as the agent produces it; `0` restores speak-at-end |
 | `HAL_VIEWSCREEN_POLL` | `2` | seconds between scans of `data/viewscreen/` for new visuals |
 | `HAL_VOICE_THRESHOLD` | `0.5` | cosine similarity a voiceprint match must reach (see Crew Manifest) |
