@@ -203,8 +203,36 @@ ALLOWED_HOSTS = [
     if h.strip()
 ]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+
+def _viewscreen_headers(name: str) -> dict[str, str]:
+    """Response headers that keep agent-written files inert.
+
+    The viewscreen is served from this app's own origin, so anything the
+    agent drops there is untrusted content one URL away from the session
+    cookie. `sandbox` puts the response in an opaque origin: scripts don't
+    run and same-origin access is gone. It only takes effect when the
+    response becomes a *document*, which is exactly the gap the panel's
+    <iframe sandbox> misses — an SVG renders script-free inside <img>, but
+    the panel links images full-size, and a top-level SVG document does run
+    its scripts. PDFs stay exempt: the browser's viewer needs its own
+    origin, the same carve-out renderViewscreen() makes for the iframe.
+    """
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if not name.lower().endswith(".pdf"):
+        headers["Content-Security-Policy"] = "sandbox"
+    return headers
+
+
+class _ViewscreenStatic(StaticFiles):
+    async def get_response(self, path: str, scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers.update(_viewscreen_headers(path))
+        return response
+
+
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
-app.mount("/viewscreen", StaticFiles(directory=str(VIEWSCREEN_DIR)), name="viewscreen")
+app.mount("/viewscreen", _ViewscreenStatic(directory=str(VIEWSCREEN_DIR)), name="viewscreen")
 
 
 def _valid_session_id(session_id: str | None) -> str | None:

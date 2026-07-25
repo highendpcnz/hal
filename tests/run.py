@@ -876,6 +876,21 @@ check("ledger orders due first", _led.open_entries()[0]["text"] == "renew the do
 check("ledger due_today catches overdue", [e["text"] for e in _led.due_today()] == ["renew the domain"])
 _sum = _led.spoken_summary()
 check("ledger summary speaks counts and dues", "3 items" in _sum and "Due now: renew the domain" in _sum, _sum)
+# The spoken budget is a total, not a per-section one: more overdue items
+# than MAX_SPOKEN_ITEMS must silence the "Open:" section entirely, not slice
+# it from the end (a bare negative slice did exactly that).
+_lbudget = ledger_mod.Ledger(_ldir / "budget")
+(_ldir / "budget").mkdir()
+for _i in range(ledger_mod.MAX_SPOKEN_ITEMS + 1):
+    _lbudget.add(f"overdue {_i}", due="2020-01-01")
+for _i in range(3):
+    _lbudget.add(f"undated {_i}")
+_bsum = _lbudget.spoken_summary()
+check("ledger summary drops open items once dues fill the budget", "Open:" not in _bsum, _bsum)
+check("ledger summary caps spoken items at the budget",
+      _bsum.count(";") + 1 <= ledger_mod.MAX_SPOKEN_ITEMS, _bsum)
+check("ledger summary still reports the true total", "10 items" in _bsum, _bsum)
+
 check("ledger complete by query", _led.complete("domain")["text"] == "renew the domain")
 check("ledger complete keeps the record", any(e["status"] == "done" for e in _led._load()))
 check("ledger forget latest", _led.forget(None)["text"] == "draft the report")
@@ -977,6 +992,46 @@ check(
 )
 hermes_bridge.unregister_event_queue("vs-browser-1", _q1)
 hermes_bridge.unregister_event_queue("vs-browser-2", _q2)
+
+# --- viewscreen: agent-written files stay inert -------------------------------------
+# The panel sandboxes agent HTML in an iframe, but links images full-size —
+# and a top-level SVG document runs its scripts with this app's origin and
+# session cookie. The response headers, not the markup, are the boundary.
+
+check("viewscreen svg is sandboxed",
+      main._viewscreen_headers("chart.svg").get("Content-Security-Policy") == "sandbox")
+check("viewscreen html is sandboxed",
+      main._viewscreen_headers("page.html").get("Content-Security-Policy") == "sandbox")
+check("viewscreen pdf keeps its viewer origin",
+      "Content-Security-Policy" not in main._viewscreen_headers("report.pdf"))
+check("viewscreen pdf carve-out is case-insensitive",
+      "Content-Security-Policy" not in main._viewscreen_headers("REPORT.PDF"))
+check("viewscreen responses refuse content sniffing",
+      all(main._viewscreen_headers(n)["X-Content-Type-Options"] == "nosniff"
+          for n in ("chart.svg", "report.pdf", "shot.png")))
+
+
+async def _exercise_viewscreen_static():
+    """The headers must survive StaticFiles, not just the helper."""
+    static = main._ViewscreenStatic(directory=str(main.VIEWSCREEN_DIR))
+    scope = {"type": "http", "method": "GET", "headers": []}
+    (main.VIEWSCREEN_DIR / "probe.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'/>")
+    served = await static.get_response("probe.svg", scope)
+    try:
+        # StaticFiles signals a miss by raising, not returning — either way
+        # the override must not turn it into a 200.
+        missing = (await static.get_response("nope.svg", scope)).status_code
+    except Exception as exc:
+        missing = getattr(exc, "status_code", None)
+    return served.headers, missing
+
+
+_vs_headers, _vs_missing_status = asyncio.run(_exercise_viewscreen_static())
+check("served viewscreen file carries the sandbox header",
+      _vs_headers.get("content-security-policy") == "sandbox", dict(_vs_headers))
+check("served viewscreen file carries nosniff",
+      _vs_headers.get("x-content-type-options") == "nosniff", dict(_vs_headers))
+check("viewscreen static still 404s a missing file", _vs_missing_status == 404, _vs_missing_status)
 
 # --- chess engine (clean-room; perft pins move generation) -------------------------
 

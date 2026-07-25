@@ -123,7 +123,10 @@ class Ledger:
             return "The ledger is clear, Dave. Nothing outstanding."
         today = date.today().isoformat()
         due = [e for e in entries if e.get("due") and str(e["due"]) <= today]
-        rest = [e for e in entries if e not in due][: MAX_SPOKEN_ITEMS - len(due)]
+        # Undated items fill whatever the due list left of the budget. Clamp at
+        # zero: a bare negative slice trims from the end instead of yielding
+        # nothing, so an overdue pile would still drag open items into speech.
+        rest = [e for e in entries if e not in due][: max(0, MAX_SPOKEN_ITEMS - len(due))]
         count = len(entries)
         parts = [f"{count} item{'s' if count != 1 else ''} on the ledger, Dave."]
         if due:
