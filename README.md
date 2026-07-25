@@ -94,6 +94,18 @@ internally so no models load; finishes in seconds. The same suite plus
 `ruff check .` runs in CI on every push. The audio/inference pipeline is
 still verified by running the server.
 
+Browser tests cover the parts of `static/index.html` a Python suite can only
+match as strings — chiefly the session-reset path, whose `confirm()` dialog
+no other tool in this repo can drive:
+
+```
+npm run test:e2e
+```
+
+Playwright boots its own instance on port 8123 with `HAL_SKIP_MODELS=1`, so it
+needs no models and no inference; ~30s, and it runs in CI alongside the Python
+suite.
+
 ## Configuration (env vars, all optional)
 
 **STT feels slow?** On CPU (no CUDA GPU — check `stt_device` in `/api/status`

@@ -21,3 +21,43 @@ jobs:
         run: ruff check .
       - name: Tests (HAL_SKIP_MODELS=1 — no model downloads)
         run: python tests/run.py
+
+  e2e:
+    # The behaviour layer in static/index.html — ~1,600 lines of inline JS the
+    # Python suite can only pin with substring assertions. Runs the app with
+    # HAL_SKIP_MODELS=1, so no models download and no inference happens.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install app dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install "fastapi>=0.115" "uvicorn[standard]>=0.32" \
+                                "python-multipart>=0.0.9" "pydantic>=2" \
+                                "piper-tts>=1.2.0" "faster-whisper>=1.0"
+      - name: Install node dependencies
+        run: npm ci
+      - name: Build the frontend bundles
+        run: npm run build
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: End-to-end tests
+        run: npx playwright test
+        env:
+          CI: "true"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7

@@ -6,7 +6,8 @@
   "scripts": {
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm run build"
+    "check": "npm run typecheck && npm run build",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@fontsource/azeret-mono": "5.2.11",
@@ -14,6 +15,7 @@
     "three": "0.185.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.0",
     "@types/three": "0.185.1",
     "typescript": "7.0.2",
     "vite": "8.1.5"

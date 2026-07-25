@@ -12,3 +12,6 @@ models/*.json
 data/
 .claude/*
 !.claude/skills/
+.playwright-data/
+playwright-report/
+test-results/

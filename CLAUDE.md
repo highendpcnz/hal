@@ -47,7 +47,14 @@ curl -fsS http://127.0.0.1:8000/api/health     # want status: operational, bridg
 .venv/bin/python tests/run.py                  # zero-dep, seconds, "all tests passed"
 .venv/bin/ruff check .
 npm run check                                  # tsc --noEmit && vite build
+npm run test:e2e                               # Playwright, ~30s, boots its own server
 ```
+
+`test:e2e` covers the behaviour layer the Python suite can only reach with
+substring assertions. It starts its own app instance on port 8123 with
+`HAL_SKIP_MODELS=1` and `HAL_DATA_DIR=.playwright-data`, so it never loads a
+model, never runs inference, and never writes to the real `data/`. Anything
+needing a live turn belongs in `.claude/skills/run-hal/smoke.sh` instead.
 
 `vite build` output is committed under `static/assets/` and is currently
 byte-identical to a fresh build — keep it that way; a drifting bundle is a silent
