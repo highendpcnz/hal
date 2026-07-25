@@ -1171,6 +1171,39 @@ check(
     start_ws_recording,
 )
 
+# --- mission log entry shape -------------------------------------------------
+# A direction may lay .mlog-entry out as a grid (01 does: 70px + 1fr). An
+# unwrapped message is then an *anonymous* grid item, auto-placed into the next
+# free cell — under the timestamp, one word wide. That shipped broken on the
+# default direction, so pin the two-child shape: .mlog-ts then .mlog-body.
+_mlog_body = _fn_body("appendToMissionLog")
+_mlog_assignments = [
+    line.strip() for line in _mlog_body.splitlines() if "el.innerHTML =" in line
+]
+check(
+    "mission log builds every entry type",
+    len(_mlog_assignments) == 4,
+    repr(_mlog_assignments),
+)
+check(
+    "every mission log entry wraps its message in .mlog-body",
+    all("body(" in line for line in _mlog_assignments),
+    repr([line for line in _mlog_assignments if "body(" not in line]),
+)
+check(
+    "the grid direction places .mlog-body in column 2",
+    ".mlog-body" in (_STATIC := Path(__file__).resolve().parent.parent / "static")
+    .joinpath("bridge-option1.css").read_text(),
+)
+
+# The JS emits `mlog-user`; two direction stylesheets used to select `mlog-you`,
+# so user entries silently lost their signal bullet. Neither name may drift.
+for _css in sorted(_STATIC.glob("bridge-*.css")):
+    check(
+        f"{_css.name} has no dead .mlog-you selector",
+        "mlog-you" not in _css.read_text(),
+    )
+
 ws_onclose_start = _frontend_src.index("ws.onclose = () => {")
 ws_onclose_end = _frontend_src.index("};", ws_onclose_start)
 ws_onclose_body = _frontend_src[ws_onclose_start:ws_onclose_end]

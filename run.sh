@@ -8,20 +8,40 @@ APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${HAL_PORT:-8000}"
 HOST="${HAL_HOST:-127.0.0.1}"
 
+# The venv that RUNS HAL needs fastapi/uvicorn/piper/faster-whisper. That is
+# normally the Hermes venv, but a repo-local .venv takes precedence when one
+# exists: some Hermes installs ship without the STT/TTS stack, and preferring
+# Hermes would select an environment that cannot even import main.py.
 if [[ -n "${HAL_HERMES_VENV:-}" ]]; then
   HERMES_VENV="$HAL_HERMES_VENV"
+elif [[ -x "$APP_DIR/.venv/bin/uvicorn" ]]; then
+  HERMES_VENV="$APP_DIR/.venv"
 elif [[ -x "$HOME/.hermes/hermes-agent/venv/bin/uvicorn" ]]; then
   HERMES_VENV="$HOME/.hermes/hermes-agent/venv"
 elif [[ -x "$HOME/hermes-agent/.venv/bin/uvicorn" ]]; then
   HERMES_VENV="$HOME/hermes-agent/.venv"
 else
-  echo "Hermes Agent's Python environment was not found." >&2
-  echo "Install Hermes Agent, or set HAL_HERMES_VENV to its environment path." >&2
+  echo "No Python environment with uvicorn was found." >&2
+  echo "Install Hermes Agent, create a repo-local .venv from requirements.txt," >&2
+  echo "or set HAL_HERMES_VENV to an environment path." >&2
   exit 1
 fi
 
-export HAL_HERMES_BIN="${HAL_HERMES_BIN:-$HERMES_VENV/bin/hermes}"
-export HAL_HERMES_ACP_BIN="${HAL_HERMES_ACP_BIN:-$HERMES_VENV/bin/hermes-acp}"
+# The agent binaries are spawned as subprocesses, so they are independent of the
+# venv running HAL — resolve them against a real Hermes install rather than
+# assuming they sit beside uvicorn. An isolated .venv has neither.
+_find_hermes_bin() {
+  local name="$1" candidate
+  for candidate in "$HERMES_VENV/bin/$name" \
+                   "$HOME/.hermes/hermes-agent/venv/bin/$name" \
+                   "$HOME/hermes-agent/.venv/bin/$name"; do
+    [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
+  done
+  command -v "$name" 2>/dev/null || printf '%s\n' "$HERMES_VENV/bin/$name"
+}
+
+export HAL_HERMES_BIN="${HAL_HERMES_BIN:-$(_find_hermes_bin hermes)}"
+export HAL_HERMES_ACP_BIN="${HAL_HERMES_ACP_BIN:-$(_find_hermes_bin hermes-acp)}"
 
 # Fall back to the repo-local voice model if the shared Hermes voice install
 # is absent (e.g. a machine where ~/.hermes/voices was never populated).

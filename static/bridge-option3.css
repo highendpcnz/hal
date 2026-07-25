@@ -382,7 +382,7 @@
     background: #3a3835;
   }
 
-  html[data-bridge-direction="vault"] .mlog-entry.mlog-you::before,
+  html[data-bridge-direction="vault"] .mlog-entry.mlog-user::before,
   html[data-bridge-direction="vault"] .mlog-entry.mlog-hal::before {
     background: var(--signal);
     box-shadow: 0 0 7px rgba(255, 45, 31, 0.6);

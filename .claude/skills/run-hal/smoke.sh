@@ -15,7 +15,9 @@ hdr() { grep -i "^$2:" "$1" | cut -d' ' -f2- | tr -d '\r'; }
 
 if ! curl -sf -m 2 "$URL/api/health" >/dev/null 2>&1; then
   echo "── starting HAL (first boot loads STT+TTS models — up to 2 min)"
-  HAL_HERMES_VENV="${HAL_HERMES_VENV:-$HOME/.hermes/hermes-agent/venv}" "$APP_DIR/bin/hal" --no-open
+  # No venv default here: run.sh detects one (repo .venv → Hermes venv), and
+  # pinning Hermes would select an environment that may lack faster-whisper/piper.
+  "$APP_DIR/bin/hal" --no-open
 fi
 
 echo "── health"

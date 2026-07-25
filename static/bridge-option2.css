@@ -292,7 +292,7 @@
     background: var(--void);
   }
 
-  html[data-bridge-direction="orrery"] .mlog-entry.mlog-you::before,
+  html[data-bridge-direction="orrery"] .mlog-entry.mlog-user::before,
   html[data-bridge-direction="orrery"] .mlog-entry.mlog-hal::before {
     border-color: var(--signal);
     box-shadow: 0 0 8px rgba(255, 45, 31, 0.55);

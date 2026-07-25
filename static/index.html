@@ -1472,21 +1472,27 @@
     el.className = 'mlog-entry';
     const ts = '<span class="mlog-ts">' + mlogTimestamp() + '</span>';
 
+    // Every entry is exactly two children — .mlog-ts then .mlog-body — because a
+    // direction may lay .mlog-entry out as a grid (01 does). An unwrapped message
+    // becomes an anonymous grid item, gets auto-placed into the next free cell,
+    // and renders one word wide under the timestamp. Keep the body wrapped.
+    const body = (inner) => '<span class="mlog-body">' + inner + '</span>';
+
     if (type === 'user') {
       el.className += ' mlog-user';
-      el.innerHTML = ts + '<span class="mlog-role">You</span>  ' + escapeHtml(text);
+      el.innerHTML = ts + body('<span class="mlog-role">You</span> ' + escapeHtml(text));
     } else if (type === 'hal') {
       el.className += ' mlog-hal';
-      el.innerHTML = ts + '<span class="mlog-role">HAL</span>  ' + escapeHtml(text);
+      el.innerHTML = ts + body('<span class="mlog-role">HAL</span> ' + escapeHtml(text));
     } else if (type === 'tool') {
       const status = extra || '';
       const icon = status === 'completed' ? '✓' : status === 'failed' ? '✗' : status === 'denied' ? '⊘' : '⚡';
       const cls = status === 'completed' ? ' done' : status === 'failed' ? ' failed' : status === 'denied' ? ' denied' : '';
       el.className += ' mlog-tool' + cls;
-      el.innerHTML = ts + '<span class="mlog-tool-icon">' + icon + '</span> ' + escapeHtml(text);
+      el.innerHTML = ts + body('<span class="mlog-tool-icon">' + icon + '</span> ' + escapeHtml(text));
     } else {
       el.className += ' mlog-system';
-      el.innerHTML = ts + escapeHtml(text);
+      el.innerHTML = ts + body(escapeHtml(text));
     }
 
     mlogEntries.appendChild(el);

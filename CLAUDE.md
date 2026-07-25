@@ -1,37 +1,103 @@
 # HAL 9000 frontend — Claude Code handoff
 
-Read `AGENTS.md` before changing anything. It is the authoritative HAL persona and runtime guidance; preserve it. Replies from the running bridge are spoken aloud, so keep user-facing prose concise and address the user as Dave.
+Read `AGENTS.md` before changing anything. It is the authoritative HAL persona and
+runtime guidance; preserve it. Replies from the running bridge are spoken aloud, so
+keep user-facing prose concise and address the user as Dave.
 
 ## Workspace
 
-This checkout is `/Users/hal-9000/Documents/Codex/hal/hal-main`. It is a local HAL 9000 voice frontend for Hermes Agent. The Python bridge is the source of truth for sessions, missions, permissions, chess, telemetry, viewscreen events, STT, and TTS. The browser surface is in `static/index.html`; the current visual shell is `static/bridge-option1.css`; the procedural Three.js optic is authored in `frontend/hal-optic.ts` and `frontend/directions.ts` and emitted to `static/assets/` by Vite.
+The repo root is whichever directory contains `run.sh` — **do not hardcode a
+checkout path here**; the previous revision of this file named a machine that no
+longer exists and misled every agent that read it.
+
+This is a local HAL 9000 voice frontend for Hermes Agent. The Python bridge is the
+source of truth for sessions, missions, permissions, chess, telemetry, viewscreen
+events, STT, and TTS. The browser surface is `static/index.html`; direction
+stylesheets are `static/bridge-option{1..4}.css` over `static/bridge-shared.css`; the
+procedural Three.js optic is authored in `frontend/*.ts` and emitted to
+`static/assets/` by Vite.
 
 ## Run and verify
 
-From this directory:
+The app does **not** run inside the Hermes venv on every machine — that venv is
+missing `faster_whisper`/`piper` on some installs, and `run.sh` auto-detects it
+first anyway. Prefer an isolated venv and override the three detection knobs:
 
 ```sh
-./run.sh
-curl -fsS http://127.0.0.1:8000/api/health
-npm run check
-npm audit --audit-level=high
-HAL_SKIP_MODELS=1 /Users/hal-9000/.hermes/hermes-agent/venv/bin/python tests/run.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt agent-client-protocol sherpa-onnx
+python3 download_model.py     # models/hal.onnx (61 MB, gitignored) — run.sh falls back to it
+
+HAL_HERMES_VENV="$PWD/.venv" \
+HAL_HERMES_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes" \
+HAL_HERMES_ACP_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes-acp" \
+  ./run.sh
 ```
 
-`run.sh` auto-detects `/Users/hal-9000/.hermes/hermes-agent/venv`, with `HAL_HERMES_VENV` available as an override. Keep the bridge on loopback unless the host allowlist and authentication story are deliberately addressed. `HAL_SKIP_MODELS=1` is for fast tests; a live health response should report `status: operational` and an alive ACP bridge.
+`hermes-acp` is spawned as a subprocess, so only that binary needs to exist outside
+this venv; the ACP *client library* must be installed inside it. On Linux
+`espeak-ng` is **not** a required system package — the `piper-tts` wheel bundles it.
+
+Then:
+
+```sh
+curl -fsS http://127.0.0.1:8000/api/health     # want status: operational, bridge alive
+.venv/bin/python tests/run.py                  # zero-dep, seconds, "all tests passed"
+.venv/bin/ruff check .
+npm run check                                  # tsc --noEmit && vite build
+```
+
+`vite build` output is committed under `static/assets/` and is currently
+byte-identical to a fresh build — keep it that way; a drifting bundle is a silent
+bug. Keep the bridge on loopback unless the host allowlist and an authentication
+story are deliberately addressed.
+
+## Verifying visual work
+
+`google-chrome --headless --screenshot` **hangs and never writes the file** — the
+page holds an SSE stream and a WebSocket open, so it never reaches network-idle. No
+flag combination fixes this. Use the claude-in-chrome MCP; WebGL renders correctly
+there. Screenshot-based design QA is mandatory for shell/optic changes: the mission
+log bug below was invisible in source and obvious on sight.
 
 ## Current product state
 
-All four visual directions are implemented and selectable from the rail: 01 “Aperture Sentinel”, 02 “Cognitive Orrery”, 03 “Signal Vault” (`docs/plans/directions-2-3.md`), and 04 “Ember Chorus” (`docs/plans/2026-07-19-ember-chorus-design.md` — a pure signal sculpture: stateless GPU murmuration, causal honesty, summoned-void shell). QA records: `design-qa.md`, `design-qa-option2.md`, `design-qa-option3.md`, `design-qa-option4.md`. Candidate axes for any future direction are banked at the end of the Ember Chorus design doc. Direction-independent base/mobile styles live in `static/bridge-shared.css`; each direction owns its desktop/tablet shell stylesheet. Note: `static/index.html`'s inline styles still contain the legacy pre-directions tablet/desktop blocks — direction stylesheets must reset against them (see the option 2 QA iteration history).
+Four visual directions are implemented and selectable from the rail: 01 "Aperture
+Sentinel" (default), 02 "Cognitive Orrery", 03 "Signal Vault"
+(`docs/plans/directions-2-3.md`), 04 "Ember Chorus"
+(`docs/plans/2026-07-19-ember-chorus-design.md`). QA records: `design-qa*.md`.
+Direction-independent base/mobile styles live in `static/bridge-shared.css`; each
+direction owns its desktop/tablet shell stylesheet.
 
-The direction runtime (Phase 0 of `docs/plans/directions-2-3.md`) is in place: selection persists in `localStorage` (`hal_direction`), a pre-paint inline script in `static/index.html` picks the direction stylesheet, and `frontend/hal-optic.ts` boots the direction’s scene module via dynamic import (`frontend/optic-aperture.ts` today; `optic-orrery.ts`/`optic-vault.ts` are stubs). The scene contract is `frontend/optic-api.ts`; `tests/run.py` pins the cross-file invariants.
+Selection persists in `localStorage` (`hal_direction`); a pre-paint inline script in
+`static/index.html` picks the stylesheet and `frontend/hal-optic.ts` dynamically
+imports the scene module. The scene contract is `frontend/optic-api.ts`;
+`tests/run.py` pins the cross-file invariants.
 
-Visual QA artifacts are in `data/viewscreen/`; `design-qa.md` records the comparison and interaction checks. Preserve existing behavior while iterating on the visual shell.
+## Known defects
 
-## Next priorities
-
-Develop options 2 and 3 as separate visual systems behind the existing direction-selector contract. Reuse the bridge behavior and endpoints, but do not collapse the directions into color-only themes. Before any handoff, run the checks above and inspect desktop, tablet, and mobile layouts. Do not add cloud API keys or commit secrets.
+- **Bridge mission log wraps role-tagged entries to a one-word column** (direction
+  01, desktop). Both `You` and `HAL` entries render their timestamp and role tag on
+  one row, then drop the message body to the panel's left edge at the timestamp
+  column's width. Untagged system lines render correctly. Origin is the
+  `appendToMissionLog` markup in `static/index.html` against the grid/flex rules the
+  direction stylesheet inherits from the legacy inline block. Reproduce by loading
+  the desktop Bridge and sending any turn.
+- `docs/ANALYSIS.md` is a stale point-in-time review: it predates the ledger,
+  voiceprints, chess, the viewscreen, and the whole directions system, describes
+  two-mode permissions (there are three), and lists trigger-state persistence as
+  open when it shipped. Treat the README as authoritative where they disagree.
 
 ## Known risks
 
-The frontend bundle is intentionally Three.js-heavy; check mobile GPU behavior and reduced-motion behavior when adding effects. The bridge has no authentication and defaults to denying tool permissions. Treat `data/` as runtime state, and inspect `git status` before changing or deleting generated artifacts.
+`static/index.html` is ~3,000 lines: ~1,100 of legacy inline CSS (which still owns
+the tablet and desktop media blocks every direction stylesheet must reset against)
+and ~1,600 of untyped inline JS carrying the whole behavior layer — WS protocol, PCM
+playback, VAD, permission bar, chess, missions — pinned only by substring assertions
+in `tests/run.py`. Treat edits there as unpinned until you have looked at the result.
+
+The frontend bundle is intentionally Three.js-heavy; check mobile GPU and
+reduced-motion behavior when adding effects. The bridge has no authentication and
+defaults to denying tool permissions. Treat `data/` as runtime state, and inspect
+`git status` before changing or deleting generated artifacts. Do not add cloud API
+keys or commit secrets.

@@ -240,6 +240,13 @@
     margin: 0;
   }
 
+  /* The message rides column 2. min-width:0 lets it wrap instead of forcing
+     the track open to its longest unbreakable word. */
+  .mlog-entry .mlog-body {
+    grid-column: 2;
+    min-width: 0;
+  }
+
   .mlog-entry .mlog-role,
   .mlog-entry .mlog-tool-icon {
     color: var(--signal);
