@@ -51,10 +51,23 @@ npm run test:e2e                               # Playwright, ~30s, boots its own
 ```
 
 `test:e2e` covers the behaviour layer the Python suite can only reach with
-substring assertions. It starts its own app instance on port 8123 with
+substring assertions — the session-reset path (`reset.spec.ts`), the duplex
+WebSocket protocol (`websocket.spec.ts`), and the Allow/Deny bar
+(`permission.spec.ts`). It starts its own app instance on port 8123 with
 `HAL_SKIP_MODELS=1` and `HAL_DATA_DIR=.playwright-data`, so it never loads a
 model, never runs inference, and never writes to the real `data/`. Anything
 needing a live turn belongs in `.claude/skills/run-hal/smoke.sh` instead.
+
+Two mocking techniques make the unreachable paths reachable, and both are
+load-bearing:
+
+- **`page.routeWebSocket`** lets a test *be* the bridge, so any frame the
+  server can emit is reproducible without models or audio. Frames like
+  `tts_done` racing `turn_done` mid-commentary have no other trigger.
+- **Routing `/api/events`** hands the page synthetic SSE. Note that fulfilling
+  a route closes the stream, which trips the page's 5s reconnect — serve the
+  frames once and keepalive after, or a replayed body re-raises a prompt the
+  user already answered.
 
 `vite build` output is committed under `static/assets/` and is currently
 byte-identical to a fresh build — keep it that way; a drifting bundle is a silent
