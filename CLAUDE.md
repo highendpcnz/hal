@@ -98,10 +98,12 @@ for two screenshots.
   column-flex item inside a `max-height` container, so it compressed below its own
   two-row content and painted over the first entry. Kept here as the worked example
   of the cache trap above.
-- `docs/ANALYSIS.md` is a stale point-in-time review: it predates the ledger,
-  voiceprints, chess, the viewscreen, and the whole directions system, describes
-  two-mode permissions (there are three), and lists trigger-state persistence as
-  open when it shipped. Treat the README as authoritative where they disagree.
+- `docs/ANALYSIS.md` is a point-in-time review against `37250a4` (2026-07-24),
+  recovered from the pre-directions line. It covers the ledger, voiceprints,
+  chess, the viewscreen and the Initiative, but predates the five visual
+  directions and the cross-origin work entirely — it describes neither. Treat
+  the README as authoritative where they disagree, and don't mistake its
+  "still open" list for the current one.
 
 ## Known risks
 
