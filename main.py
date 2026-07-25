@@ -28,6 +28,8 @@ from urllib.parse import quote, urlsplit
 import asyncio
 from collections import deque
 
+import numpy as np
+
 from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,6 +63,8 @@ STT_COMPUTE_TYPE = os.environ.get("HAL_STT_COMPUTE_TYPE", "auto")
 # 0 = let ctranslate2 pick (usually all physical cores); set explicitly on a
 # shared/throttled box to stop STT from starving everything else.
 STT_CPU_THREADS = int(os.environ.get("HAL_STT_CPU_THREADS", "0"))
+# Whisper's fixed input rate — only used for the boot-time device probe.
+SAMPLE_RATE_STT = 16000
 # Skip loading the STT/TTS models — for tests of the pure-python parts only;
 # /api/talk and /api/say will not work.
 SKIP_MODELS = os.environ.get("HAL_SKIP_MODELS", "") == "1"
@@ -128,6 +132,39 @@ SYN_CONFIG = SynthesisConfig(
     normalize_audio=True,
 )
 
+def _load_stt():
+    """Build the STT model, proving the resolved device can actually decode.
+
+    `device="auto"` only asks whether a GPU exists — not whether this box can
+    run CUDA inference. A machine with an NVIDIA driver but no cuBLAS builds
+    the model happily and then raises on the first encode, so every
+    /api/talk becomes a 500 while /api/health still reports operational.
+    That is strictly worse than staying on CPU, so probe once at boot with a
+    throwaway decode (the lazy generator must be drained — that is where CUDA
+    actually fails) and fall back rather than fail requests forever.
+    """
+    def build(device: str, compute_type: str):
+        model = WhisperModel(
+            STT_MODEL_NAME,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=STT_CPU_THREADS,
+        )
+        segments, _info = model.transcribe(
+            np.zeros(SAMPLE_RATE_STT, dtype=np.float32), language="en", beam_size=1
+        )
+        list(segments)
+        return model
+
+    try:
+        return build(STT_DEVICE, STT_COMPUTE_TYPE)
+    except Exception as exc:
+        if STT_DEVICE == "cpu":
+            raise
+        print(f"[stt] device={STT_DEVICE!r} could not decode ({exc}); falling back to CPU")
+        return build("cpu", "int8")
+
+
 if SKIP_MODELS:
     VOICE = None
     STT = None
@@ -136,13 +173,8 @@ else:
     VOICE = PiperVoice.load(str(VOICE_PATH))
     print("HAL voice loaded")
     print(f"Loading STT model ({STT_MODEL_NAME}, device={STT_DEVICE}, compute={STT_COMPUTE_TYPE})...")
-    STT = WhisperModel(
-        STT_MODEL_NAME,
-        device=STT_DEVICE,
-        compute_type=STT_COMPUTE_TYPE,
-        cpu_threads=STT_CPU_THREADS,
-    )
-    print("STT model loaded")
+    STT = _load_stt()
+    print(f"STT model loaded (device={STT.model.device})")
 
 SAMPLE_RATE = VOICE.config.sample_rate if VOICE is not None else 22050
 
