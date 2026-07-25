@@ -34,6 +34,28 @@ export async function mockSocket(page: Page): Promise<Socket> {
   return { sent, send: (frame) => route?.send(JSON.stringify(frame)), ready };
 }
 
+/**
+ * Serve SSE frames in place of the real /api/events stream.
+ *
+ * Only the first connection gets them. Fulfilling a route closes the
+ * response, which trips the page's 5s reconnect — and a replayed body would
+ * re-raise a prompt the user just answered, which the real bridge would never
+ * do. Later connections get an inert keepalive.
+ */
+export async function serveEvents(page: Page, frames: unknown[]): Promise<void> {
+  const body = frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join("");
+  let delivered = false;
+  await page.route("**/api/events", async (route) => {
+    const payload = delivered ? ": keepalive\n\n" : body;
+    delivered = true;
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+      body: payload
+    });
+  });
+}
+
 /** Frames of a given type the page has sent, parsed. */
 export function framesOfType(socket: Socket, type: string): Record<string, unknown>[] {
   return socket.sent

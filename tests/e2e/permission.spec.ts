@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
-import { logText, opticReady, pinDirection } from "./helpers";
+import { logText, opticReady, pinDirection, serveEvents } from "./helpers";
 
 /**
  * The Allow/Deny bar — the UI that gates tool execution.
@@ -14,31 +14,6 @@ import { logText, opticReady, pinDirection } from "./helpers";
  */
 
 const REQUEST_ID = "req-0123456789abcdef";
-
-/**
- * Serve one SSE frame (or several) in place of the real event stream.
- *
- * Only the first connection gets the frames. Fulfilling a route closes the
- * response, which trips the page's `onerror` reconnect after 5s — and a
- * replayed body would re-raise a prompt the user just answered, which the
- * real bridge would never do. Later connections get an inert keepalive.
- */
-async function serveEvents(page: Page, frames: unknown[]): Promise<void> {
-  const body = frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join("");
-  let delivered = false;
-  await page.route("**/api/events", async (route) => {
-    const payload = delivered ? ": keepalive\n\n" : body;
-    delivered = true;
-    await route.fulfill({
-      status: 200,
-      headers: {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache"
-      },
-      body: payload
-    });
-  });
-}
 
 async function openBridge(page: Page): Promise<void> {
   await pinDirection(page, "aperture");

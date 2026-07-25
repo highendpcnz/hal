@@ -51,11 +51,12 @@ npm run test:e2e                               # Playwright, ~30s, boots its own
 ```
 
 `test:e2e` covers the behaviour layer the Python suite can only reach with
-substring assertions — the session-reset path (`reset.spec.ts`), the duplex
-WebSocket protocol (`websocket.spec.ts`), the Allow/Deny bar
-(`permission.spec.ts`), full-duplex/VAD mode (`duplex.spec.ts`), and the chess
-board (`chess.spec.ts`, which runs against the *real* engine since it needs no
-model). It starts its own app instance on port 8123 with
+substring assertions. 41 tests across six specs: the session-reset path
+(`reset.spec.ts`), the duplex WebSocket protocol (`websocket.spec.ts`), the
+Allow/Deny bar (`permission.spec.ts`), full-duplex/VAD mode
+(`duplex.spec.ts`), the chess board (`chess.spec.ts`, which runs against the
+*real* engine since it needs no model), and the proposal bar, missions panel
+and viewscreen (`surfaces.spec.ts`). It starts its own app instance on port 8123 with
 `HAL_SKIP_MODELS=1` and `HAL_DATA_DIR=.playwright-data`, so it never loads a
 model, never runs inference, and never writes to the real `data/`. Anything
 needing a live turn belongs in `.claude/skills/run-hal/smoke.sh` instead.
@@ -81,10 +82,20 @@ load-bearing:
 - **`page.routeWebSocket`** lets a test *be* the bridge, so any frame the
   server can emit is reproducible without models or audio. Frames like
   `tts_done` racing `turn_done` mid-commentary have no other trigger.
-- **Routing `/api/events`** hands the page synthetic SSE. Note that fulfilling
-  a route closes the stream, which trips the page's 5s reconnect — serve the
-  frames once and keepalive after, or a replayed body re-raises a prompt the
-  user already answered.
+- **Routing `/api/events`** (`serveEvents` in `helpers.ts`) hands the page
+  synthetic SSE. Note that fulfilling a route closes the stream, which trips
+  the page's 5s reconnect — serve the frames once and keepalive after, or a
+  replayed body re-raises a prompt the user already answered.
+
+Two selector traps in this UI: `.mission-card-act` is shared by the chess and
+viewscreen controls, so scope it (`#mission-cards .mission-card-act`); and the
+left-hand panels render whenever they have content but only become *clickable*
+once the rail action sets `data-active-surface`, so click
+`[data-bridge-action="…"]` before driving their buttons.
+
+The suite runs single-worker (~6m). Each test gets its own browser context and
+therefore its own `hal_session` cookie, so parallelising is likely safe — but
+it hasn't been tried, and chess and reset both mutate per-session server state.
 
 `vite build` output is committed under `static/assets/` and is currently
 byte-identical to a fresh build — keep it that way; a drifting bundle is a silent
