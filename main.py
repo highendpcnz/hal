@@ -23,14 +23,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import asyncio
 from collections import deque
 
 from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from faster_whisper import WhisperModel
 from piper import PiperVoice, SynthesisConfig
@@ -203,6 +204,68 @@ ALLOWED_HOSTS = [
     if h.strip()
 ]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+# Methods that can change state or drive the agent. GET/HEAD are exempt: they
+# don't act, and a cross-origin page can't read their responses anyway.
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _origin_allowed(origin: str | None, fetch_site: str | None) -> bool:
+    """Whether a state-changing request may proceed, by its Origin.
+
+    TrustedHostMiddleware stops DNS rebinding, but not the plainer attack: any
+    page you happen to be visiting can `fetch()` this API. `/api/talk` takes
+    multipart, which is CORS-safelisted, so the browser sends it with **no
+    preflight** — and the handler mints a session when the cookie is absent, so
+    SameSite=lax withholding the cookie doesn't stop it either. The attacker
+    can't read the reply, but the turn still runs; under
+    HAL_PERMISSION_MODE=yolo that is arbitrary local command execution from any
+    open tab.
+
+    A browser always sends Origin on unsafe methods and on WebSocket
+    handshakes, so absence means no browser is being used as a confused deputy
+    — curl, bin/hal, and the smoke driver keep working untouched.
+    """
+    if fetch_site == "cross-site":
+        return False
+    if origin is None:
+        return True  # non-browser client
+    if origin == "null":
+        return False  # opaque origin: sandboxed iframe, data: URL, file://
+    if "*" in ALLOWED_HOSTS:
+        return True  # operator opted out of the host allowlist entirely
+    return urlsplit(origin).hostname in ALLOWED_HOSTS
+
+
+class SameOriginMiddleware:
+    """Reject cross-origin state-changing requests and socket handshakes.
+
+    Raw ASGI rather than BaseHTTPMiddleware because it must cover the
+    WebSocket scope too — `/ws/conversation` drives the agent as directly as
+    any POST does.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            unsafe = scope["type"] == "websocket" or scope.get("method") in _UNSAFE_METHODS
+            if unsafe:
+                headers = Headers(scope=scope)
+                if not _origin_allowed(headers.get("origin"), headers.get("sec-fetch-site")):
+                    if scope["type"] == "websocket":
+                        await send({"type": "websocket.close", "code": 1008})
+                    else:
+                        response = PlainTextResponse(
+                            "Cross-origin request blocked", status_code=403
+                        )
+                        await response(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(SameOriginMiddleware)
 
 
 def _viewscreen_headers(name: str) -> dict[str, str]:

@@ -20,23 +20,25 @@ procedural Three.js optic is authored in `frontend/*.ts` and emitted to
 ## Run and verify
 
 The app does **not** run inside the Hermes venv on every machine — that venv is
-missing `faster_whisper`/`piper` on some installs, and `run.sh` auto-detects it
-first anyway. Prefer an isolated venv and override the three detection knobs:
+missing `faster_whisper`/`piper` on some installs. `run.sh` prefers a repo-local
+`.venv` when one exists and resolves `hermes`/`hermes-acp` separately, so no
+environment variables are needed:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt agent-client-protocol sherpa-onnx
 python3 download_model.py     # models/hal.onnx (61 MB, gitignored) — run.sh falls back to it
-
-HAL_HERMES_VENV="$PWD/.venv" \
-HAL_HERMES_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes" \
-HAL_HERMES_ACP_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes-acp" \
-  ./run.sh
+./run.sh
 ```
 
 `hermes-acp` is spawned as a subprocess, so only that binary needs to exist outside
 this venv; the ACP *client library* must be installed inside it. On Linux
 `espeak-ng` is **not** a required system package — the `piper-tts` wheel bundles it.
+`HAL_HERMES_VENV` / `HAL_HERMES_BIN` / `HAL_HERMES_ACP_BIN` still override detection
+if you need to force an environment.
+
+**The venv is not relocatable** — `bin/*` shebangs are absolute. If the checkout
+moves, delete `.venv` and rebuild rather than copying it.
 
 Then:
 
@@ -74,15 +76,28 @@ Selection persists in `localStorage` (`hal_direction`); a pre-paint inline scrip
 imports the scene module. The scene contract is `frontend/optic-api.ts`;
 `tests/run.py` pins the cross-file invariants.
 
+## Verifying CSS changes — read this before believing a screenshot
+
+The browser aggressively caches the direction stylesheets, and `StaticFiles`
+serves them with revalidation the browser may skip. **A reload is not enough**: a
+correct fix will look broken. Cache-bust the sheet and measure geometry rather
+than trusting your eyes:
+
+```js
+const link = document.querySelector('link[data-direction-style="vault"]');
+link.href = link.getAttribute('href').split('?')[0] + '?cachebust=' + Date.now();
+// then read getBoundingClientRect() on the elements you changed
+```
+
+This cost a wrong conclusion once — a working flex fix appeared to have no effect
+for two screenshots.
+
 ## Known defects
 
-- **Bridge mission log wraps role-tagged entries to a one-word column** (direction
-  01, desktop). Both `You` and `HAL` entries render their timestamp and role tag on
-  one row, then drop the message body to the panel's left edge at the timestamp
-  column's width. Untagged system lines render correctly. Origin is the
-  `appendToMissionLog` markup in `static/index.html` against the grid/flex rules the
-  direction stylesheet inherits from the legacy inline block. Reproduce by loading
-  the desktop Bridge and sending any turn.
+- **Direction 03 "Signal Vault"**: fixed — the log header was a `min-height: 0`
+  column-flex item inside a `max-height` container, so it compressed below its own
+  two-row content and painted over the first entry. Kept here as the worked example
+  of the cache trap above.
 - `docs/ANALYSIS.md` is a stale point-in-time review: it predates the ledger,
   voiceprints, chess, the viewscreen, and the whole directions system, describes
   two-mode permissions (there are three), and lists trigger-state persistence as

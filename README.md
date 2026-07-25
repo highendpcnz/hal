@@ -57,8 +57,10 @@ The bridge speaks ACP through the official `agent-client-protocol` library
     `HAL_PERMISSION_TIMEOUT` seconds. Answer by voice or text ("yes" /
     "go ahead" / "no" / "deny"), or with the Allow/Deny bar in the UI.
     Unanswered requests are denied.
-  - `yolo` — auto-approve everything (`HAL_YOLO=1` is the legacy alias),
-    if you accept voice-triggered shell access.
+  - `yolo` — auto-approve everything (`HAL_YOLO=1` is the legacy alias).
+    Understand the real scope before setting this: it is not merely "my
+    voice can run shell." Anything that reaches the API runs tools without
+    asking. See Security below for what does and doesn't reach it.
 
 ## Run
 
@@ -97,7 +99,7 @@ still verified by running the server.
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `HAL_PORT` / `HAL_HOST` | `8000` / `127.0.0.1` | bind address (keep loopback; there is no auth) |
-| `HAL_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Host-header allowlist (blocks DNS rebinding); add your hostname/IP — or `*` — if you bind beyond loopback |
+| `HAL_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Host-header allowlist (blocks DNS rebinding) **and** the `Origin` allowlist for state-changing requests (see Security); add your hostname/IP — or `*` — if you bind beyond loopback |
 | `HAL_STT_MODEL` | `base.en` | any faster-whisper model; `small.en` = better accuracy, slower |
 | `HAL_VOICE` | `~/.hermes/voices/hal9000/hal9000.onnx` | Piper voice model |
 | `HAL_BRIDGE` | `acp` | `acp` = persistent agent process; `subprocess` = one CLI call per turn |
@@ -359,6 +361,37 @@ They are kept for reference / upstream diffing. In particular the Dockerfile
 predates the Hermes rewiring and **does not build a working image** — it
 neither copies `hermes_bridge.py`/`mission_control.py` nor provides the
 Hermes CLI or the HAL voice model.
+
+## Security
+
+There is no authentication. Three things stand between the agent and the
+rest of the machine, and it is worth knowing exactly what each one covers:
+
+1. **Loopback binding.** Nothing off-host reaches the API unless you
+   deliberately bind wider.
+2. **Host allowlist** (`HAL_ALLOWED_HOSTS`, via `TrustedHostMiddleware`).
+   Stops DNS rebinding — a hostile page whose hostname resolves to
+   127.0.0.1 gets its request rejected on the `Host` header.
+3. **Origin allowlist** (same variable). Stops the plainer attack: any page
+   you happen to be visiting can `fetch()` this API. `/api/talk` takes
+   multipart, which is CORS-safelisted, so the browser sends it with **no
+   preflight** — and the handler mints a session when the cookie is absent,
+   so `SameSite=lax` withholding the cookie doesn't stop it either. The
+   attacker can't read the reply, but the turn still runs. State-changing
+   methods (`POST`/`PUT`/`PATCH`/`DELETE`) and the WebSocket handshake are
+   now rejected with 403 unless `Origin` is absent (non-browser clients like
+   curl and `bin/hal`) or its host is in the allowlist. `Origin: null` —
+   a sandboxed iframe or `file://` page — is rejected.
+
+Agent-written files under `data/viewscreen/` are served with
+`Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so
+an SVG or HTML file the agent produces cannot run scripts against this
+origin even if opened directly. PDFs are exempt so the browser's viewer
+works.
+
+What none of this covers: anything with local shell access already, and a
+`yolo` session driven from the machine's own browser. Treat
+`HAL_PERMISSION_MODE=yolo` as "this box's browser can run commands."
 
 ## Notes
 

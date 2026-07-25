@@ -993,6 +993,89 @@ check(
 hermes_bridge.unregister_event_queue("vs-browser-1", _q1)
 hermes_bridge.unregister_event_queue("vs-browser-2", _q2)
 
+# --- cross-origin defence ------------------------------------------------------------
+# TrustedHostMiddleware stops DNS rebinding but not the plainer attack: any page
+# you are visiting can fetch() /api/talk. Multipart is CORS-safelisted (no
+# preflight) and the handler mints a session when the cookie is absent, so
+# SameSite=lax does not help. Origin is the boundary.
+
+check("same-origin request allowed",
+      main._origin_allowed("http://127.0.0.1:8000", "same-origin"))
+check("localhost origin allowed",
+      main._origin_allowed("http://localhost:8000", "same-origin"))
+check("foreign origin blocked",
+      not main._origin_allowed("https://evil.example", None))
+check("foreign origin blocked even on the right port",
+      not main._origin_allowed("https://evil.example:8000", None))
+check("Sec-Fetch-Site: cross-site blocked regardless of Origin",
+      not main._origin_allowed("http://127.0.0.1:8000", "cross-site"))
+check("opaque origin blocked (sandboxed iframe / data: URL)",
+      not main._origin_allowed("null", None))
+# curl, bin/hal and smoke.sh send no Origin; a browser always does on unsafe
+# methods, so absence means no browser is being used as a confused deputy.
+check("originless client still allowed (curl, bin/hal, smoke.sh)",
+      main._origin_allowed(None, None))
+
+_saved_hosts = list(main.ALLOWED_HOSTS)
+main.ALLOWED_HOSTS[:] = ["*"]
+check("wildcard host allowlist opts out of the origin check",
+      main._origin_allowed("https://anything.example", None))
+main.ALLOWED_HOSTS[:] = _saved_hosts
+check("allowlist restored", main.ALLOWED_HOSTS == _saved_hosts)
+
+check("GET is exempt (safe, and unreadable cross-origin anyway)",
+      "GET" not in main._UNSAFE_METHODS and "POST" in main._UNSAFE_METHODS)
+
+
+async def _exercise_cross_origin_asgi():
+    """The middleware must reject at the ASGI layer, for POST *and* sockets."""
+    sent: list[dict] = []
+
+    async def _send(message):
+        sent.append(message)
+
+    async def _receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def _unreachable(scope, receive, send):  # the app behind the guard
+        sent.append({"type": "REACHED_APP"})
+
+    guard = main.SameOriginMiddleware(_unreachable)
+    evil = [(b"origin", b"https://evil.example")]
+    good = [(b"origin", b"http://127.0.0.1:8000")]
+
+    await guard({"type": "http", "method": "POST", "path": "/api/talk", "headers": evil},
+                _receive, _send)
+    blocked_post = [m for m in sent if m.get("type") == "http.response.start"]
+    reached = any(m.get("type") == "REACHED_APP" for m in sent)
+
+    sent.clear()
+    await guard({"type": "websocket", "path": "/ws/conversation", "headers": evil},
+                _receive, _send)
+    closed_ws = [m for m in sent if m.get("type") == "websocket.close"]
+
+    sent.clear()
+    await guard({"type": "http", "method": "POST", "path": "/api/talk", "headers": good},
+                _receive, _send)
+    same_origin_ok = any(m.get("type") == "REACHED_APP" for m in sent)
+
+    sent.clear()
+    await guard({"type": "http", "method": "GET", "path": "/api/health", "headers": evil},
+                _receive, _send)
+    get_ok = any(m.get("type") == "REACHED_APP" for m in sent)
+
+    return blocked_post, reached, closed_ws, same_origin_ok, get_ok
+
+
+_xo_post, _xo_reached, _xo_ws, _xo_same, _xo_get = asyncio.run(_exercise_cross_origin_asgi())
+check("cross-origin POST is rejected with 403",
+      len(_xo_post) == 1 and _xo_post[0]["status"] == 403, repr(_xo_post))
+check("cross-origin POST never reaches the app", not _xo_reached)
+check("cross-origin WebSocket handshake is closed",
+      len(_xo_ws) == 1 and _xo_ws[0].get("code") == 1008, repr(_xo_ws))
+check("same-origin POST passes through", _xo_same)
+check("cross-origin GET passes through (safe method)", _xo_get)
+
 # --- viewscreen: agent-written files stay inert -------------------------------------
 # The panel sandboxes agent HTML in an iframe, but links images full-size —
 # and a top-level SVG document runs its scripts with this app's origin and
