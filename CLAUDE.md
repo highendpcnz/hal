@@ -52,14 +52,31 @@ npm run test:e2e                               # Playwright, ~30s, boots its own
 
 `test:e2e` covers the behaviour layer the Python suite can only reach with
 substring assertions — the session-reset path (`reset.spec.ts`), the duplex
-WebSocket protocol (`websocket.spec.ts`), and the Allow/Deny bar
-(`permission.spec.ts`). It starts its own app instance on port 8123 with
+WebSocket protocol (`websocket.spec.ts`), the Allow/Deny bar
+(`permission.spec.ts`), full-duplex/VAD mode (`duplex.spec.ts`), and the chess
+board (`chess.spec.ts`, which runs against the *real* engine since it needs no
+model). It starts its own app instance on port 8123 with
 `HAL_SKIP_MODELS=1` and `HAL_DATA_DIR=.playwright-data`, so it never loads a
 model, never runs inference, and never writes to the real `data/`. Anything
 needing a live turn belongs in `.claude/skills/run-hal/smoke.sh` instead.
 
-Two mocking techniques make the unreachable paths reachable, and both are
+**The behaviour layer's state is script-scoped, not on `window`.**
+`static/index.html`'s inline JS is a classic `<script>`, so its top-level
+`let`/`const` (`chessGame`, `isWsRecording`, `busy`, `loadChess`, `setState`, …)
+live in the script's global *lexical* environment. `window.chessGame` is
+`undefined`; the bare identifier resolves. Inside `page.evaluate` use bare
+identifiers and `declare` them in the spec for TypeScript. Reaching for
+`window.*` fails silently as `undefined`, which reads like a broken app rather
+than a broken test.
+
+Three mocking techniques make the unreachable paths reachable, and all are
 load-bearing:
+
+- **`--use-fake-device-for-media-stream`** plus `permissions: ["microphone"]`
+  makes `getUserMedia` resolve, so full-duplex can actually be switched on
+  instead of falling into its access-denied branch. The fake device emits a
+  steady tone rather than speech, so don't wait on the VAD tripping by
+  itself — drive `isWsRecording` directly for the capture-in-flight branches.
 
 - **`page.routeWebSocket`** lets a test *be* the bridge, so any frame the
   server can emit is reproducible without models or audio. Frames like

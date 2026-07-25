@@ -1,4 +1,46 @@
-import type { Page } from "@playwright/test";
+import type { Page, WebSocketRoute } from "@playwright/test";
+
+export interface Socket {
+  /** Frames the page sent us. */
+  sent: string[];
+  /** Push a server frame to the page. */
+  send: (frame: unknown) => void;
+  ready: Promise<void>;
+}
+
+/**
+ * Stand in for /ws/conversation — the test becomes the bridge.
+ *
+ * Must be installed before navigation. Not calling `connectToServer` is the
+ * point: we answer instead of the real server, so any frame it could emit is
+ * reproducible without models, inference, or audio.
+ */
+export async function mockSocket(page: Page): Promise<Socket> {
+  const sent: string[] = [];
+  let route: WebSocketRoute | null = null;
+  let markReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+
+  await page.routeWebSocket(/\/ws\/conversation/, (ws) => {
+    route = ws;
+    ws.onMessage((message) => {
+      sent.push(typeof message === "string" ? message : "<binary>");
+    });
+    markReady();
+  });
+
+  return { sent, send: (frame) => route?.send(JSON.stringify(frame)), ready };
+}
+
+/** Frames of a given type the page has sent, parsed. */
+export function framesOfType(socket: Socket, type: string): Record<string, unknown>[] {
+  return socket.sent
+    .filter((raw) => raw.includes(`"${type}"`))
+    .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .filter((frame) => frame.type === type);
+}
 
 /** Pin the direction before any page script runs — the pre-paint script reads
  *  localStorage to pick the stylesheet, so this has to land first. */

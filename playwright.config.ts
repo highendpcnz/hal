@@ -30,9 +30,19 @@ export default defineConfig({
       name: "chromium",
       use: {
         ...devices["Desktop Chrome"],
-        // The scenes are WebGL; headless Chrome needs software rasterisation
-        // to render them, and without this the optic silently never boots.
-        launchOptions: { args: ["--enable-unsafe-swiftshader"] }
+        // getUserMedia would otherwise prompt and then reject in headless,
+        // which is the only failure the duplex path cannot recover from.
+        permissions: ["microphone"],
+        launchOptions: {
+          args: [
+            // The scenes are WebGL; headless Chrome needs software
+            // rasterisation, and without this the optic silently never boots.
+            "--enable-unsafe-swiftshader",
+            // A synthetic mic so full-duplex can actually be switched on.
+            "--use-fake-device-for-media-stream",
+            "--use-fake-ui-for-media-stream"
+          ]
+        }
       }
     }
   ],

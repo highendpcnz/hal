@@ -1,6 +1,14 @@
-import { expect, test, type Page, type WebSocketRoute } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-import { captionText, eyeState, logText, opticReady, pinDirection } from "./helpers";
+import {
+  captionText,
+  eyeState,
+  logText,
+  mockSocket,
+  opticReady,
+  pinDirection,
+  type Socket
+} from "./helpers";
 
 /**
  * The full-duplex WebSocket protocol, from the client's side.
@@ -12,38 +20,6 @@ import { captionText, eyeState, logText, opticReady, pinDirection } from "./help
  * reason, an interim caption mid-recording. tests/run.py can only check that
  * the strings exist somewhere in index.html.
  */
-
-interface Socket {
-  /** Frames the page sent us. */
-  sent: string[];
-  /** Push a server frame to the page. */
-  send: (frame: unknown) => void;
-  ready: Promise<void>;
-}
-
-/** Stand in for /ws/conversation. Must be installed before navigation. */
-async function mockSocket(page: Page): Promise<Socket> {
-  const sent: string[] = [];
-  let route: WebSocketRoute | null = null;
-  let markReady: () => void;
-  const ready = new Promise<void>((resolve) => {
-    markReady = resolve;
-  });
-
-  await page.routeWebSocket(/\/ws\/conversation/, (ws) => {
-    route = ws;
-    ws.onMessage((message) => {
-      sent.push(typeof message === "string" ? message : "<binary>");
-    });
-    markReady();
-  });
-
-  return {
-    sent,
-    send: (frame: unknown) => route?.send(JSON.stringify(frame)),
-    ready
-  };
-}
 
 async function openBridge(page: Page): Promise<Socket> {
   const socket = await mockSocket(page);
