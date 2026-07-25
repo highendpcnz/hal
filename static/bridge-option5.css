@@ -1,0 +1,500 @@
+/* Direction 05 — Logic Memory Center: you are inside the machine.
+   The chamber owns the screen. Chrome is racked to the chamber's own
+   geometry rather than floating over it: a hairline top rail, the log as an
+   inscription strip down the left edge, and a bottom rail that reads as rack
+   instrumentation — we are inside the machine, so its status belongs on the
+   wall. One rule block covers desktop and tablet (the direction-scoped
+   selectors out-rank the legacy inline blocks at any width). Scoped to
+   html[data-bridge-direction="lmc"]; base/mobile in bridge-shared.css.
+   Design: docs/plans/2026-07-26-logic-memory-center-design.md.
+
+   Palette note: --lmc-memory is cold on purpose. Directions 01-04 are
+   red-on-black; here the blocks (and the type that indexes them) are pale
+   cyan-white against HAL's red room. Red never lights a memory. */
+
+@keyframes lmc-seat {
+  0% { opacity: 0; transform: translateX(-6px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+
+@media (min-width: 761px) {
+  html[data-bridge-direction="lmc"] {
+    --lmc-memory: #cfe6ea;
+    --lmc-memory-dim: #3f4d52;
+    --lmc-wash: #2a0906;
+    --lmc-hair: rgba(207, 230, 234, 0.13);
+  }
+
+  html[data-bridge-direction="lmc"] body {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 48px minmax(0, 1fr) 34px 72px;
+    width: 100vw;
+    height: 100vh;
+    gap: 0;
+    padding: 0;
+    overflow: hidden;
+    align-items: stretch;
+    align-content: stretch;
+    justify-content: stretch;
+    justify-items: stretch;
+    background: #050506;
+  }
+
+  html[data-bridge-direction="lmc"] .bridge-left {
+    display: contents;
+  }
+
+  /* --- top rail --------------------------------------------------------- */
+
+  html[data-bridge-direction="lmc"] .bridge-brand {
+    grid-area: 1 / 1 / 2 / 2;
+    display: flex;
+    flex-direction: row-reverse;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 14px;
+    padding: 0 26px;
+    border-bottom: 1px solid var(--lmc-hair);
+    background: rgba(5, 5, 6, 0.9);
+  }
+
+  html[data-bridge-direction="lmc"] .bridge-mark {
+    color: var(--lmc-memory);
+    font-family: "Azeret Mono", monospace;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="lmc"] .bridge-brand-title {
+    color: #5f6b6e;
+    font-size: 9px;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="lmc"] .bridge-rail {
+    grid-area: 1 / 2 / 2 / 3;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    border-top: 0;
+    border-bottom: 1px solid var(--lmc-hair);
+    background: rgba(5, 5, 6, 0.9);
+  }
+
+  html[data-bridge-direction="lmc"] .rail-actions {
+    display: flex;
+    align-items: stretch;
+    justify-content: flex-end;
+    gap: 2px;
+  }
+
+  html[data-bridge-direction="lmc"] .rail-action {
+    border-right: 0;
+    padding: 0 18px;
+    color: #6f7b7e;
+    font-size: 9px;
+    letter-spacing: 0.2em;
+  }
+
+  html[data-bridge-direction="lmc"] .rail-action::before {
+    display: none;
+  }
+
+  html[data-bridge-direction="lmc"] .rail-action:hover {
+    background: transparent;
+    color: var(--lmc-memory);
+    box-shadow: inset 0 -1px 0 var(--lmc-memory);
+  }
+
+  html[data-bridge-direction="lmc"] .direction-selector {
+    display: flex;
+  }
+
+  /* --- the chamber ------------------------------------------------------ */
+
+  html[data-bridge-direction="lmc"] .eye-module {
+    position: fixed;
+    inset: 48px 0 106px 0;
+    z-index: 0;
+    width: auto;
+    height: auto;
+    margin: 0;
+    aspect-ratio: auto;
+    border: 0;
+    border-radius: 0;
+    background: #050506;
+    box-shadow: none;
+    pointer-events: none;
+  }
+
+  html[data-bridge-direction="lmc"] .eye-module::before,
+  html[data-bridge-direction="lmc"] .eye-module::after,
+  html[data-bridge-direction="lmc"] .panel-slot,
+  html[data-bridge-direction="lmc"] .panel-screw,
+  html[data-bridge-direction="lmc"] .optic-retainer {
+    display: none;
+  }
+
+  html[data-bridge-direction="lmc"] .optic-stage {
+    inset: 0;
+    border-radius: 0;
+    pointer-events: none;
+  }
+
+  /* Hold anywhere in the chamber to speak. */
+  html[data-bridge-direction="lmc"] .eye-module .eye,
+  html[data-bridge-direction="lmc"] .eye-module.webgl-ready .eye {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    height: auto;
+    transform: none;
+    z-index: 5;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    pointer-events: auto;
+  }
+
+  /* WebGL failure: the shared CSS eye, centered plainly, no chamber. */
+  html[data-bridge-direction="lmc"] .eye-module:not(.webgl-ready) .eye {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: min(30vh, 260px);
+    height: min(30vh, 260px);
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+  }
+
+  /* --- the inscription strip (mission log) ------------------------------ */
+
+  html[data-bridge-direction="lmc"] .mission-log {
+    position: fixed;
+    left: 0;
+    top: 48px;
+    bottom: 106px;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    width: 306px;
+    max-width: none;
+    height: auto;
+    max-height: none;
+    margin: 0;
+    padding: 20px 18px 0 26px;
+    border: 0;
+    border-right: 1px solid var(--lmc-hair);
+    border-radius: 0;
+    background: linear-gradient(90deg, rgba(5, 5, 6, 0.94) 72%, rgba(5, 5, 6, 0));
+  }
+
+  html[data-bridge-direction="lmc"] .mission-log-header {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    /* Never compress: this header stacks a title over a button row inside a
+       column flex. Learned on direction 03. */
+    flex: 0 0 auto;
+    margin: 0 0 14px;
+    padding: 0;
+    border-bottom: 0;
+  }
+
+  html[data-bridge-direction="lmc"] .mission-log-title {
+    color: #5f6b6e;
+    font-size: 9px;
+    letter-spacing: 0.28em;
+  }
+
+  html[data-bridge-direction="lmc"] .mission-log-action {
+    border-color: var(--lmc-hair);
+    color: #6f7b7e;
+    font-size: 8px;
+    letter-spacing: 0.16em;
+  }
+
+  html[data-bridge-direction="lmc"] .mission-log-action:hover {
+    border-color: var(--lmc-memory);
+    color: var(--lmc-memory);
+  }
+
+  html[data-bridge-direction="lmc"] .mission-log-entries {
+    flex: 1 1 auto;
+    min-height: 0;
+    margin: 0;
+    padding: 0 6px 12px 0;
+    border-left: 0;
+    overflow-y: auto;
+    counter-reset: socket;
+    mask-image: linear-gradient(to bottom, black 82%, transparent);
+  }
+
+  html[data-bridge-direction="lmc"] .mlog-entry {
+    display: block;
+    position: relative;
+    padding: 7px 0 7px 46px;
+    border-bottom: 0;
+    color: #79837f;
+    font-size: 10.5px;
+    line-height: 1.62;
+    counter-increment: socket;
+    animation: lmc-seat 0.34s ease-out both;
+  }
+
+  /* The address is the structural device: these entries are an addressed
+     array, and the number is where the exchange physically sits in the rack
+     the scene is drawing. Time is not the organizing principle here, so the
+     timestamp stands down in this direction only (it is still in
+     /api/history, and directions 01-04 show it). */
+  html[data-bridge-direction="lmc"] .mlog-entry::before {
+    content: "M-" counter(socket, decimal-leading-zero);
+    position: absolute;
+    left: 0;
+    top: 7px;
+    color: var(--lmc-memory-dim);
+    font-family: "Azeret Mono", monospace;
+    font-size: 8px;
+    letter-spacing: 0.1em;
+  }
+
+  html[data-bridge-direction="lmc"] .mlog-entry .mlog-ts {
+    display: none;
+  }
+
+  html[data-bridge-direction="lmc"] .mlog-entry .mlog-body {
+    display: block;
+  }
+
+  html[data-bridge-direction="lmc"] .mlog-entry .mlog-role {
+    color: var(--lmc-memory);
+    margin-right: 7px;
+  }
+
+  html[data-bridge-direction="lmc"] .mlog-entry.mlog-hal {
+    color: #93a09c;
+  }
+
+  html[data-bridge-direction="lmc"] .mlog-entry .mlog-tool-icon {
+    color: var(--signal);
+  }
+
+  html[data-bridge-direction="lmc"] .mlog-entry.mlog-system {
+    color: #4e5856;
+  }
+
+  /* --- voice chrome ----------------------------------------------------- */
+
+  html[data-bridge-direction="lmc"] .waveform-wrap {
+    position: fixed;
+    inset: 0;
+    z-index: 25;
+    display: block;
+    width: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    pointer-events: none;
+  }
+
+  html[data-bridge-direction="lmc"] .optic-status-row {
+    position: absolute;
+    right: 30px;
+    top: 66px;
+    display: flex;
+    gap: 14px;
+  }
+
+  html[data-bridge-direction="lmc"] .voice-instruction {
+    position: absolute;
+    right: 30px;
+    bottom: 124px;
+    display: block;
+    max-width: 210px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    color: #667270;
+    font-family: "Azeret Mono", monospace;
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    line-height: 1.9;
+    text-align: right;
+    text-transform: uppercase;
+  }
+
+  html[data-bridge-direction="lmc"] .waveform-canvas {
+    position: absolute;
+    right: 30px;
+    bottom: 168px;
+    display: block;
+    width: 210px;
+    height: 34px;
+    margin: 0;
+    opacity: 0.5;
+  }
+
+  /* --- hero caption ----------------------------------------------------- */
+
+  html[data-bridge-direction="lmc"] .caption {
+    position: fixed;
+    left: 356px;
+    right: 30px;
+    bottom: 132px;
+    top: auto;
+    transform: none;
+    max-width: none;
+    z-index: 30;
+    color: #e6efef;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: clamp(15px, 1.5vw, 21px);
+    font-weight: 400;
+    letter-spacing: 0.01em;
+    line-height: 1.55;
+    text-align: left;
+    text-transform: none;
+  }
+
+  html[data-bridge-direction="lmc"] .ticker {
+    position: fixed;
+    left: 356px;
+    bottom: 112px;
+    z-index: 30;
+    color: #5c6664;
+    font-size: 9px;
+    letter-spacing: 0.18em;
+  }
+
+  /* --- rack instrumentation (telemetry) --------------------------------- */
+
+  html[data-bridge-direction="lmc"] .telemetry {
+    grid-area: 3 / 1 / 4 / 3;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 34px;
+    width: auto;
+    margin: 0;
+    padding: 0 26px;
+    border: 0;
+    border-top: 1px solid var(--lmc-hair);
+    border-radius: 0;
+    background: rgba(5, 5, 6, 0.92);
+    z-index: 22;
+  }
+
+  html[data-bridge-direction="lmc"] .telemetry-cell {
+    flex: 0 0 auto;
+    padding: 0;
+    border: 0;
+  }
+
+  html[data-bridge-direction="lmc"] .telemetry-label {
+    color: #4b5553;
+    font-size: 7.5px;
+    letter-spacing: 0.22em;
+  }
+
+  html[data-bridge-direction="lmc"] .telemetry-value {
+    color: #8d9997;
+    font-size: 10px;
+  }
+
+  /* --- command bar ------------------------------------------------------ */
+
+  html[data-bridge-direction="lmc"] .bridge-command {
+    grid-area: 4 / 1 / 5 / 3;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin: 0;
+    padding: 0 26px;
+    border: 0;
+    border-top: 1px solid var(--lmc-hair);
+    border-radius: 0;
+    background: rgba(5, 5, 6, 0.96);
+    z-index: 22;
+  }
+
+  html[data-bridge-direction="lmc"] .bridge-command input {
+    color: #e6efef;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+  }
+
+  html[data-bridge-direction="lmc"] .bridge-command input::placeholder {
+    color: #4b5553;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+
+  /* --- summoned surfaces: only while they are real ---------------------- */
+
+  html[data-bridge-direction="lmc"] .missions-panel,
+  html[data-bridge-direction="lmc"] .chess-panel,
+  html[data-bridge-direction="lmc"] .viewscreen-panel {
+    position: fixed;
+    right: 30px;
+    top: 108px;
+    z-index: 26;
+    width: 290px;
+    max-width: none;
+    margin: 0;
+    padding: 14px 16px;
+    border: 1px solid var(--lmc-hair);
+    border-radius: 0;
+    background: rgba(6, 8, 9, 0.94);
+  }
+
+  html[data-bridge-direction="lmc"] .missions-panel {
+    top: auto;
+    bottom: 220px;
+  }
+
+  html[data-bridge-direction="lmc"] .missions-title,
+  html[data-bridge-direction="lmc"] .chess-title,
+  html[data-bridge-direction="lmc"] .vs-title {
+    color: #5f6b6e;
+    font-size: 8.5px;
+    letter-spacing: 0.24em;
+  }
+
+  html[data-bridge-direction="lmc"] .mission-card {
+    border-color: var(--lmc-hair);
+    border-radius: 0;
+    background: rgba(207, 230, 234, 0.03);
+  }
+
+  html[data-bridge-direction="lmc"] .mission-card-title {
+    color: var(--lmc-memory);
+  }
+
+  /* Permission and proposal bars keep HAL's red: they are the room talking,
+     not the memory. */
+  html[data-bridge-direction="lmc"] .permbar,
+  html[data-bridge-direction="lmc"] .propbar {
+    border-radius: 0;
+    border-color: rgba(255, 45, 31, 0.4);
+  }
+
+  /* Legacy pre-directions chrome from index.html's inline styles. The fixed
+     Systems pill in particular lands on top of the direction selector. */
+  html[data-bridge-direction="lmc"] .monitor-tab,
+  html[data-bridge-direction="lmc"] .hint,
+  html[data-bridge-direction="lmc"] .log,
+  html[data-bridge-direction="lmc"] .cmdline {
+    display: none !important;
+  }
+}
+
+@media (min-width: 761px) and (prefers-reduced-motion: reduce) {
+  html[data-bridge-direction="lmc"] .mlog-entry {
+    animation: none;
+  }
+}

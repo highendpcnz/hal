@@ -1345,10 +1345,35 @@ _frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
 _directions_src = (_frontend_dir / "directions.ts").read_text()
 _entry_src = (_frontend_dir / "hal-optic.ts").read_text()
 
+# Direction 05 stages the memory extraction on session reset. The hook is
+# optional by contract, so the risk is the *caller* silently dropping it —
+# and a scene that hangs must never strand the reset behind it.
+_reset_body = _fn_body("resetSession")
+check(
+    "resetSession awaits the direction's session-end hook",
+    "playSessionEnd" in _reset_body,
+    _reset_body,
+)
+check(
+    "session-end hook is time-boxed so a hung scene can't strand the reset",
+    "Promise.race" in _reset_body and "setTimeout" in _reset_body,
+    _reset_body,
+)
+check(
+    "session-end hook is optional (directions 01-04 don't implement it)",
+    "playSessionEnd?." in _reset_body,
+    _reset_body,
+)
+check(
+    "the optic contract declares playSessionEnd optional",
+    "playSessionEnd?:" in (Path(__file__).resolve().parent.parent
+                           / "frontend" / "optic-api.ts").read_text(),
+)
+
 _manifests = re.findall(
     r'id:\s*"([a-z]+)".*?ready:\s*(true|false)', _directions_src, flags=re.S
 )
-check("directions.ts declares four manifests", len(_manifests) == 4, repr(_manifests))
+check("directions.ts declares five manifests", len(_manifests) == 5, repr(_manifests))
 _ready_ids = [mid for mid, ready in _manifests if ready == "true"]
 _default_match = re.search(r'ACTIVE_DIRECTION:\s*BridgeDirectionId\s*=\s*"([a-z]+)"', _directions_src)
 _default_id = _default_match.group(1) if _default_match else None

@@ -11,6 +11,16 @@ export interface HalOpticApi {
   setAudioEnergy: (energy: number) => void;
   setState: (state: HalVisualState) => void;
   setToolKind: (kind: HalToolKind) => void;
+  /**
+   * Optional farewell before the page reloads into a fresh session.
+   *
+   * `resetSession()` awaits this — behind a timeout, so a hung scene can
+   * never strand the reset — after the user confirms and the POST lands,
+   * but before `location.reload()`. Optional by design: directions that
+   * have nothing to say about a session ending simply omit it and are
+   * unaffected. Direction 05 uses it to play the memory extraction.
+   */
+  playSessionEnd?: () => Promise<void>;
 }
 
 export type CreateOptic = (container: HTMLElement, eye: HTMLElement) => HalOpticApi;

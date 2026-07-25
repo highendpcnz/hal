@@ -1138,13 +1138,14 @@
 <link rel="stylesheet" href="/static/bridge-option2.css" data-direction-style="orrery" disabled />
 <link rel="stylesheet" href="/static/bridge-option3.css" data-direction-style="vault" disabled />
 <link rel="stylesheet" href="/static/bridge-option4.css" data-direction-style="chorus" disabled />
+<link rel="stylesheet" href="/static/bridge-option5.css" data-direction-style="lmc" disabled />
 <script>
   // Pre-paint direction pick: enable the selected direction's stylesheet
   // before the body parses so switching never flashes the wrong shell.
   // READY_DIRECTIONS and the storage key mirror frontend/directions.ts and
   // frontend/hal-optic.ts (asserted by tests/run.py) — keep them in sync.
   (function () {
-    var READY_DIRECTIONS = ["aperture", "orrery", "vault", "chorus"];
+    var READY_DIRECTIONS = ["aperture", "orrery", "vault", "chorus", "lmc"];
     var direction = READY_DIRECTIONS[0];
     try {
       var stored = localStorage.getItem("hal_direction");
@@ -1303,6 +1304,7 @@
       <button class="direction-option" type="button" data-direction-id="orrery" aria-label="Select Cognitive Orrery">02</button>
       <button class="direction-option" type="button" data-direction-id="vault" aria-label="Select Signal Vault">03</button>
       <button class="direction-option" type="button" data-direction-id="chorus" aria-label="Select Ember Chorus">04</button>
+      <button class="direction-option" type="button" data-direction-id="lmc" aria-label="Select Logic Memory Center">05</button>
     </div>
   </nav>
 
@@ -2986,6 +2988,17 @@
       await fetch('/api/session/reset', { method: 'POST', credentials: 'same-origin' });
     } catch (e) {
       console.error('session reset failed', e);
+    }
+    // Let the direction say goodbye to the memory it was rendering, if it has
+    // anything to say (direction 05 plays the extraction). Optional and
+    // time-boxed: a scene that hangs must never strand the reset.
+    try {
+      await Promise.race([
+        window.HALOptic?.playSessionEnd?.() ?? Promise.resolve(),
+        new Promise(resolve => setTimeout(resolve, 4000))
+      ]);
+    } catch (e) {
+      console.warn('session-end animation failed', e);
     }
     // New cookie means new event-stream identity — reload to rebind everything.
     location.reload();

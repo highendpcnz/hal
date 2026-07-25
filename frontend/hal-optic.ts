@@ -20,7 +20,8 @@ const SCENE_LOADERS: Record<BridgeDirectionId, () => Promise<{ createOptic: Crea
   aperture: () => import("./optic-aperture"),
   orrery: () => import("./optic-orrery"),
   vault: () => import("./optic-vault"),
-  chorus: () => import("./optic-chorus")
+  chorus: () => import("./optic-chorus"),
+  lmc: () => import("./optic-lmc")
 };
 
 function resolveDirection(): BridgeDirectionManifest {
