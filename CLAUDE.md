@@ -51,9 +51,10 @@ npm run test:e2e                               # Playwright, ~30s, boots its own
 ```
 
 `test:e2e` covers the behaviour layer the Python suite can only reach with
-substring assertions. 41 tests across six specs: the session-reset path
-(`reset.spec.ts`), the duplex WebSocket protocol (`websocket.spec.ts`), the
-Allow/Deny bar (`permission.spec.ts`), full-duplex/VAD mode
+substring assertions. 43 tests across six specs: the session-reset path
+(`reset.spec.ts`), push-to-talk and duplex WebSocket transport
+(`websocket.spec.ts`), the Allow/Deny bar (`permission.spec.ts`),
+full-duplex/VAD mode
 (`duplex.spec.ts`), the chess board (`chess.spec.ts`, which runs against the
 *real* engine since it needs no model), and the proposal bar, missions panel
 and viewscreen (`surfaces.spec.ts`). It starts its own app instance on port 8123 with

@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ["HAL_SKIP_MODELS"] = "1"
@@ -202,6 +203,33 @@ check("wake rejects embedded hal", main._WAKE_RE.match("Halt the presses") is No
 check(
     "wake keeps the remainder",
     main._WAKE_RE.match("HAL, start mission scan logs").group(1).strip() == "start mission scan logs",
+)
+check(
+    "wake mode gates ambient duplex speech",
+    main._wake_word_required(
+        from_speech=True,
+        wake_gated=True,
+        manual_capture=False,
+        enrollment_pending=False,
+    ),
+)
+check(
+    "manual push-to-talk bypasses wake mode",
+    not main._wake_word_required(
+        from_speech=True,
+        wake_gated=True,
+        manual_capture=True,
+        enrollment_pending=False,
+    ),
+)
+check(
+    "voice enrollment bypasses wake mode",
+    not main._wake_word_required(
+        from_speech=True,
+        wake_gated=True,
+        manual_capture=False,
+        enrollment_pending=True,
+    ),
 )
 
 # --- SSE event aliasing (missions) -------------------------------------------
@@ -621,6 +649,159 @@ check(
     "assembler splits multiple sentences in one chunk",
     _asm4.feed("One. Two! Three? Four") == ["One.", "Two!", "Three?"],
 )
+_asm5 = main.SentenceAssembler()
+_early_phrase = "I have checked every local voice component on the bridge, "
+check(
+    "assembler emits a sufficiently long phrase at a natural pause",
+    _asm5.feed(_early_phrase)
+    == ["I have checked every local voice component on the bridge,"],
+)
+_phrase_tail = "and the remaining systems are still responding normally."
+check(
+    "assembler completes the sentence after an early phrase",
+    _asm5.feed(_phrase_tail)
+    == ["and the remaining systems are still responding normally."],
+)
+_asm5_whole = main.SentenceAssembler()
+check(
+    "assembler keeps an already-complete sentence in one chunk",
+    _asm5_whole.feed(_early_phrase + _phrase_tail)
+    == [(_early_phrase + _phrase_tail).strip()],
+)
+check(
+    "phrase streaming preserves the complete reply text",
+    " ".join([
+        "I have checked every local voice component on the bridge,",
+        "and the remaining systems are still responding normally.",
+    ])
+    == (_early_phrase + _phrase_tail).strip(),
+)
+_asm6 = main.SentenceAssembler()
+check("assembler does not split a short reply at a comma", _asm6.feed("Ready, ") == [])
+check("assembler keeps the short reply whole", _asm6.feed("Dave.") == ["Ready, Dave."])
+_asm7 = main.SentenceAssembler()
+check(
+    "phrase streaming still holds an open code fence",
+    _asm7.feed(
+        "I will keep this complete code sample out of the spoken reply: "
+        "```txt\nalpha, beta; gamma:"
+    )
+    == [],
+)
+check(
+    "phrase streaming releases a closed code fence whole",
+    _asm7.feed("\n``` Finished.") == [
+        "I will keep this complete code sample out of the spoken reply: "
+        "```txt\nalpha, beta; gamma:\n``` Finished."
+    ],
+)
+_asm8 = main.SentenceAssembler()
+_bounded = _asm8.feed("word " * 50)
+check(
+    "assembler bounds long unpunctuated commentary at a word boundary",
+    bool(_bounded)
+    and all(len(part) <= main._COMMENTARY_PHRASE_MAX_CHARS for part in _bounded)
+    and all(part.endswith("word") for part in _bounded),
+    repr(_bounded),
+)
+_asm9 = main.SentenceAssembler()
+check(
+    "phrase streaming holds a comma inside inline code",
+    _asm9.feed(
+        "I have verified every relevant bridge value, including `alpha, beta"
+    )
+    == [],
+)
+check(
+    "phrase streaming releases complete inline code at a later pause",
+    _asm9.feed("`, and the remaining values are stable, ")
+    == [
+        "I have verified every relevant bridge value, including "
+        "`alpha, beta`,"
+    ],
+)
+_asm10 = main.SentenceAssembler()
+check(
+    "phrase streaming holds punctuation inside a Markdown link",
+    _asm10.feed(
+        "I have checked the detailed bridge reference "
+        "[in the manual](https://example.test/alpha,beta"
+    )
+    == [],
+)
+check(
+    "phrase streaming releases a complete Markdown link at a later pause",
+    _asm10.feed("), and the documented behavior is correct, ")
+    == [
+        "I have checked the detailed bridge reference "
+        "[in the manual](https://example.test/alpha,beta),"
+    ],
+)
+
+
+def _exercise_phrase_commentary_turn():
+    original_run_turn = main.run_turn_text
+    original_send_tts = main._ws_send_tts
+    original_commentary = main.COMMENTARY
+    reply = _early_phrase + _phrase_tail
+
+    class _Socket:
+        def __init__(self):
+            self.frames: list[dict] = []
+            self.spoken: list[str] = []
+
+        async def send_json(self, payload):
+            self.frames.append(payload)
+
+    async def fake_run_turn(session_id, _user_text, _speaker):
+        sink = hermes_bridge._commentary_sinks[session_id]
+        sink(_early_phrase)
+        sink(_phrase_tail)
+        return reply, {"infer": 1}
+
+    async def fake_send_tts(websocket, text):
+        websocket.spoken.append(text)
+
+    async def drive():
+        websocket = _Socket()
+        await main._ws_run_turn(websocket, "phrase-turn", "status")
+        return websocket
+
+    main.run_turn_text = fake_run_turn
+    main._ws_send_tts = fake_send_tts
+    main.COMMENTARY = True
+    try:
+        return asyncio.run(drive()), reply
+    finally:
+        main.run_turn_text = original_run_turn
+        main._ws_send_tts = original_send_tts
+        main.COMMENTARY = original_commentary
+
+
+_phrase_socket, _phrase_reply = _exercise_phrase_commentary_turn()
+_phrase_frames = [
+    frame["text"]
+    for frame in _phrase_socket.frames
+    if frame.get("type") == "commentary"
+]
+_final_frames = [
+    frame["text"]
+    for frame in _phrase_socket.frames
+    if frame.get("type") == "transcript" and frame.get("role") == "hal"
+]
+check(
+    "commentary turn speaks the early phrase and remaining sentence",
+    _phrase_frames == [
+        "I have checked every local voice component on the bridge,",
+        "and the remaining systems are still responding normally.",
+    ],
+    repr(_phrase_frames),
+)
+check(
+    "commentary keeps the final transcript exact",
+    _final_frames == [_phrase_reply],
+    repr(_final_frames),
+)
 
 
 def _exercise_commentary_sink():
@@ -769,9 +950,26 @@ check(
     "latency ring keeps the newest",
     main._recent_timings[-1]["infer"] == 149 and main._recent_timings[-1]["turn"] == 249,
 )
+main._record_timing({"stt": 41, "infer": 149, "total": 191})
+check(
+    "latency ring keeps stage detail",
+    main._recent_timings[-1]["stt"] == 41 and main._recent_timings[-1]["total"] == 191,
+)
 main._record_timing({})
 check("empty timings are not recorded", main._recent_timings[-1]["infer"] == 149)
 main._recent_timings.clear()
+
+main._STT_LOCK.acquire()
+try:
+    _interim_started = time.perf_counter()
+    _interim_text = main.transcribe(b"", beam_size=1, wait_for_lock=False)
+    _interim_elapsed = time.perf_counter() - _interim_started
+finally:
+    main._STT_LOCK.release()
+check(
+    "interim STT never queues behind a busy final decode",
+    _interim_text == "" and _interim_elapsed < 0.05,
+)
 
 check("vitals parse valid", mc._parse_vitals({"disk_free_gb_below": 20}) == {"disk_free_gb_below": 20.0})
 check("vitals parse rejects junk", mc._parse_vitals({"disk_free_gb_below": "lots"}) is None)

@@ -27,7 +27,7 @@ A voice turn flows:
 
 ```
 browser (eye press / space bar / duplex VAD / typed input)
-  └─ POST /api/talk | POST /api/say | WS /ws/conversation
+  └─ WS /ws/conversation preferred | POST /api/talk and /api/say fallback
        ├─ faster-whisper → transcript
        ├─ run_turn_text() — command grammar first (permission/proposal
        │    replies, enrollment, ledger, missions, chess), else:

@@ -5,6 +5,8 @@ export interface Socket {
   sent: string[];
   /** Push a server frame to the page. */
   send: (frame: unknown) => void;
+  /** Push raw PCM bytes from the server to the page. */
+  sendBinary: (frame: Buffer) => void;
   ready: Promise<void>;
 }
 
@@ -31,7 +33,12 @@ export async function mockSocket(page: Page): Promise<Socket> {
     markReady();
   });
 
-  return { sent, send: (frame) => route?.send(JSON.stringify(frame)), ready };
+  return {
+    sent,
+    send: (frame) => route?.send(JSON.stringify(frame)),
+    sendBinary: (frame) => route?.send(frame),
+    ready
+  };
 }
 
 /**

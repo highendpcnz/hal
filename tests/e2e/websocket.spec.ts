@@ -3,6 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import {
   captionText,
   eyeState,
+  framesOfType,
   logText,
   mockSocket,
   opticReady,
@@ -58,6 +59,40 @@ test.describe("websocket protocol", () => {
     expect(frame).toEqual({ type: "text_input", text: "status report" });
   });
 
+  test("push-to-talk prefers the socket and preserves audio frame order", async ({ page }) => {
+    let talkRequests = 0;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/talk") talkRequests += 1;
+    });
+    const socket = await openBridge(page);
+
+    await page.dispatchEvent("#eye", "mousedown", { button: 0 });
+    await expect.poll(() => eyeState(page)).toContain("listening");
+    await page.waitForTimeout(300);
+    await page.dispatchEvent("#eye", "mouseup", { button: 0 });
+
+    await expect.poll(() => framesOfType(socket, "start_speech").length).toBe(1);
+    expect(framesOfType(socket, "start_speech")[0]).toEqual({
+      type: "start_speech",
+      manual: true
+    });
+    await expect
+      .poll(() => socket.sent.filter((frame) => frame === "<binary>").length)
+      .toBeGreaterThanOrEqual(1);
+    await expect.poll(() => framesOfType(socket, "end_speech").length).toBe(1);
+
+    const start = socket.sent.findIndex((frame) => frame.includes("start_speech"));
+    const firstAudio = socket.sent.indexOf("<binary>");
+    const lastAudio = socket.sent.lastIndexOf("<binary>");
+    const end = socket.sent.findIndex((frame) => frame.includes("end_speech"));
+    expect(start).toBeLessThan(firstAudio);
+    expect(lastAudio).toBeLessThan(end);
+    expect(talkRequests).toBe(0);
+
+    socket.send({ type: "turn_aborted", reason: "no_speech", text: "" });
+    await expect.poll(() => eyeState(page)).toEqual([]);
+  });
+
   test("the wake-mode frame is sent as soon as the socket opens", async ({ page }) => {
     const socket = await openBridge(page);
     await expect.poll(() => socket.sent.some((f) => f.includes("set_mode"))).toBe(true);
@@ -110,6 +145,30 @@ test.describe("websocket protocol", () => {
 
     socket.send({ type: "turn_done" });
     await expect.poll(() => eyeState(page), { timeout: 8000 }).toEqual([]);
+  });
+
+  test("commentary phrases queue PCM instead of overlapping it", async ({ page }) => {
+    const socket = await openBridge(page);
+    await page.mouse.click(5, 5); // trusted gesture primes the AudioContext
+    const oneSecondOfPcm = Buffer.alloc(22050 * 2);
+
+    socket.send({ type: "commentary", text: "First phrase, Dave." });
+    socket.send({ type: "tts_start", sample_rate: 22050 });
+    socket.sendBinary(oneSecondOfPcm);
+    socket.send({ type: "tts_done" });
+    socket.send({ type: "commentary", text: "Second phrase, Dave." });
+    socket.send({ type: "tts_start", sample_rate: 22050 });
+    socket.sendBinary(oneSecondOfPcm);
+    socket.send({ type: "tts_done" });
+    socket.send({ type: "turn_done" });
+
+    await expect.poll(() => eyeState(page)).toContain("speaking");
+    await page.waitForTimeout(1300);
+    expect(
+      await eyeState(page),
+      "two one-second phrases must still be playing after 1.3 seconds"
+    ).toContain("speaking");
+    await expect.poll(() => eyeState(page), { timeout: 5000 }).toEqual([]);
   });
 
   test("a tts cycle outside commentary does release the turn", async ({ page }) => {

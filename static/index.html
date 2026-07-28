@@ -2206,7 +2206,15 @@
   // ═══════════════════════════════════════════════════
   function turnDone() {
     stopThinkingTimer();
+    // Retire both scheduled-audio waiters and binary frames that may still be
+    // decoding from the turn we are closing. A late frame must not put the eye
+    // back into speaking after the UI has returned to standby.
+    wsPlaybackGen++;
+    wsPlaybackEpoch++;
+    wsPendingChunks = 0;
     setState('idle');
+    wsNextTime = 0;
+    wsStarted = false;
     // In duplex mode the mic stays hot between turns; keep its waveform alive.
     if (!duplexEnabled) stopWaveform();
     busy = false;
@@ -2228,12 +2236,17 @@
       URL.revokeObjectURL(currentBlobUrl);
       currentBlobUrl = null;
     }
-    if (streamPlayback) {
+    if (streamPlayback || wsPendingChunks || wsNextTime || commentaryActive) {
       wsPlaybackGen++;  // cancel any pending WS tts_done drain-wait
-      streamPlayback.cancelled = true;
-      try { streamPlayback.reader.cancel(); } catch (e) {}
-      streamPlayback.sources.forEach(s => { try { s.stop(); } catch (e) {} });
+      wsPlaybackEpoch++;
+      wsPendingChunks = 0;
+      if (streamPlayback) streamPlayback.cancelled = true;
+      try { streamPlayback?.reader.cancel(); } catch (e) {}
+      streamPlayback?.sources.forEach(s => { try { s.stop(); } catch (e) {} });
       streamPlayback = null;
+      commentaryActive = false;
+      wsNextTime = 0;
+      wsStarted = false;
       stopped = true;
     }
     if (resumeCleanup) { resumeCleanup(); resumeCleanup = null; }
@@ -2433,7 +2446,9 @@
   let wsNextTime = 0;
   let wsStarted = false;
   let wsTurn = false;  // the in-flight turn belongs to the WebSocket transport
-  let wsPlaybackGen = 0;  // bumped when WS playback is torn down or superseded
+  let wsPlaybackGen = 0;  // invalidates obsolete tts_done drain waiters
+  let wsPlaybackEpoch = 0;  // invalidates binary frames after teardown
+  let wsPendingChunks = 0;  // frames received but not scheduled by WebAudio yet
   let announceSignalled = false;  // this socket has been told we can hear
   // Running commentary: one tts cycle per sentence, so tts_done no longer
   // means the turn is over — turn_done is the unlock signal instead.
@@ -2468,12 +2483,14 @@
           }
         } else if (msg.type === 'tts_start') {
           stopThinkingTimer();
-          wsPlaybackGen++;  // a new reply supersedes any drain-wait in flight
+          // A later commentary phrase supersedes the prior phrase's drain
+          // waiter, but it must keep the same playback cursor so its PCM queues
+          // after audio that is already scheduled instead of overlapping it.
+          wsPlaybackGen++;
           wsSampleRate = msg.sample_rate || 22050;
-          wsNextTime = 0;
           wsStarted = false;
         } else if (msg.type === 'commentary') {
-          // A sentence HAL is speaking while the turn still runs — caption
+          // A phrase HAL is speaking while the turn still runs — caption
           // it live; the full reply lands in the log via the final
           // transcript frame.
           commentaryActive = true;
@@ -2485,11 +2502,7 @@
           // marks synthesis done — playback is still draining. Hold the turn
           // open until the scheduled audio actually finishes.
           const gen = wsPlaybackGen;
-          const ctx = audioCtx;
-          do {
-            await new Promise(r => setTimeout(r, 100));
-          } while (wsPlaybackGen === gen && ctx && ctx.currentTime < wsNextTime);
-          if (wsPlaybackGen !== gen) return;  // barge-in or a newer reply owns the state
+          if (!await waitForWsPlayback(gen)) return;
           if (commentaryActive) return;  // per-sentence cycle — turn_done unlocks
           streamPlayback = null;
           turnDone();
@@ -2497,12 +2510,8 @@
           // Commentary turn finished server-side; wait for scheduled audio
           // to drain, then unlock.
           const gen = wsPlaybackGen;
-          const ctx = audioCtx;
-          do {
-            await new Promise(r => setTimeout(r, 100));
-          } while (wsPlaybackGen === gen && ctx && ctx.currentTime < wsNextTime);
+          if (!await waitForWsPlayback(gen)) return;
           commentaryActive = false;
-          if (wsPlaybackGen !== gen) return;
           streamPlayback = null;
           turnDone();
         } else if (msg.type === 'turn_aborted') {
@@ -2549,6 +2558,20 @@
   }
   connectWS();
 
+  async function waitForWsPlayback(gen) {
+    // Binary WebSocket events can still be awaiting arrayBuffer() or a
+    // suspended AudioContext when the following string frame arrives. Wait
+    // for those frames to be scheduled before using the playback cursor.
+    while (wsPlaybackGen === gen) {
+      await new Promise(r => setTimeout(r, 100));
+      const ctx = audioCtx;
+      if (wsPendingChunks === 0 && (!ctx || ctx.currentTime >= wsNextTime)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // Any first interaction (typing counts — Bridge users may never click the
   // eye) unlocks audio and lets queued trigger reports through.
   ['pointerdown', 'keydown'].forEach(evt =>
@@ -2556,31 +2579,40 @@
   );
 
   async function playWsChunk(blob) {
-    primePlayback();
-    const ctx = audioCtx;
-    if (ctx.state === 'suspended') await ctx.resume();
+    const epoch = wsPlaybackEpoch;
+    wsPendingChunks++;
+    try {
+      primePlayback();
+      const ctx = audioCtx;
+      if (ctx.state === 'suspended') await ctx.resume();
 
-    const arrayBuffer = await blob.arrayBuffer();
-    const ints = new Int16Array(arrayBuffer);
-    const buf = ctx.createBuffer(1, ints.length, wsSampleRate);
-    const floats = buf.getChannelData(0);
-    for (let i = 0; i < ints.length; i++) floats[i] = ints[i] / 32768;
+      const arrayBuffer = await blob.arrayBuffer();
+      if (epoch !== wsPlaybackEpoch) return;
+      const ints = new Int16Array(arrayBuffer);
+      const buf = ctx.createBuffer(1, ints.length, wsSampleRate);
+      const floats = buf.getChannelData(0);
+      for (let i = 0; i < ints.length; i++) floats[i] = ints[i] / 32768;
 
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
 
-    if (!streamPlayback) streamPlayback = { sources: new Set(), cancelled: false };
-    streamPlayback.sources.add(src);
-    src.onended = () => { if (streamPlayback) streamPlayback.sources.delete(src); };
+      if (!streamPlayback) streamPlayback = { sources: new Set(), cancelled: false };
+      streamPlayback.sources.add(src);
+      src.onended = () => { if (streamPlayback) streamPlayback.sources.delete(src); };
 
-    if (wsNextTime < ctx.currentTime + 0.02) wsNextTime = ctx.currentTime + 0.05;
-    src.start(wsNextTime);
-    wsNextTime += buf.duration;
+      if (wsNextTime < ctx.currentTime + 0.02) wsNextTime = ctx.currentTime + 0.05;
+      src.start(wsNextTime);
+      wsNextTime += buf.duration;
 
-    if (!wsStarted) {
-      wsStarted = true;
-      setState('speaking');
+      if (!wsStarted) {
+        wsStarted = true;
+        setState('speaking');
+      }
+    } finally {
+      if (epoch === wsPlaybackEpoch) {
+        wsPendingChunks = Math.max(0, wsPendingChunks - 1);
+      }
     }
   }
 
@@ -2763,13 +2795,35 @@
     const mime = recorder.mimeType || 'audio/webm';
     const ext = mime.includes('mp4') ? 'mp4' : mime.includes('ogg') ? 'ogg' : 'webm';
     const blob = new Blob(chunks, { type: mime });
+    chunks = [];
     recorder = null;
-
-    const form = new FormData();
-    form.append('audio', blob, 'audio.' + ext);
 
     setState('thinking');
     startThinkingTimer();
+
+    // Prefer the already-open conversation socket. Besides avoiding another
+    // request, this lets the server display the transcript as soon as STT
+    // finishes and speak complete sentences while Hermes is still working.
+    if (supportsStreaming && ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        // Resolve the Blob before sending start_speech. WebSocket may read a
+        // Blob asynchronously, which can otherwise let end_speech overtake it.
+        const audioBytes = new Uint8Array(await blob.arrayBuffer());
+        if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('socket closed');
+        wsTurn = true;
+        ws.send(JSON.stringify({ type: 'start_speech', manual: true }));
+        for (let offset = 0; offset < audioBytes.length; offset += 256 * 1024) {
+          ws.send(audioBytes.slice(offset, offset + 256 * 1024));
+        }
+        ws.send(JSON.stringify({ type: 'end_speech' }));
+        return;
+      } catch (err) {
+        wsTurn = false;  // fall through to the HTTP compatibility path
+      }
+    }
+
+    const form = new FormData();
+    form.append('audio', blob, 'audio.' + ext);
     try {
       const res = await fetch('/api/talk' + (supportsStreaming ? '?stream=1' : ''), {
         method: 'POST', body: form, credentials: 'same-origin',

@@ -26,7 +26,7 @@ to run fully local with zero cloud API keys:
 
 ```
 browser (hold-to-talk)
-  └─ POST /api/talk (webm/mp4 audio)
+  └─ WS /ws/conversation (POST /api/talk fallback; webm/mp4 audio)
        ├─ faster-whisper  → transcript
        ├─ persistent hermes-acp process (Agent Client Protocol over stdio)
        │    · session/prompt per turn — no CLI startup cost (~4s/turn all-in)
@@ -39,7 +39,8 @@ browser (hold-to-talk)
 ```
 
 The bridge speaks ACP through the official `agent-client-protocol` library
-(installed in the Hermes venv as the `hermes-agent[acp]` extra). Set
+(included in `requirements.txt`, and in the Hermes venv through the
+`hermes-agent[acp]` extra). Set
 `HAL_BRIDGE=subprocess` to fall back to the original one-`hermes chat -Q`
 -per-turn bridge if ACP ever misbehaves.
 
@@ -119,6 +120,11 @@ regardless of `HAL_STT_BEAM` so they hold the shared STT lock briefly; if
 captions still aren't worth it to you, `HAL_INTERIM_STT=0` removes them
 entirely and frees the whole STT pipeline for the real transcript.
 
+The browser prefers the WebSocket for push-to-talk. It can therefore show
+the final user transcript immediately after STT and speak natural commentary
+phrases while Hermes is still working. `/api/talk` remains the compatibility
+fallback when the socket or streaming audio support is unavailable.
+
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `HAL_PORT` / `HAL_HOST` | `8000` / `127.0.0.1` | bind address (keep loopback; there is no auth) |
@@ -164,7 +170,7 @@ entirely and frees the whole STT pipeline for the real transcript.
 
 - `GET /` — the eye (hold it, or hold the space bar, to speak; press the eye
   while HAL is talking to barge in; `/` opens a typed command line)
-- `POST /api/talk` — multipart audio in, WAV out (`X-User-Transcript` /
+- `POST /api/talk` — HTTP fallback: multipart audio in, WAV out (`X-User-Transcript` /
   `X-Hal-Transcript` response headers, truncated to 2000 chars; full text
   in `/api/history`). Add `?stream=1` for raw 16-bit mono PCM (`audio/L16`,
   rate in `X-Hal-Sample-Rate`) streamed sentence-by-sentence as Piper
@@ -189,8 +195,8 @@ entirely and frees the whole STT pipeline for the real transcript.
   answers a pending `ask`-mode tool-permission request (the Allow/Deny bar)
 - `GET /api/events` — SSE stream of tool-call/permission/mission events for
   the eye; mission-owned events carry a `mission_session` tag
-- `WS /ws/conversation` — full-duplex channel used by the Bridge UI and duplex
-  mode: client sends `start_speech` + binary audio + `end_speech` (or
+- `WS /ws/conversation` — preferred channel for push-to-talk, typed input, and
+  duplex mode: client sends `start_speech` + binary audio + `end_speech` (or
   `text_input`, or `set_mode` to toggle the wake-word gate), server answers
   with `transcript` frames, `tts_start`, raw PCM, `tts_done` — plus
   `interim_transcript` while you're still speaking — or `turn_aborted` when

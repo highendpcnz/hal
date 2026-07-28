@@ -486,8 +486,14 @@ def _stt_device() -> str:
     return STT.model.device if STT is not None else "n/a"
 
 
-def transcribe(audio_bytes: bytes, beam_size: int | None = None) -> str:
-    with _STT_LOCK:
+def transcribe(
+    audio_bytes: bytes,
+    beam_size: int | None = None,
+    wait_for_lock: bool = True,
+) -> str:
+    if not _STT_LOCK.acquire(blocking=wait_for_lock):
+        return ""
+    try:
         segments, _info = STT.transcribe(
             io.BytesIO(audio_bytes),
             language="en",
@@ -497,6 +503,8 @@ def transcribe(audio_bytes: bytes, beam_size: int | None = None) -> str:
         )
         # segments is lazy — decoding happens here, so join inside the lock.
         return " ".join(seg.text.strip() for seg in segments).strip()
+    finally:
+        _STT_LOCK.release()
 
 
 _MD_PATTERNS = [
@@ -871,6 +879,28 @@ _PERM_DENY_RE = re.compile(
 # to the agent, so voice mission triggers ("HAL, start mission…") keep
 # working and the persona is addressed the way it expects.
 _WAKE_RE = re.compile(r"^\s*(?:hey|ok|okay)?[,\s]*hal\b[,.!?:]*\s*(.*)$", re.I | re.S)
+
+
+def _wake_word_required(
+    *,
+    from_speech: bool,
+    wake_gated: bool,
+    manual_capture: bool,
+    enrollment_pending: bool,
+) -> bool:
+    """Apply WAKE mode only to ambient duplex capture.
+
+    Holding the eye is already an explicit address to HAL, like typed input.
+    Requiring the spoken word "HAL" as well would silently discard deliberate
+    push-to-talk whenever duplex WAKE mode happens to be enabled.
+    """
+    return (
+        from_speech
+        and wake_gated
+        and not manual_capture
+        and not enrollment_pending
+    )
+
 
 # Interim transcripts while a duplex utterance records (HAL_INTERIM_STT=0
 # disables). Each pass re-transcribes the whole buffered audio so far, so
@@ -1877,44 +1907,153 @@ def _record_timing(timings: dict[str, int]) -> None:
     infer = timings.get("infer", 0)
     turn = timings.get("turn") or timings.get("total") or infer
     if turn or infer:
-        _recent_timings.append({"ts": round(time.time(), 1), "infer": infer, "turn": turn})
+        sample = {"ts": round(time.time(), 1), "infer": infer, "turn": turn}
+        for stage in ("upload", "stt", "history", "tts", "total"):
+            if stage in timings:
+                sample[stage] = timings[stage]
+        _recent_timings.append(sample)
 
-# Running commentary: HAL speaks the reply sentence-by-sentence while the
-# agent is still working, instead of waiting for the turn to finish.
-# WS/duplex transport only — HTTP responses can't push early audio.
+# Running commentary: HAL speaks the reply in natural sentence/phrase chunks
+# while the agent is still working, instead of waiting for the turn to finish.
+# WebSocket transport only (push-to-talk and duplex) — HTTP responses can't
+# push early audio.
 COMMENTARY = os.environ.get("HAL_COMMENTARY", "1").strip().lower() not in {"0", "false", "no"}
 
 _SENTENCE_BOUNDARY = re.compile(r"[.!?](?:\s+|$)|\n+")
+_PHRASE_BOUNDARY = re.compile(r"[,;:](?:\s+|$)|\s+[—–]\s+")
+_COMMENTARY_PHRASE_MIN_CHARS = 48
+_COMMENTARY_PHRASE_MIN_WORDS = 8
+_COMMENTARY_PHRASE_MAX_CHARS = 180
 
 
 class SentenceAssembler:
-    """Accumulates streamed chunk text and yields complete sentences.
+    """Accumulates streamed text and yields speakable sentences or phrases.
 
     Holds everything back while a ``` fence is open so speakable() sees the
     whole code block and can replace it as one unit — a fence split across
-    sentences would leak backticks into speech.
+    chunks would leak backticks into speech. Long prose may leave at a natural
+    pause before its terminal punctuation; a word-boundary cap prevents an
+    unpunctuated reply from growing without bound.
     """
 
     def __init__(self) -> None:
         self._buf = ""
+
+    def _outside_markup(self, pos: int) -> bool:
+        """Whether ``pos`` is safe to hand to speech normalization.
+
+        A partial inline-code span or Markdown link cannot be normalized yet:
+        splitting there would send raw backticks, brackets, or a URL to Piper.
+        This small scanner tracks only the constructs that must remain intact;
+        ordinary parentheses and prose punctuation stay eligible boundaries.
+        """
+        in_fence = False
+        inline_ticks = 0
+        bracket_depth = 0
+        link_depth = 0
+        index = 0
+        while index < pos:
+            if self._buf[index] == "\\":
+                index += 2
+                continue
+            if self._buf.startswith("```", index):
+                in_fence = not in_fence
+                index += 3
+                continue
+            if in_fence:
+                index += 1
+                continue
+
+            char = self._buf[index]
+            if char == "`":
+                end = index + 1
+                while end < pos and self._buf[end] == "`":
+                    end += 1
+                run = end - index
+                if inline_ticks == 0:
+                    inline_ticks = run
+                elif inline_ticks == run:
+                    inline_ticks = 0
+                index = end
+                continue
+            if inline_ticks:
+                index += 1
+                continue
+
+            if link_depth:
+                if char == "(":
+                    link_depth += 1
+                elif char == ")":
+                    link_depth -= 1
+                index += 1
+                continue
+            if char == "[":
+                bracket_depth += 1
+            elif char == "]" and bracket_depth:
+                bracket_depth -= 1
+                if (
+                    bracket_depth == 0
+                    and index + 1 < pos
+                    and self._buf[index + 1] == "("
+                ):
+                    link_depth = 1
+                    index += 2
+                    continue
+            index += 1
+        return not (in_fence or inline_ticks or bracket_depth or link_depth)
+
+    def _first_outside_boundary(self, pattern: re.Pattern) -> re.Match | None:
+        pos = 0
+        while match := pattern.search(self._buf, pos):
+            if self._outside_markup(match.start()):
+                return match
+            pos = match.end()
+        return None
+
+    def _phrase_boundary(self) -> re.Match | None:
+        pos = 0
+        while match := _PHRASE_BOUNDARY.search(self._buf, pos):
+            if self._outside_markup(match.start()):
+                candidate = self._buf[:match.end()].strip()
+                if (
+                    len(candidate) >= _COMMENTARY_PHRASE_MIN_CHARS
+                    and len(candidate.split()) >= _COMMENTARY_PHRASE_MIN_WORDS
+                ):
+                    return match
+            pos = match.end()
+        return None
+
+    def _bounded_cut(self) -> int | None:
+        if len(self._buf) < _COMMENTARY_PHRASE_MAX_CHARS:
+            return None
+        limit = _COMMENTARY_PHRASE_MAX_CHARS
+        for match in reversed(list(re.finditer(r"\s+", self._buf[: limit + 1]))):
+            if match.start() < _COMMENTARY_PHRASE_MIN_CHARS:
+                break
+            if self._outside_markup(match.start()):
+                return match.end()
+        if self._outside_markup(limit):
+            return limit
+        return None
 
     def feed(self, text: str) -> list[str]:
         self._buf += text
         if self._buf.count("```") % 2 == 1:
             return []
         sentences = []
-        pos = 0
-        while True:
-            match = _SENTENCE_BOUNDARY.search(self._buf, pos)
-            if match is None:
+        while self._buf:
+            # If a complete sentence is already available, keep it intact.
+            # Phrase splitting only buys latency while terminal punctuation is
+            # still in flight.
+            match = self._first_outside_boundary(_SENTENCE_BOUNDARY)
+            end = match.end() if match is not None else None
+            if end is None:
+                match = self._phrase_boundary()
+                end = match.end() if match is not None else self._bounded_cut()
+            if end is None:
                 break
-            if self._buf.count("```", 0, match.start()) % 2 == 1:
-                # Boundary inside a completed fence — resume after its close.
-                pos = self._buf.find("```", match.start()) + 3
-                continue
-            sentence = self._buf[: match.end()].strip()
-            self._buf = self._buf[match.end():]
-            pos = 0
+            sentence = self._buf[:end].strip()
+            self._buf = self._buf[end:]
             if sentence:
                 sentences.append(sentence)
         return sentences
@@ -1946,20 +2085,28 @@ async def _speak_over_ws(session_id: str, websocket: WebSocket, text: str) -> No
 
 
 async def _ws_run_turn(
-    websocket: WebSocket, session_id: str, user_text: str, speaker: str | None = None
+    websocket: WebSocket,
+    session_id: str,
+    user_text: str,
+    speaker: str | None = None,
+    timings: dict[str, int] | None = None,
+    total_start: float | None = None,
 ) -> None:
-    await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
+    all_timings = dict(timings or {})
     if not COMMENTARY:
-        hal_text, _timings = await run_turn_text(session_id, user_text, speaker)
-        _record_timing(_timings)
+        hal_text, turn_timings = await run_turn_text(session_id, user_text, speaker)
+        all_timings.update(turn_timings)
+        if total_start is not None:
+            all_timings["total"] = _elapsed_ms(total_start)
+        _log_latency(session_id, all_timings)
         await _speak_over_ws(session_id, websocket, hal_text)
         return
 
     # Speak-while-thinking: agent chunks flow through a sentence assembler
-    # into a speaker task, so HAL's voice starts at his first sentence. The
+    # into a speaker task, so HAL's voice starts at his first natural phrase. The
     # final transcript frame still carries the whole reply for the log, and
     # turn_done (not tts_done) is the client's unlock signal — commentary
-    # produces one tts cycle per sentence.
+    # produces one tts cycle per spoken chunk.
     sentences: asyncio.Queue = asyncio.Queue()
     assembler = SentenceAssembler()
     spoken_count = 0
@@ -1977,8 +2124,8 @@ async def _ws_run_turn(
                 return
             # The PROPOSE_MISSION marker is reply metadata (last line by
             # contract) — latch mute so neither it nor anything after is
-            # spoken. The assembler buffers whole sentences, so the marker
-            # word can't be split across chunks here.
+            # spoken. The marker begins its own final line by contract, so the
+            # chunk carrying it latches the mute before TTS starts.
             if muted or "PROPOSE_MISSION" in sentence:
                 muted = True
                 continue
@@ -1993,8 +2140,11 @@ async def _ws_run_turn(
     speaker_task = _spawn(speak_worker(), name=f"ws-commentary-{session_id[:8]}")
     hermes_bridge.set_commentary_sink(session_id, sink)
     try:
-        hal_text, _timings = await run_turn_text(session_id, user_text, speaker)
-        _record_timing(_timings)
+        hal_text, turn_timings = await run_turn_text(session_id, user_text, speaker)
+        all_timings.update(turn_timings)
+        if total_start is not None:
+            all_timings["total"] = _elapsed_ms(total_start)
+        _log_latency(session_id, all_timings)
     finally:
         hermes_bridge.clear_commentary_sink(session_id, sink)
     tail = assembler.flush()
@@ -2017,6 +2167,8 @@ async def _ws_turn_task(
     session_id: str,
     user_text: str,
     audio_bytes: bytes | None = None,
+    timings: dict[str, int] | None = None,
+    total_start: float | None = None,
 ) -> None:
     """One turn as a background task. Turns run concurrently with the receive
     loop so a spoken 'yes' can answer a permission request while the asking
@@ -2029,13 +2181,21 @@ async def _ws_turn_task(
         if audio_bytes is not None:
             speaker, enroll_reply = await _speaker_hook(session_id, audio_bytes)
             if enroll_reply is not None:
-                await websocket.send_json(
-                    {"type": "transcript", "role": "user", "text": user_text}
-                )
                 await _record_turn(session_id, user_text, enroll_reply)
+                enrollment_timings = dict(timings or {})
+                if total_start is not None:
+                    enrollment_timings["total"] = _elapsed_ms(total_start)
+                _log_latency(session_id, enrollment_timings)
                 await _speak_over_ws(session_id, websocket, enroll_reply)
                 return
-        await _ws_run_turn(websocket, session_id, user_text, speaker)
+        await _ws_run_turn(
+            websocket,
+            session_id,
+            user_text,
+            speaker,
+            timings=timings,
+            total_start=total_start,
+        )
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -2173,10 +2333,20 @@ async def ws_conversation(websocket: WebSocket):
     interim_gen = 0
     interim_last = 0.0
     interim_task: asyncio.Task | None = None
+    manual_capture = False
 
     async def send_interim(snapshot: bytes, gen: int) -> None:
+        if gen != interim_gen:
+            return  # the recording ended before this worker started
         try:
-            text = await asyncio.to_thread(transcribe, snapshot, INTERIM_STT_BEAM)
+            # Captions are disposable. Never let a stale interim wait behind
+            # another decode and then jump ahead of the final transcript.
+            text = await asyncio.to_thread(
+                transcribe,
+                snapshot,
+                INTERIM_STT_BEAM,
+                wait_for_lock=False,
+            )
         except Exception:
             return  # partial containers can fail to decode — never fatal
         if gen != interim_gen or not text:
@@ -2224,6 +2394,7 @@ async def ws_conversation(websocket: WebSocket):
                     audio_chunks = []
                     audio_size = 0
                     audio_overflow = False
+                    manual_capture = bool(data.get("manual"))
                     interim_gen += 1
                     interim_last = time.monotonic()
                     continue
@@ -2242,11 +2413,16 @@ async def ws_conversation(websocket: WebSocket):
                     )
                     continue
 
+                turn_start = time.perf_counter()
+                turn_timings: dict[str, int] = {}
                 from_speech = False
+                turn_was_manual = False
                 turn_audio: bytes | None = None
                 if kind == "text_input":
                     user_text = (data.get("text") or "").strip()
                 elif kind == "end_speech":
+                    turn_was_manual = manual_capture
+                    manual_capture = False
                     interim_gen += 1  # stale interim results must not surface
                     if audio_overflow:
                         audio_overflow = False
@@ -2262,7 +2438,9 @@ async def ws_conversation(websocket: WebSocket):
                             websocket, "no_speech", "I didn't quite catch that, Dave."
                         )
                         continue
+                    stage_start = time.perf_counter()
                     user_text = await asyncio.to_thread(transcribe, audio_bytes)
+                    turn_timings["stt"] = _elapsed_ms(stage_start)
                     from_speech = True
                     turn_audio = audio_bytes
                 else:
@@ -2274,9 +2452,14 @@ async def ws_conversation(websocket: WebSocket):
                     )
                     continue
 
-                # An enrollment sample is exempt from wake gating — HAL just
-                # asked for a free-form sentence.
-                if from_speech and wake_gated and session_id not in _pending_enrollments:
+                # Enrollment and manual push-to-talk are explicit intent.
+                # WAKE mode gates only ambient duplex capture.
+                if _wake_word_required(
+                    from_speech=from_speech,
+                    wake_gated=wake_gated,
+                    manual_capture=turn_was_manual,
+                    enrollment_pending=session_id in _pending_enrollments,
+                ):
                     wake = _WAKE_RE.match(user_text)
                     if wake is None:
                         # Ambient speech, not addressed to HAL — drop silently.
@@ -2291,8 +2474,20 @@ async def ws_conversation(websocket: WebSocket):
                         continue
                     # Keep the full utterance: the persona expects to be
                     # addressed, and voice mission triggers rely on the prefix.
+                # Acknowledge what HAL heard before speaker matching or Hermes
+                # inference. The old HTTP path hid this until the whole answer.
+                await websocket.send_json(
+                    {"type": "transcript", "role": "user", "text": user_text}
+                )
                 _spawn(
-                    _ws_turn_task(websocket, session_id, user_text, turn_audio),
+                    _ws_turn_task(
+                        websocket,
+                        session_id,
+                        user_text,
+                        turn_audio,
+                        timings=turn_timings,
+                        total_start=turn_start,
+                    ),
                     name=f"ws-turn-{session_id[:8]}",
                 )
     except WebSocketDisconnect:
