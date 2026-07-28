@@ -85,6 +85,158 @@ input:focus-visible,
   outline-offset: 4px;
 }
 
+.visually-hidden {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.command-composer {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.slash-command-menu {
+  --command-radius: 7px;
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 70;
+  display: none;
+  max-height: min(286px, 48vh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--command-radius);
+  background: rgba(3, 3, 3, 0.98);
+  color: var(--telemetry);
+  scrollbar-color: var(--ghost) var(--void);
+}
+
+.slash-command-menu.open {
+  display: block;
+}
+
+.slash-command-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 32px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--hairline);
+  background: rgba(3, 3, 3, 0.98);
+  color: var(--ghost);
+  font-family: "Azeret Mono", monospace;
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.slash-command-option {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.26fr) minmax(0, 1fr) auto;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 14px 8px 12px;
+  border: 0;
+  border-bottom: 1px solid rgba(196, 189, 180, 0.08);
+  border-left: 2px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 140ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.slash-command-option:last-child {
+  border-bottom: 0;
+}
+
+.slash-command-option:hover,
+.slash-command-option[aria-selected="true"] {
+  background: rgba(255, 45, 31, 0.05);
+}
+
+.slash-command-option[aria-selected="true"] {
+  border-left-color: var(--signal);
+}
+
+.slash-command-name {
+  overflow: hidden;
+  color: var(--signal);
+  font-family: "Azeret Mono", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slash-command-copy {
+  min-width: 0;
+  padding: 0 12px;
+}
+
+.slash-command-description {
+  display: block;
+  overflow: hidden;
+  color: var(--telemetry);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slash-command-hint {
+  display: block;
+  overflow: hidden;
+  margin-top: 2px;
+  color: var(--ghost);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.slash-command-source {
+  color: var(--ghost);
+  font-family: "Azeret Mono", monospace;
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.slash-command-state {
+  min-height: 52px;
+  padding: 16px 14px;
+  color: var(--ghost);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+html[data-bridge-direction="orrery"] .slash-command-menu {
+  --command-radius: 8px;
+}
+
+html[data-bridge-direction="vault"] .slash-command-menu {
+  --command-radius: 10px;
+}
+
+html[data-bridge-direction="chorus"] .slash-command-menu {
+  --command-radius: 14px;
+}
+
 .bridge-brand {
   display: none;
 }
@@ -281,6 +433,38 @@ input:focus-visible,
 }
 
 @media (max-width: 760px) {
+  .cmdline {
+    z-index: 70;
+  }
+
+  .slash-command-menu {
+    max-height: min(264px, 42vh);
+    border-radius: 10px;
+  }
+
+  .slash-command-header {
+    min-height: 30px;
+    padding: 0 12px;
+  }
+
+  .slash-command-option {
+    grid-template-columns: minmax(94px, auto) minmax(0, 1fr);
+    padding-right: 12px;
+    padding-left: 10px;
+  }
+
+  .slash-command-copy {
+    padding-right: 0;
+  }
+
+  .slash-command-description {
+    white-space: normal;
+  }
+
+  .slash-command-source {
+    display: none;
+  }
+
   body {
     min-height: 100dvh;
     height: auto;

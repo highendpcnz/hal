@@ -402,6 +402,8 @@ class _HALClient:
         self._acp = acp_mod
         self._buffers: dict[str, list[str]] = {}
         self._active: set[str] = set()
+        self._commands: dict[str, list[dict[str, str | None]]] = {}
+        self._command_events: dict[str, asyncio.Event] = {}
 
     def begin(self, session_id: str) -> None:
         self._buffers[session_id] = []
@@ -411,9 +413,63 @@ class _HALClient:
         self._active.discard(session_id)
         return "".join(self._buffers.pop(session_id, [])).strip()
 
+    def commands(self, session_id: str) -> list[dict[str, str | None]]:
+        return [dict(command) for command in self._commands.get(session_id, [])]
+
+    async def wait_for_commands(
+        self, session_id: str, timeout: float = 1.5
+    ) -> list[dict[str, str | None]]:
+        commands = self.commands(session_id)
+        if commands:
+            return commands
+        event = self._command_events.setdefault(session_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return []
+        return self.commands(session_id)
+
+    def forget(self, session_id: str) -> None:
+        self._commands.pop(session_id, None)
+        self._command_events.pop(session_id, None)
+
     async def session_update(self, session_id: str, update, **kwargs) -> None:
         kind = getattr(update, "session_update", "")
-        if kind == "agent_message_chunk":
+        if kind == "available_commands_update":
+            commands: list[dict[str, str | None]] = []
+            for command in getattr(update, "available_commands", None) or []:
+                name = getattr(command, "name", None)
+                if not name and isinstance(command, dict):
+                    name = command.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                description = getattr(command, "description", None)
+                if description is None and isinstance(command, dict):
+                    description = command.get("description")
+                input_spec = getattr(command, "input", None)
+                if input_spec is None and isinstance(command, dict):
+                    input_spec = command.get("input")
+                input_value = getattr(input_spec, "root", input_spec)
+                if isinstance(input_spec, dict) and "root" in input_spec:
+                    input_value = input_spec["root"]
+                hint = getattr(input_value, "hint", None)
+                if hint is None and isinstance(input_value, dict):
+                    hint = input_value.get("hint")
+                commands.append({
+                    "name": name.strip().lstrip("/"),
+                    "description": str(description or "").strip(),
+                    "input_hint": str(hint).strip() if hint else None,
+                    "source": "hermes",
+                })
+            self._commands[session_id] = commands
+            self._command_events.setdefault(session_id, asyncio.Event()).set()
+            cookie_id = _acp_to_cookie.get(session_id)
+            if cookie_id is not None:
+                publish_event(cookie_id, {
+                    "type": "commands_update",
+                    "commands": commands,
+                })
+        elif kind == "agent_message_chunk":
             if session_id not in self._active:
                 return
             text = getattr(getattr(update, "content", None), "text", "") or ""
@@ -570,6 +626,8 @@ class ACPBridge:
 
     def forget(self, session_id: str) -> None:
         self._loaded.discard(session_id)
+        if self._client is not None:
+            self._client.forget(session_id)
 
     async def _ensure_started_locked(self) -> None:
         if self._alive():
@@ -666,6 +724,19 @@ class ACPBridge:
                 await self._conn.cancel(session_id=acp_id)
             except Exception as exc:
                 print(f"[hermes_bridge] cancel {acp_id} failed: {exc!r}")
+
+    async def commands(self, cookie_id: str) -> list[dict[str, str | None]]:
+        """Resolve the browser's ACP session and return its advertised slash
+        commands. Hermes owns this catalog; HAL only transports it."""
+        async with self._restart_lock:
+            await self._ensure_started_locked()
+        session_id = await self._resolve_session(cookie_id)
+        _acp_to_cookie[session_id] = cookie_id
+        assert self._client is not None
+        commands = self._client.commands(session_id)
+        if commands:
+            return commands
+        return await self._client.wait_for_commands(session_id)
 
     async def _prompt(self, session_id: str, cookie_id: str, text: str) -> str:
         m = self._acp
@@ -776,6 +847,14 @@ async def cancel_session(cookie_id: str) -> None:
     — subprocess mode has no handle on its per-turn process)."""
     if _acp_bridge is not None:
         await _acp_bridge.cancel(cookie_id)
+
+
+async def list_slash_commands(cookie_id: str) -> list[dict[str, str | None]]:
+    """Return the live slash-command catalog advertised by Hermes ACP."""
+    if _acp_bridge is None:
+        return []
+    async with _cookie_locks.hold(cookie_id):
+        return await _acp_bridge.commands(cookie_id)
 
 
 def drop_session(cookie_id: str) -> None:

@@ -324,7 +324,7 @@
   .cmdline.open { display: block; }
   .cmdline input {
     width: 100%;
-    background: rgba(8, 2, 2, 0.85);
+    background: #050202;
     border: 1px solid #2a1210;
     border-radius: 999px;
     color: #b84b3b;
@@ -1242,12 +1242,18 @@
     <button id="prop-approve" class="allow" type="button">Approve</button>
     <button id="prop-decline" class="deny" type="button">Decline</button>
   </div>
-  <div class="hint">Hold the eye — or the space bar — to speak · "/" to type</div>
+  <div class="hint">Hold the eye — or the space bar — to speak · "/" opens commands</div>
 
   <!-- Mobile command line (hidden on tablet/desktop) -->
   <form id="cmdline" class="cmdline">
-    <input id="cmd-input" type="text" autocomplete="off" spellcheck="false"
-           placeholder="Type to HAL — Enter sends, Esc closes" />
+    <div class="command-composer">
+      <div id="cmd-command-menu" class="slash-command-menu" role="listbox"
+           aria-label="HAL and Hermes slash commands" hidden></div>
+      <input id="cmd-input" type="text" autocomplete="off" spellcheck="false"
+             role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
+             aria-expanded="false" aria-controls="cmd-command-menu"
+             placeholder='Type to HAL — "/" opens commands' />
+    </div>
   </form>
 
   <!-- Telemetry bar (visible on tablet + desktop) -->
@@ -1284,12 +1290,19 @@
 
   <!-- Bridge input (visible on tablet + desktop) -->
   <div class="bridge-input">
-    <form id="bridge-form">
-      <input id="bridge-cmd" type="text" autocomplete="off" spellcheck="false"
-             placeholder="Type to HAL — Enter sends, Space bar to speak" />
-      <button type="submit">Send</button>
-    </form>
+    <div class="command-composer">
+      <div id="bridge-command-menu" class="slash-command-menu" role="listbox"
+           aria-label="HAL and Hermes slash commands" hidden></div>
+      <form id="bridge-form">
+        <input id="bridge-cmd" type="text" autocomplete="off" spellcheck="false"
+               role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
+               aria-expanded="false" aria-controls="bridge-command-menu"
+               placeholder='Type to HAL — "/" opens commands, Enter sends' />
+        <button type="submit">Send</button>
+      </form>
+    </div>
   </div>
+  <div id="command-status" class="visually-hidden" aria-live="polite"></div>
 
   <nav class="bridge-rail" aria-label="Bridge navigation and visual directions">
     <div class="rail-actions">
@@ -1926,6 +1939,8 @@
         appendToMissionLog('system',
           'Proposal "' + (msg.title || '') + '" — ' + (msg.approved ? 'approved' : 'declined'));
         if (msg.approved) refreshMissions();
+      } else if (msg.type === 'commands_update') {
+        loadCommandCatalog(true);
       }
     };
     events.onerror = () => {
@@ -2859,20 +2874,309 @@
   const cmdInput = document.getElementById('cmd-input');
   const bridgeForm = document.getElementById('bridge-form');
   const bridgeCmd = document.getElementById('bridge-cmd');
+  const commandStatus = document.getElementById('command-status');
+  let commandCatalog = [];
+  let commandCatalogLoaded = false;
+  let commandCatalogLoading = null;
+  let commandCatalogError = '';
 
-  function openCmdline() {
+  const commandControllers = [
+    {
+      input: cmdInput,
+      menu: document.getElementById('cmd-command-menu'),
+      activeIndex: 0,
+      filtered: [],
+      suppressed: false,
+    },
+    {
+      input: bridgeCmd,
+      menu: document.getElementById('bridge-command-menu'),
+      activeIndex: 0,
+      filtered: [],
+      suppressed: false,
+    },
+  ].filter(controller => controller.input && controller.menu);
+
+  function commandControllerFor(input) {
+    return commandControllers.find(controller => controller.input === input);
+  }
+
+  function commandQuery(input) {
+    const value = input.value;
+    if (!value.startsWith('/')) return null;
+    const token = value.slice(1);
+    if (/\s/.test(token) || token.includes('/')) return null;
+    return token.toLowerCase();
+  }
+
+  function normalizeCommand(command) {
+    if (!command || typeof command !== 'object') return null;
+    const name = String(command.name || '').trim().replace(/^\/+/, '');
+    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(name)) return null;
+    return {
+      name: name.toLowerCase(),
+      description: String(command.description || '').trim(),
+      inputHint: command.input_hint ? String(command.input_hint).trim() : '',
+      source: command.source === 'hal' ? 'hal' : 'hermes',
+    };
+  }
+
+  function announceCommandStatus(text) {
+    commandStatus.textContent = text;
+  }
+
+  function closeCommandMenu(controller) {
+    if (!controller) return;
+    controller.menu.classList.remove('open');
+    controller.menu.hidden = true;
+    controller.input.setAttribute('aria-expanded', 'false');
+    controller.input.removeAttribute('aria-activedescendant');
+  }
+
+  function commandMatches(command, query) {
+    if (!query) return true;
+    return command.name.includes(query)
+      || command.description.toLowerCase().includes(query)
+      || command.inputHint.toLowerCase().includes(query);
+  }
+
+  function appendCommandState(menu, text) {
+    const state = document.createElement('div');
+    state.className = 'slash-command-state';
+    state.textContent = text;
+    menu.appendChild(state);
+  }
+
+  function completeCommand(controller, command) {
+    const suffix = command.inputHint ? ' ' : '';
+    controller.input.value = '/' + command.name + suffix;
+    controller.input.setSelectionRange(
+      controller.input.value.length,
+      controller.input.value.length,
+    );
+    controller.suppressed = true;
+    closeCommandMenu(controller);
+    announceCommandStatus(
+      '/' + command.name + (command.inputHint ? '. Enter ' + command.inputHint + '.' : '. Ready to send.'),
+    );
+  }
+
+  function updateCommandSelection(controller, shouldScroll = false) {
+    const options = Array.from(controller.menu.querySelectorAll('[role="option"]'));
+    options.forEach((option, index) => {
+      option.setAttribute(
+        'aria-selected',
+        index === controller.activeIndex ? 'true' : 'false',
+      );
+    });
+    const activeOption = options[controller.activeIndex];
+    if (!activeOption) {
+      controller.input.removeAttribute('aria-activedescendant');
+      return;
+    }
+    controller.input.setAttribute('aria-activedescendant', activeOption.id);
+    if (shouldScroll) {
+      requestAnimationFrame(() => {
+        activeOption.scrollIntoView({ block: 'nearest' });
+      });
+    }
+  }
+
+  function renderCommandMenu(controller) {
+    const query = commandQuery(controller.input);
+    if (
+      query === null
+      || controller.suppressed
+      || document.activeElement !== controller.input
+    ) {
+      closeCommandMenu(controller);
+      return;
+    }
+
+    const filtered = commandCatalog.filter(command => commandMatches(command, query));
+    controller.filtered = filtered;
+    if (controller.activeIndex >= filtered.length) controller.activeIndex = 0;
+
+    const menu = controller.menu;
+    menu.replaceChildren();
+
+    const header = document.createElement('div');
+    header.className = 'slash-command-header';
+    const title = document.createElement('span');
+    title.textContent = commandCatalogError ? 'Command channel · HAL only' : 'Command channel';
+    const count = document.createElement('span');
+    count.textContent = commandCatalogLoading && !commandCatalogLoaded
+      ? 'Sync'
+      : String(filtered.length).padStart(2, '0') + ' / ' + String(commandCatalog.length).padStart(2, '0');
+    header.append(title, count);
+    menu.appendChild(header);
+
+    if (commandCatalogLoading && !commandCatalogLoaded) {
+      appendCommandState(menu, 'Synchronizing with Hermes ACP.');
+    } else if (!filtered.length) {
+      appendCommandState(
+        menu,
+        commandCatalogError && !commandCatalog.length
+          ? commandCatalogError
+          : 'No matching slash command.',
+      );
+    } else {
+      filtered.forEach((command, index) => {
+        const option = document.createElement('div');
+        option.id = menu.id + '-option-' + index;
+        option.className = 'slash-command-option';
+        option.setAttribute('role', 'option');
+        option.setAttribute('aria-selected', index === controller.activeIndex ? 'true' : 'false');
+
+        const name = document.createElement('span');
+        name.className = 'slash-command-name';
+        name.textContent = '/' + command.name;
+
+        const copy = document.createElement('span');
+        copy.className = 'slash-command-copy';
+        const description = document.createElement('span');
+        description.className = 'slash-command-description';
+        description.textContent = command.description || 'Hermes command';
+        copy.appendChild(description);
+        if (command.inputHint) {
+          const hint = document.createElement('span');
+          hint.className = 'slash-command-hint';
+          hint.textContent = command.inputHint;
+          copy.appendChild(hint);
+        }
+
+        const source = document.createElement('span');
+        source.className = 'slash-command-source';
+        source.textContent = command.source;
+
+        option.append(name, copy, source);
+        option.addEventListener('pointermove', () => {
+          if (controller.activeIndex === index) return;
+          controller.activeIndex = index;
+          updateCommandSelection(controller);
+        });
+        option.addEventListener('pointerdown', (event) => {
+          event.preventDefault();
+          completeCommand(controller, command);
+        });
+        menu.appendChild(option);
+      });
+    }
+
+    menu.hidden = false;
+    menu.classList.add('open');
+    controller.input.setAttribute('aria-expanded', 'true');
+    updateCommandSelection(controller, true);
+  }
+
+  function renderCommandMenus() {
+    commandControllers.forEach(renderCommandMenu);
+  }
+
+  async function loadCommandCatalog(force = false) {
+    if (commandCatalogLoading) return commandCatalogLoading;
+    if (commandCatalogLoaded && !force) return commandCatalog;
+    renderCommandMenus();
+    commandCatalogLoading = (async () => {
+      try {
+        const response = await fetch('/api/commands', { credentials: 'same-origin' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const payload = await response.json();
+        commandCatalog = (Array.isArray(payload.commands) ? payload.commands : [])
+          .map(normalizeCommand)
+          .filter(Boolean);
+        commandCatalogLoaded = true;
+        commandCatalogError = payload.hermes_error || '';
+        announceCommandStatus(
+          commandCatalog.length + ' slash commands available'
+          + (commandCatalogError ? '. Hermes is unavailable; HAL commands remain.' : '.'),
+        );
+        return commandCatalog;
+      } catch (error) {
+        console.error('command catalog failed', error);
+        commandCatalogError = 'Command channel unavailable.';
+        announceCommandStatus(commandCatalogError);
+        return commandCatalog;
+      } finally {
+        commandCatalogLoading = null;
+        renderCommandMenus();
+      }
+    })();
+    renderCommandMenus();
+    return commandCatalogLoading;
+  }
+
+  commandControllers.forEach(controller => {
+    controller.input.addEventListener('input', () => {
+      controller.activeIndex = 0;
+      controller.suppressed = false;
+      if (commandQuery(controller.input) !== null) loadCommandCatalog();
+      renderCommandMenu(controller);
+    });
+    controller.input.addEventListener('focus', () => {
+      controller.suppressed = false;
+      renderCommandMenu(controller);
+    });
+    controller.input.addEventListener('blur', () => {
+      setTimeout(() => closeCommandMenu(controller), 0);
+    });
+    controller.input.addEventListener('keydown', (event) => {
+      const open = controller.menu.classList.contains('open');
+      if (event.key === 'Escape' && open) {
+        event.preventDefault();
+        event.stopPropagation();
+        controller.suppressed = true;
+        closeCommandMenu(controller);
+        return;
+      }
+      if (!open || !controller.filtered.length) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        const delta = event.key === 'ArrowDown' ? 1 : -1;
+        controller.activeIndex = (
+          controller.activeIndex + delta + controller.filtered.length
+        ) % controller.filtered.length;
+        updateCommandSelection(controller, true);
+        return;
+      }
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        completeCommand(controller, controller.filtered[controller.activeIndex]);
+        return;
+      }
+      if (event.key === 'Enter') {
+        const selected = controller.filtered[controller.activeIndex];
+        const query = commandQuery(controller.input);
+        if (selected && query !== selected.name) {
+          event.preventDefault();
+          completeCommand(controller, selected);
+        } else {
+          controller.suppressed = true;
+          closeCommandMenu(controller);
+        }
+      }
+    });
+  });
+
+  function openCmdline(seedSlash = false) {
+    const input = isBridgeMode() ? bridgeCmd : cmdInput;
     if (isBridgeMode()) {
       // On tablet/desktop, focus the always-visible input
-      bridgeCmd.focus();
+      input.focus();
     } else {
       cmdline.classList.add('open');
-      cmdInput.focus();
+      input.focus();
+    }
+    if (seedSlash && !input.value) {
+      input.value = '/';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
     }
   }
   function closeCmdline() {
     cmdline.classList.remove('open');
     cmdInput.value = '';
     cmdInput.blur();
+    closeCommandMenu(commandControllerFor(cmdInput));
   }
   // Mobile cmdline submit
   cmdline.addEventListener('submit', (e) => {
@@ -2886,15 +3190,17 @@
     e.preventDefault();
     const text = bridgeCmd.value.trim();
     bridgeCmd.value = '';
+    closeCommandMenu(commandControllerFor(bridgeCmd));
     if (text) sendTyped(text);
   });
 
   window.addEventListener('keydown', (e) => {
     if (e.key === '/' && !typingTarget(e) && !drawer.classList.contains('open')) {
       e.preventDefault();
-      openCmdline();
+      openCmdline(true);
     }
   });
+  loadCommandCatalog();
 
   // ═══════════════════════════════════════════════════
   // Systems drawer (preserved from original)

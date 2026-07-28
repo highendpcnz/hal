@@ -72,6 +72,9 @@ check("session id accepts uuid-ish", main._valid_session_id("abc-123_X.z") == "a
 check("session id rejects slash", main._valid_session_id("../etc") is None)
 check("session id rejects empty", main._valid_session_id("") is None and main._valid_session_id(None) is None)
 check("session id rejects overlong", main._valid_session_id("a" * 129) is None)
+check("slash helper accepts command", main._looks_like_slash_command("/help"))
+check("slash helper accepts arguments", main._looks_like_slash_command("/model gpt5"))
+check("slash helper rejects absolute path", not main._looks_like_slash_command("/Users/dave/file.txt"))
 
 try:
     main.session_file("../evil")
@@ -655,6 +658,88 @@ check(
     "buffered reply is unaffected by the sink",
     _reply == "Hello, Dave. Hello, Dave. Hello, Dave.",
     repr(_reply),
+)
+
+
+def _exercise_available_commands_update():
+    client = hermes_bridge._HALClient(None)
+
+    class _Input:
+        hint = "model name"
+
+    class _InputWrapper:
+        root = _Input()
+
+    class _Command:
+        name = "model"
+        description = "Switch model"
+        input = _InputWrapper()
+
+    class _CommandsUpdate:
+        session_update = "available_commands_update"
+        available_commands = [_Command()]
+
+    async def drive():
+        await client.session_update("acp-commands", _CommandsUpdate())
+        return client.commands("acp-commands")
+
+    return asyncio.run(drive())
+
+
+_advertised_commands = _exercise_available_commands_update()
+check(
+    "ACP available-command metadata is retained for the composer",
+    _advertised_commands == [{
+        "name": "model",
+        "description": "Switch model",
+        "input_hint": "model name",
+        "source": "hermes",
+    }],
+    repr(_advertised_commands),
+)
+
+
+def _exercise_exact_slash_routing():
+    original_ask = main.ask_hermes
+    original_drain = main.mission_control.manager.drain_notes
+    original_daily = main.ledger.manager.daily_note
+    prompts: list[str] = []
+    notes_touched: list[bool] = []
+
+    async def fake_ask(text, _session_id):
+        prompts.append(text)
+        return "Available commands."
+
+    def fake_drain(_session_id):
+        notes_touched.append(True)
+        return ["A completed mission report."]
+
+    def fake_daily():
+        notes_touched.append(True)
+        return "A ledger note."
+
+    main.ask_hermes = fake_ask
+    main.mission_control.manager.drain_notes = fake_drain
+    main.ledger.manager.daily_note = fake_daily
+    try:
+        asyncio.run(main.run_turn_text("slash-routing", "/help"))
+    finally:
+        main.ask_hermes = original_ask
+        main.mission_control.manager.drain_notes = original_drain
+        main.ledger.manager.daily_note = original_daily
+    return prompts, notes_touched
+
+
+_slash_prompts, _slash_notes_touched = _exercise_exact_slash_routing()
+check(
+    "slash command reaches Hermes as the exact ACP prompt",
+    _slash_prompts == ["/help"],
+    repr(_slash_prompts),
+)
+check(
+    "slash command does not consume pending conversation notes",
+    _slash_notes_touched == [],
+    repr(_slash_notes_touched),
 )
 
 _sink_a, _sink_b = (lambda t: None), (lambda t: None)
@@ -1323,6 +1408,11 @@ for token in (
     "mission_proposal",        # …driven by the SSE event
     'id="lat-spark"',          # latency sparkline canvas exists
     "/api/latency",            # …fed from the timings endpoint
+    'role="combobox"',         # slash command inputs expose combobox semantics
+    'role="listbox"',          # …with keyboard-addressable suggestion lists
+    "/api/commands",           # …fed by the live backend command catalog
+    "loadCommandCatalog",      # …and refreshed after ACP metadata updates
+    "aria-activedescendant",   # active option remains announced while typing
 ):
     check(f"frontend wires {token}", token in _frontend_src)
 check(

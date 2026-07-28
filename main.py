@@ -107,6 +107,38 @@ speaker_id.init(DATA_DIR)
 ledger.init(DATA_DIR)
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+HAL_SLASH_COMMANDS = (
+    {
+        "name": "mission",
+        "description": "Start a background mission",
+        "input_hint": "mission title",
+        "source": "hal",
+    },
+    {
+        "name": "ask",
+        "description": "Ask the latest completed mission a follow-up",
+        "input_hint": "question",
+        "source": "hal",
+    },
+    {
+        "name": "chess",
+        "description": "Start or control a chess game",
+        "input_hint": "black | white | resign",
+        "source": "hal",
+    },
+    {
+        "name": "remember",
+        "description": "Add an item to the care ledger",
+        "input_hint": "item",
+        "source": "hal",
+    },
+    {
+        "name": "resign",
+        "description": "Resign the active chess game",
+        "input_hint": None,
+        "source": "hal",
+    },
+)
 
 # Reuse Hermes' HAL text normalization; ffmpeg mastering is optional for speed.
 _HAL_TTS_SCRIPT = Path(
@@ -760,6 +792,14 @@ def _ledger_add_request(user_text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _looks_like_slash_command(text: str) -> bool:
+    """Distinguish `/help` from an absolute path such as `/Users/dave/file`."""
+    if not text.startswith("/"):
+        return False
+    first_word = text.split(maxsplit=1)[0]
+    return "/" not in first_word[1:]
+
+
 # Crew Manifest: enrollment by introduction. "this is X" needs the guard
 # below or "HAL, this is ridiculous" enrolls Ridiculous — whisper reliably
 # capitalizes proper names and lowercases adjectives, so require a leading
@@ -1137,19 +1177,28 @@ async def run_turn_text(
     elif (chess_line := await _chess_turn(session_id, user_text)) is not None:
         hal_text = chess_line
     else:
-        # Completed-mission reports ride along on the next prompt so the
-        # brain can answer follow-up questions about them.
-        notes = mission_control.manager.drain_notes(session_id)
-        ledger_note = ledger.manager.daily_note()
-        if ledger_note:
-            notes = [*notes, ledger_note]
-        tagged_text = user_text
-        if speaker is not None and speaker_id.manager is not None and speaker_id.manager.enrolled():
-            # Voice identity for the persona: it addresses crew by name and
-            # treats unknown voices as guests. History keeps the raw text.
-            if speaker != speaker_id.manager.commander():
-                tagged_text = f"[Voice: {speaker or 'unidentified'}] {user_text}"
-        prompt_text = "\n\n".join([*notes, tagged_text]) if notes else tagged_text
+        if _looks_like_slash_command(user_text):
+            # ACP intercepts slash commands only when `/command` is the exact
+            # prompt prefix. Mission/ledger notes must wait for a normal turn.
+            prompt_text = user_text
+        else:
+            # Completed-mission reports ride along on the next prompt so the
+            # brain can answer follow-up questions about them.
+            notes = mission_control.manager.drain_notes(session_id)
+            ledger_note = ledger.manager.daily_note()
+            if ledger_note:
+                notes = [*notes, ledger_note]
+            tagged_text = user_text
+            if (
+                speaker is not None
+                and speaker_id.manager is not None
+                and speaker_id.manager.enrolled()
+            ):
+                # Voice identity for the persona: it addresses crew by name and
+                # treats unknown voices as guests. History keeps the raw text.
+                if speaker != speaker_id.manager.commander():
+                    tagged_text = f"[Voice: {speaker or 'unidentified'}] {user_text}"
+            prompt_text = "\n\n".join([*notes, tagged_text]) if notes else tagged_text
         stage_start = time.perf_counter()
         hal_text = await ask_hermes(prompt_text, session_id)
         timings["infer"] = _elapsed_ms(stage_start)
@@ -1395,6 +1444,56 @@ def status(request: Request):
         "agent_cwd": hermes_bridge.AGENT_CWD,
         "uptime_seconds": round(time.monotonic() - _BOOT_TIME),
     }
+
+
+@app.get("/api/commands")
+async def command_catalog(request: Request):
+    """Live composer catalog: HAL-native commands plus Hermes ACP metadata."""
+    session_id, new_session = _session_from_request(request)
+    hermes_commands: list[dict[str, str | None]] = []
+    hermes_error = None
+    try:
+        hermes_commands = await hermes_bridge.list_slash_commands(session_id)
+    except Exception as exc:
+        hermes_error = "Hermes command channel is unavailable."
+        print(f"[commands] catalog unavailable: {exc!r}")
+    if not hermes_commands and hermes_error is None:
+        hermes_error = "Hermes command metadata is unavailable."
+
+    by_name: dict[str, dict[str, str | None]] = {}
+    for command in HAL_SLASH_COMMANDS:
+        name = str(command.get("name") or "").strip().lstrip("/").lower()
+        if not name:
+            continue
+        by_name[name] = {
+            "name": name,
+            "description": str(command.get("description") or "").strip(),
+            "input_hint": command.get("input_hint"),
+            "source": "hal",
+        }
+    for command in hermes_commands:
+        name = str(command.get("name") or "").strip().lstrip("/").lower()
+        if not name or name in by_name:
+            continue
+        by_name[name] = {
+            "name": name,
+            "description": str(command.get("description") or "").strip(),
+            "input_hint": command.get("input_hint"),
+            "source": "hermes",
+        }
+    commands = sorted(
+        by_name.values(),
+        key=lambda command: (command["source"] != "hermes", command["name"]),
+    )
+
+    resp = JSONResponse({
+        "commands": commands,
+        "hermes_available": bool(hermes_commands),
+        "hermes_error": hermes_error,
+    })
+    if new_session:
+        _set_session_cookie(resp, session_id)
+    return resp
 
 
 # The surfaces fan out 7 CLI subprocesses; cache them briefly so reopening
