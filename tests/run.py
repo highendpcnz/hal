@@ -196,9 +196,12 @@ check("ordinary speech is not an answer",
 
 check("wake matches plain address", main._WAKE_RE.match("HAL, open the log.") is not None)
 check("wake matches hey-prefix", main._WAKE_RE.match("Hey HAL what's our status?") is not None)
+check("wake accepts local STT hell homophone", main._WAKE_RE.match("Hell, open the log.") is not None)
+check("wake accepts hall homophone", main._WAKE_RE.match("Hall, open the log.") is not None)
 _bare = main._WAKE_RE.match("Hal.")
 check("bare HAL leaves empty remainder", _bare is not None and _bare.group(1).strip() == "")
 check("wake rejects ambient speech", main._WAKE_RE.match("How are you doing?") is None)
+check("wake rejects hello", main._WAKE_RE.match("Hello there") is None)
 check("wake rejects embedded hal", main._WAKE_RE.match("Halt the presses") is None)
 check(
     "wake keeps the remainder",
@@ -737,6 +740,63 @@ check(
         "[in the manual](https://example.test/alpha,beta),"
     ],
 )
+_asm11 = main.SentenceAssembler()
+check(
+    "phrase streaming holds punctuation inside emphasis",
+    _asm11.feed(
+        "I have checked the detailed bridge state **including alpha, beta"
+    )
+    == [],
+)
+check(
+    "phrase streaming releases closed emphasis at a later pause",
+    _asm11.feed("**, and the remaining values are stable, ")
+    == [
+        "I have checked the detailed bridge state "
+        "**including alpha, beta**,"
+    ],
+)
+_asm12 = main.SentenceAssembler()
+check(
+    "phrase streaming holds punctuation inside strikethrough",
+    _asm12.feed(
+        "I have checked the detailed bridge state ~~including alpha, beta"
+    )
+    == [],
+)
+check(
+    "phrase streaming releases closed strikethrough at a later pause",
+    _asm12.feed("~~, and the remaining values are stable, ")
+    == [
+        "I have checked the detailed bridge state "
+        "~~including alpha, beta~~,"
+    ],
+)
+_asm13 = main.SentenceAssembler()
+check(
+    "phrase streaming holds a partial table row",
+    _asm13.feed(
+        "| Component | Detailed state, including the latest measurement"
+    )
+    == [],
+)
+check(
+    "phrase streaming releases a complete table with following prose",
+    _asm13.feed(" |\nThe remaining bridge systems are stable, ")
+    == [
+        "| Component | Detailed state, including the latest measurement |\n"
+        "The remaining bridge systems are stable,"
+    ],
+)
+
+check(
+    "websocket frames preserve a client turn id",
+    main._ws_frame("turn_done", 7) == {"type": "turn_done", "turn_id": 7},
+)
+check(
+    "out-of-band websocket frames omit turn id",
+    main._ws_frame("tts_done") == {"type": "tts_done"},
+)
 
 
 def _exercise_phrase_commentary_turn():
@@ -759,12 +819,17 @@ def _exercise_phrase_commentary_turn():
         sink(_phrase_tail)
         return reply, {"infer": 1}
 
-    async def fake_send_tts(websocket, text):
+    async def fake_send_tts(websocket, text, _turn_id=None):
         websocket.spoken.append(text)
 
     async def drive():
         websocket = _Socket()
-        await main._ws_run_turn(websocket, "phrase-turn", "status")
+        await main._ws_run_turn(
+            websocket,
+            "phrase-turn",
+            "status",
+            turn_id=42,
+        )
         return websocket
 
     main.run_turn_text = fake_run_turn
@@ -801,6 +866,11 @@ check(
     "commentary keeps the final transcript exact",
     _final_frames == [_phrase_reply],
     repr(_final_frames),
+)
+check(
+    "commentary frames retain the client turn id",
+    all(frame.get("turn_id") == 42 for frame in _phrase_socket.frames),
+    repr(_phrase_socket.frames),
 )
 
 
@@ -1575,7 +1645,7 @@ ws_onclose_end = _frontend_src.index("};", ws_onclose_start)
 ws_onclose_body = _frontend_src[ws_onclose_start:ws_onclose_end]
 check(
     "ws.onclose stops a live duplex recorder before unlocking",
-    "isWsRecording" in ws_onclose_body and "vadRecorder" in ws_onclose_body,
+    "isWsRecording" in ws_onclose_body and "vadUtteranceChunks" in ws_onclose_body,
     ws_onclose_body,
 )
 

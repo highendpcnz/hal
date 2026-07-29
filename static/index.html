@@ -2212,6 +2212,7 @@
     wsPlaybackGen++;
     wsPlaybackEpoch++;
     wsPendingChunks = 0;
+    wsChunkQueue = Promise.resolve();
     setState('idle');
     wsNextTime = 0;
     wsStarted = false;
@@ -2219,6 +2220,8 @@
     if (!duplexEnabled) stopWaveform();
     busy = false;
     wsTurn = false;
+    wsActiveTurnId = null;
+    wsCaptureTurnId = null;
   }
 
   // Stop any in-flight HAL speech (both playback paths). Returns true if
@@ -2240,6 +2243,7 @@
       wsPlaybackGen++;  // cancel any pending WS tts_done drain-wait
       wsPlaybackEpoch++;
       wsPendingChunks = 0;
+      wsChunkQueue = Promise.resolve();
       if (streamPlayback) streamPlayback.cancelled = true;
       try { streamPlayback?.reader.cancel(); } catch (e) {}
       streamPlayback?.sources.forEach(s => { try { s.stop(); } catch (e) {} });
@@ -2446,13 +2450,28 @@
   let wsNextTime = 0;
   let wsStarted = false;
   let wsTurn = false;  // the in-flight turn belongs to the WebSocket transport
+  let wsTurnSeq = 0;
+  let wsActiveTurnId = null;
+  let wsCaptureTurnId = null;
+  let wsAudioAccepted = true;
   let wsPlaybackGen = 0;  // invalidates obsolete tts_done drain waiters
   let wsPlaybackEpoch = 0;  // invalidates binary frames after teardown
   let wsPendingChunks = 0;  // frames received but not scheduled by WebAudio yet
+  let wsChunkQueue = Promise.resolve();  // preserves binary receive order
   let announceSignalled = false;  // this socket has been told we can hear
   // Running commentary: one tts cycle per sentence, so tts_done no longer
   // means the turn is over — turn_done is the unlock signal instead.
   let commentaryActive = false;
+
+  function beginWsTurn() {
+    wsActiveTurnId = ++wsTurnSeq;
+    wsAudioAccepted = false;  // discard any late PCM from the retired turn
+    return wsActiveTurnId;
+  }
+
+  function frameBelongsToActiveTurn(msg) {
+    return msg.turn_id == null || msg.turn_id === wsActiveTurnId;
+  }
 
   // Tell the server we can actually play audio (socket open + AudioContext
   // running after a user gesture) so it can deliver queued trigger reports
@@ -2476,12 +2495,15 @@
         let msg;
         try { msg = JSON.parse(e.data); } catch (err) { return; }
         if (msg.type === 'transcript') {
+          if (!frameBelongsToActiveTurn(msg)) return;
           updateLog(msg.role === 'user' ? msg.text : null, msg.role === 'hal' ? msg.text : null);
           showCaption(msg.text);
           if (msg.role === 'hal') {
             setState('speaking');
           }
         } else if (msg.type === 'tts_start') {
+          wsAudioAccepted = frameBelongsToActiveTurn(msg);
+          if (!wsAudioAccepted) return;
           stopThinkingTimer();
           // A later commentary phrase supersedes the prior phrase's drain
           // waiter, but it must keep the same playback cursor so its PCM queues
@@ -2490,6 +2512,7 @@
           wsSampleRate = msg.sample_rate || 22050;
           wsStarted = false;
         } else if (msg.type === 'commentary') {
+          if (!frameBelongsToActiveTurn(msg)) return;
           // A phrase HAL is speaking while the turn still runs — caption
           // it live; the full reply lands in the log via the final
           // transcript frame.
@@ -2497,6 +2520,10 @@
           setState('speaking');
           if (msg.text) showCaption(msg.text, { holdMs: 8000 });
         } else if (msg.type === 'tts_done') {
+          if (!frameBelongsToActiveTurn(msg)) {
+            wsAudioAccepted = true;
+            return;
+          }
           // tts_done races the async decode in playWsChunk (string frames are
           // handled while binary ones still await arrayBuffer), and it only
           // marks synthesis done — playback is still draining. Hold the turn
@@ -2505,8 +2532,13 @@
           if (!await waitForWsPlayback(gen)) return;
           if (commentaryActive) return;  // per-sentence cycle — turn_done unlocks
           streamPlayback = null;
+          if (msg.turn_id == null && wsActiveTurnId != null) {
+            setState('thinking');  // an out-of-band prompt spoke mid-turn
+            return;
+          }
           turnDone();
         } else if (msg.type === 'turn_done') {
+          if (!frameBelongsToActiveTurn(msg)) return;
           // Commentary turn finished server-side; wait for scheduled audio
           // to drain, then unlock.
           const gen = wsPlaybackGen;
@@ -2515,6 +2547,7 @@
           streamPlayback = null;
           turnDone();
         } else if (msg.type === 'turn_aborted') {
+          if (!frameBelongsToActiveTurn(msg)) return;
           // The server had nothing to say (empty audio, over-long recording,
           // error) — without this the UI would wait on a reply forever.
           // Wake-gated ambient speech is dropped without comment.
@@ -2529,7 +2562,7 @@
           if (msg.text && isWsRecording) showCaption(msg.text + ' …', { holdMs: 4000 });
         }
       } else {
-        await playWsChunk(e.data);
+        if (wsAudioAccepted) queueWsChunk(e.data);
       }
     };
     ws.onopen = () => { sendWakeMode(); maybeAnnounceReady(); };
@@ -2538,15 +2571,11 @@
       commentaryActive = false;
       if (isWsRecording) {
         // Socket died while still capturing a duplex utterance — there will
-        // be no end_speech reply to unlock on. Stop the recorder before
+        // be no end_speech reply to unlock on. Drop the buffered PCM before
         // turnDone() below runs (wsTurn is already true from startWsRecording).
         isWsRecording = false;
-        if (vadRecorder && vadRecorder.state === 'recording') {
-          vadRecorder.onstop = null;
-          vadRecorder.ondataavailable = null;
-          try { vadRecorder.stop(); } catch (e) {}
-        }
-        vadRecorder = null;
+        vadUtteranceChunks = [];
+        vadUtteranceSamples = 0;
       }
       if (wsTurn) {
         // Socket died mid-turn; the reply is gone. Unlock the UI.
@@ -2564,6 +2593,7 @@
     // for those frames to be scheduled before using the playback cursor.
     while (wsPlaybackGen === gen) {
       await new Promise(r => setTimeout(r, 100));
+      if (wsPlaybackGen !== gen) return false;
       const ctx = audioCtx;
       if (wsPendingChunks === 0 && (!ctx || ctx.currentTime >= wsNextTime)) {
         return true;
@@ -2578,41 +2608,46 @@
     document.addEventListener(evt, primePlayback, { once: true, capture: true })
   );
 
-  async function playWsChunk(blob) {
+  function queueWsChunk(blob) {
     const epoch = wsPlaybackEpoch;
     wsPendingChunks++;
-    try {
-      primePlayback();
-      const ctx = audioCtx;
-      if (ctx.state === 'suspended') await ctx.resume();
+    wsChunkQueue = wsChunkQueue
+      .then(() => playWsChunk(blob, epoch))
+      .catch(err => console.error('WebSocket audio playback failed', err))
+      .finally(() => {
+        if (epoch === wsPlaybackEpoch) {
+          wsPendingChunks = Math.max(0, wsPendingChunks - 1);
+        }
+      });
+  }
 
-      const arrayBuffer = await blob.arrayBuffer();
-      if (epoch !== wsPlaybackEpoch) return;
-      const ints = new Int16Array(arrayBuffer);
-      const buf = ctx.createBuffer(1, ints.length, wsSampleRate);
-      const floats = buf.getChannelData(0);
-      for (let i = 0; i < ints.length; i++) floats[i] = ints[i] / 32768;
+  async function playWsChunk(blob, epoch) {
+    primePlayback();
+    const ctx = audioCtx;
+    if (ctx.state === 'suspended') await ctx.resume();
 
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(ctx.destination);
+    const arrayBuffer = await blob.arrayBuffer();
+    if (epoch !== wsPlaybackEpoch) return;
+    const ints = new Int16Array(arrayBuffer);
+    const buf = ctx.createBuffer(1, ints.length, wsSampleRate);
+    const floats = buf.getChannelData(0);
+    for (let i = 0; i < ints.length; i++) floats[i] = ints[i] / 32768;
 
-      if (!streamPlayback) streamPlayback = { sources: new Set(), cancelled: false };
-      streamPlayback.sources.add(src);
-      src.onended = () => { if (streamPlayback) streamPlayback.sources.delete(src); };
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
 
-      if (wsNextTime < ctx.currentTime + 0.02) wsNextTime = ctx.currentTime + 0.05;
-      src.start(wsNextTime);
-      wsNextTime += buf.duration;
+    if (!streamPlayback) streamPlayback = { sources: new Set(), cancelled: false };
+    streamPlayback.sources.add(src);
+    src.onended = () => { if (streamPlayback) streamPlayback.sources.delete(src); };
 
-      if (!wsStarted) {
-        wsStarted = true;
-        setState('speaking');
-      }
-    } finally {
-      if (epoch === wsPlaybackEpoch) {
-        wsPendingChunks = Math.max(0, wsPendingChunks - 1);
-      }
+    if (wsNextTime < ctx.currentTime + 0.02) wsNextTime = ctx.currentTime + 0.05;
+    src.start(wsNextTime);
+    wsNextTime += buf.duration;
+
+    if (!wsStarted) {
+      wsStarted = true;
+      setState('speaking');
     }
   }
 
@@ -2620,9 +2655,15 @@
   // Duplex VAD — always-on mic with client-side gating
   // ═══════════════════════════════════════════════════
   let vadMicStream = null;
-  let vadRecorder = null;
+  let vadSourceNode = null;
+  let vadCaptureNode = null;
+  let vadSilentGain = null;
   let vadAnalyser = null;
   let vadDataArray = null;
+  let vadPreRollChunks = [];
+  let vadPreRollSamples = 0;
+  let vadUtteranceChunks = [];
+  let vadUtteranceSamples = 0;
   let vadSilenceFrames = 0;
   let vadVoiceFrames = 0;
   let isWsRecording = false;
@@ -2631,6 +2672,8 @@
   const VAD_THRESHOLD = 15;
   const VAD_SILENCE_FRAMES = 60;   // ~1s of quiet ends the utterance
   const VAD_BARGE_IN_FRAMES = 12;  // ~200ms of sustained speech cuts HAL off
+  const VAD_PRE_ROLL_SECONDS = 0.6;
+  const VAD_MAX_RECORD_SECONDS = 90;
 
   // Duplex cycles OFF → ON → WAKE. In WAKE the mic stays hot but the server
   // drops any utterance not addressed to HAL ("HAL, …" / "Hey HAL …").
@@ -2658,15 +2701,24 @@
     } else if (duplexMode === 2) {
       appendToMissionLog('system', 'Wake-word mode: say "HAL, …" to be heard.');
     } else if (duplexMode === 0) {
-      if (vadRecorder && vadRecorder.state === 'recording') {
-        vadRecorder.onstop = null;
-        vadRecorder.ondataavailable = null;
-        try { vadRecorder.stop(); } catch (e) {}
-      }
-      vadRecorder = null;
       if (isWsRecording) {
         isWsRecording = false;
+        vadUtteranceChunks = [];
+        vadUtteranceSamples = 0;
         turnDone();  // a half-captured utterance must not leave the UI busy
+      }
+      if (vadCaptureNode) {
+        vadCaptureNode.onaudioprocess = null;
+        try { vadCaptureNode.disconnect(); } catch (e) {}
+        vadCaptureNode = null;
+      }
+      if (vadSilentGain) {
+        try { vadSilentGain.disconnect(); } catch (e) {}
+        vadSilentGain = null;
+      }
+      if (vadSourceNode) {
+        try { vadSourceNode.disconnect(); } catch (e) {}
+        vadSourceNode = null;
       }
       if (vadMicStream) {
         vadMicStream.getTracks().forEach(t => t.stop());
@@ -2674,6 +2726,8 @@
       }
       vadAnalyser = null;
       vadDataArray = null;
+      vadPreRollChunks = [];
+      vadPreRollSamples = 0;
       stopWaveform();
       appendToMissionLog('system', 'Duplex mode disabled.');
     }
@@ -2690,9 +2744,19 @@
 
       vadAnalyser = audioCtx.createAnalyser();
       vadAnalyser.fftSize = 512;
-      const source = audioCtx.createMediaStreamSource(vadMicStream);
-      source.connect(vadAnalyser);
+      vadSourceNode = audioCtx.createMediaStreamSource(vadMicStream);
+      vadSourceNode.connect(vadAnalyser);
       vadDataArray = new Uint8Array(vadAnalyser.frequencyBinCount);
+
+      // Capture PCM continuously. The rolling pre-roll preserves the opening
+      // wake word that would otherwise be lost while the VAD notices speech.
+      vadCaptureNode = audioCtx.createScriptProcessor(2048, 1, 1);
+      vadSilentGain = audioCtx.createGain();
+      vadSilentGain.gain.value = 0;
+      vadSourceNode.connect(vadCaptureNode);
+      vadCaptureNode.connect(vadSilentGain);
+      vadSilentGain.connect(audioCtx.destination);
+      vadCaptureNode.onaudioprocess = e => captureVadPcm(e.inputBuffer.getChannelData(0));
 
       startWaveformMic(vadMicStream);
       requestAnimationFrame(vadLoop);
@@ -2706,6 +2770,55 @@
       btnDuplex.style.color = '';
       sendWakeMode();
     }
+  }
+
+  function captureVadPcm(input) {
+    const chunk = new Float32Array(input);
+    if (isWsRecording) {
+      vadUtteranceChunks.push(chunk);
+      vadUtteranceSamples += chunk.length;
+      if (vadUtteranceSamples >= audioCtx.sampleRate * VAD_MAX_RECORD_SECONDS) {
+        stopWsRecording();
+      }
+      return;
+    }
+
+    vadPreRollChunks.push(chunk);
+    vadPreRollSamples += chunk.length;
+    const maxSamples = audioCtx.sampleRate * VAD_PRE_ROLL_SECONDS;
+    while (vadPreRollSamples > maxSamples && vadPreRollChunks.length > 1) {
+      vadPreRollSamples -= vadPreRollChunks.shift().length;
+    }
+  }
+
+  function encodeMonoWav(chunks, sampleRate, sampleCount) {
+    const buffer = new ArrayBuffer(44 + sampleCount * 2);
+    const view = new DataView(buffer);
+    const write = (offset, text) => {
+      for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    write(0, 'RIFF');
+    view.setUint32(4, 36 + sampleCount * 2, true);
+    write(8, 'WAVE');
+    write(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    write(36, 'data');
+    view.setUint32(40, sampleCount * 2, true);
+    let offset = 44;
+    for (const samples of chunks) {
+      for (let i = 0; i < samples.length; i++) {
+        const value = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, value < 0 ? value * 32768 : value * 32767, true);
+        offset += 2;
+      }
+    }
+    return buffer;
   }
 
   function vadLoop() {
@@ -2746,37 +2859,31 @@
     isWsRecording = true;
     busy = true;
     wsTurn = true;  // this turn now owns the WS reply; onclose must unlock it
+    wsCaptureTurnId = beginWsTurn();
+    vadUtteranceChunks = vadPreRollChunks;
+    vadUtteranceSamples = vadPreRollSamples;
+    vadPreRollChunks = [];
+    vadPreRollSamples = 0;
     setState('listening');
-    ws.send(JSON.stringify({ type: 'start_speech' }));
-
-    // Safari's MediaRecorder has no webm support; use its default container.
-    const opts = (window.MediaRecorder && MediaRecorder.isTypeSupported &&
-                  MediaRecorder.isTypeSupported('audio/webm'))
-      ? { mimeType: 'audio/webm' } : undefined;
-    vadRecorder = new MediaRecorder(vadMicStream, opts);
-    vadRecorder.ondataavailable = e => {
-      // No isWsRecording guard: the final chunk fires after stop(), and
-      // dropping it would clip the tail off every utterance.
-      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-        ws.send(e.data);
-      }
-    };
-    vadRecorder.start(250);
+    ws.send(JSON.stringify({ type: 'start_speech', turn_id: wsCaptureTurnId }));
   }
 
   function stopWsRecording() {
     isWsRecording = false;
     wsTurn = true;
-    const finish = () => {
-      ws.send(JSON.stringify({ type: 'end_speech' }));
+    const turnId = wsCaptureTurnId;
+    wsCaptureTurnId = null;
+    const chunks = vadUtteranceChunks;
+    const sampleCount = vadUtteranceSamples;
+    vadUtteranceChunks = [];
+    vadUtteranceSamples = 0;
+    if (ws && ws.readyState === WebSocket.OPEN && sampleCount > 0) {
+      ws.send(encodeMonoWav(chunks, audioCtx.sampleRate, sampleCount));
+      ws.send(JSON.stringify({ type: 'end_speech', turn_id: turnId }));
       setState('thinking');
       startThinkingTimer();
-    };
-    if (vadRecorder && vadRecorder.state === 'recording') {
-      vadRecorder.onstop = finish;
-      vadRecorder.stop();
     } else {
-      finish();
+      turnDone();
     }
   }
 
@@ -2811,14 +2918,16 @@
         const audioBytes = new Uint8Array(await blob.arrayBuffer());
         if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('socket closed');
         wsTurn = true;
-        ws.send(JSON.stringify({ type: 'start_speech', manual: true }));
+        const turnId = beginWsTurn();
+        ws.send(JSON.stringify({ type: 'start_speech', manual: true, turn_id: turnId }));
         for (let offset = 0; offset < audioBytes.length; offset += 256 * 1024) {
           ws.send(audioBytes.slice(offset, offset + 256 * 1024));
         }
-        ws.send(JSON.stringify({ type: 'end_speech' }));
+        ws.send(JSON.stringify({ type: 'end_speech', turn_id: turnId }));
         return;
       } catch (err) {
         wsTurn = false;  // fall through to the HTTP compatibility path
+        wsActiveTurnId = null;
       }
     }
 
@@ -2857,10 +2966,12 @@
     if (ws && ws.readyState === WebSocket.OPEN) {
       wsTurn = true;
       try {
-        ws.send(JSON.stringify({ type: 'text_input', text: text }));
+        const turnId = beginWsTurn();
+        ws.send(JSON.stringify({ type: 'text_input', text: text, turn_id: turnId }));
         return;
       } catch (err) {
         wsTurn = false;  // fall through to the HTTP path
+        wsActiveTurnId = null;
       }
     }
 

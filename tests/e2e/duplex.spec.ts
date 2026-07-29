@@ -14,7 +14,15 @@ import {
 // let/const are script-scoped and never become window properties. Bare
 // identifiers resolve inside page.evaluate; window.* does not.
 declare let isWsRecording: boolean;
+declare let vadAnalyser: AnalyserNode | null;
+declare let vadPreRollChunks: Float32Array[];
+declare let vadPreRollSamples: number;
+declare let vadUtteranceChunks: Float32Array[];
+declare let vadUtteranceSamples: number;
 declare const setState: (state: string) => void;
+declare const captureVadPcm: (input: Float32Array) => void;
+declare const startWsRecording: () => void;
+declare const stopWsRecording: () => void;
 
 /**
  * Full-duplex mode and the VAD.
@@ -99,6 +107,36 @@ test.describe("full duplex", () => {
 
     await page.click(duplex);
     await expect.poll(() => logText(page)).toContain('say "HAL');
+  });
+
+  test("duplex capture sends pre-roll before the detected utterance", async ({ page }) => {
+    const socket = await openBridge(page);
+    await page.click(duplex);
+    await expect.poll(() => logText(page), { timeout: 15_000 }).toContain("Mic is hot");
+    socket.sent.length = 0;
+    socket.sentBinary.length = 0;
+
+    await page.evaluate(() => {
+      // Stop the synthetic analyser loop and drive the capture deterministically.
+      vadAnalyser = null;
+      isWsRecording = false;
+      vadPreRollChunks = [];
+      vadPreRollSamples = 0;
+      vadUtteranceChunks = [];
+      vadUtteranceSamples = 0;
+      captureVadPcm(new Float32Array(4096).fill(0.1));
+      startWsRecording();
+      captureVadPcm(new Float32Array(2048).fill(0.2));
+      stopWsRecording();
+    });
+
+    await expect.poll(() => framesOfType(socket, "end_speech").length).toBe(1);
+    expect(socket.sentBinary).toHaveLength(1);
+    const wav = socket.sentBinary[0];
+    expect(wav.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    expect(wav.readUInt32LE(40)).toBe((4096 + 2048) * 2);
+    expect(wav.readInt16LE(44)).toBeCloseTo(0.1 * 32767, -1);
+    expect(wav.readInt16LE(44 + 4096 * 2)).toBeCloseTo(0.2 * 32767, -1);
   });
 
   test("switching off releases the microphone tracks", async ({ page }) => {

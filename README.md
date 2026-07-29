@@ -8,7 +8,8 @@ and the reply comes back in HAL's voice.
 On screens wider than 760px the eye sits in a **Bridge** layout — mission log,
 telemetry bar, live waveform, mission cards, always-visible input — with an
 optional full-duplex mode (always-on mic with voice detection, barge-in, live
-interim captions, and an optional "HAL, …" wake-word gate) and background
+interim captions, and an optional "HAL, …" wake-word gate with audio pre-roll
+so the opening address is not clipped) and background
 **missions** HAL reports on when they finish. With
 `HAL_PERMISSION_MODE=ask`, HAL asks out loud before running a tool and waits
 for your yes/no (or an on-screen Allow/Deny).
@@ -104,7 +105,7 @@ npm run test:e2e
 ```
 
 Playwright boots its own instance on port 8123 with `HAL_SKIP_MODELS=1`, so it
-needs no models and no inference; ~30s, and it runs in CI alongside the Python
+needs no models and no inference; it runs in CI alongside the Python
 suite.
 
 ## Configuration (env vars, all optional)
@@ -201,7 +202,9 @@ fallback when the socket or streaming audio support is unavailable.
   with `transcript` frames, `tts_start`, raw PCM, `tts_done` — plus
   `interim_transcript` while you're still speaking — or `turn_aborted` when
   there is nothing to say (`reason: no_wake_word` for gated ambient speech).
-  HAL can speak first on this channel (mission reports, permission prompts).
+  User-owned frames carry a `turn_id`, so late audio or completion frames from
+  a barged-in turn cannot disturb its replacement. HAL can also speak first on
+  this channel (mission reports, permission prompts).
 
 ## Missions (background tasks)
 

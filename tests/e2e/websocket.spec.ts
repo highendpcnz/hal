@@ -56,7 +56,8 @@ test.describe("websocket protocol", () => {
 
     await expect.poll(() => socket.sent.filter((f) => f.includes("text_input")).length).toBe(1);
     const frame = JSON.parse(socket.sent.find((f) => f.includes("text_input"))!);
-    expect(frame).toEqual({ type: "text_input", text: "status report" });
+    expect(frame).toMatchObject({ type: "text_input", text: "status report" });
+    expect(typeof frame.turn_id).toBe("number");
   });
 
   test("push-to-talk prefers the socket and preserves audio frame order", async ({ page }) => {
@@ -74,12 +75,16 @@ test.describe("websocket protocol", () => {
     await expect.poll(() => framesOfType(socket, "start_speech").length).toBe(1);
     expect(framesOfType(socket, "start_speech")[0]).toEqual({
       type: "start_speech",
-      manual: true
+      manual: true,
+      turn_id: expect.any(Number)
     });
     await expect
       .poll(() => socket.sent.filter((frame) => frame === "<binary>").length)
       .toBeGreaterThanOrEqual(1);
     await expect.poll(() => framesOfType(socket, "end_speech").length).toBe(1);
+    expect(framesOfType(socket, "end_speech")[0].turn_id).toBe(
+      framesOfType(socket, "start_speech")[0].turn_id
+    );
 
     const start = socket.sent.findIndex((frame) => frame.includes("start_speech"));
     const firstAudio = socket.sent.indexOf("<binary>");
@@ -148,17 +153,44 @@ test.describe("websocket protocol", () => {
   });
 
   test("commentary phrases queue PCM instead of overlapping it", async ({ page }) => {
+    await page.addInitScript(() => {
+      const state = window as unknown as { __scheduledPcm: number[] };
+      state.__scheduledPcm = [];
+      const originalArrayBuffer = Blob.prototype.arrayBuffer;
+      let pcmBlobCall = 0;
+      Blob.prototype.arrayBuffer = async function patchedArrayBuffer() {
+        const value = await originalArrayBuffer.call(this);
+        if (this.size === 22050 * 2 && ++pcmBlobCall === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        return value;
+      };
+      const Context = window.AudioContext;
+      const originalCreate = Context.prototype.createBufferSource;
+      Context.prototype.createBufferSource = function patchedCreate() {
+        const source = originalCreate.call(this);
+        const originalStart = source.start.bind(source);
+        source.start = ((...args: Parameters<AudioBufferSourceNode["start"]>) => {
+          state.__scheduledPcm.push(source.buffer?.getChannelData(0)[0] ?? 0);
+          return originalStart(...args);
+        }) as AudioBufferSourceNode["start"];
+        return source;
+      };
+    });
     const socket = await openBridge(page);
     await page.mouse.click(5, 5); // trusted gesture primes the AudioContext
-    const oneSecondOfPcm = Buffer.alloc(22050 * 2);
+    const firstPcm = Buffer.alloc(22050 * 2);
+    const secondPcm = Buffer.alloc(22050 * 2);
+    firstPcm.writeInt16LE(1000, 0);
+    secondPcm.writeInt16LE(2000, 0);
 
     socket.send({ type: "commentary", text: "First phrase, Dave." });
     socket.send({ type: "tts_start", sample_rate: 22050 });
-    socket.sendBinary(oneSecondOfPcm);
+    socket.sendBinary(firstPcm);
     socket.send({ type: "tts_done" });
     socket.send({ type: "commentary", text: "Second phrase, Dave." });
     socket.send({ type: "tts_start", sample_rate: 22050 });
-    socket.sendBinary(oneSecondOfPcm);
+    socket.sendBinary(secondPcm);
     socket.send({ type: "tts_done" });
     socket.send({ type: "turn_done" });
 
@@ -168,7 +200,40 @@ test.describe("websocket protocol", () => {
       await eyeState(page),
       "two one-second phrases must still be playing after 1.3 seconds"
     ).toContain("speaking");
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (window as unknown as { __scheduledPcm: number[] }).__scheduledPcm
+        )
+      )
+      .toHaveLength(2);
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __scheduledPcm: number[] }).__scheduledPcm
+      )
+    ).toEqual([1000 / 32768, 2000 / 32768]);
     await expect.poll(() => eyeState(page), { timeout: 5000 }).toEqual([]);
+  });
+
+  test("late frames from a retired turn cannot reset the active turn", async ({ page }) => {
+    const socket = await openBridge(page);
+    await page.fill("#bridge-cmd", "current turn");
+    await page.press("#bridge-cmd", "Enter");
+    await expect.poll(() => framesOfType(socket, "text_input").length).toBe(1);
+    const current = framesOfType(socket, "text_input")[0].turn_id as number;
+
+    socket.send({ type: "commentary", turn_id: current - 1, text: "Obsolete." });
+    socket.send({ type: "turn_done", turn_id: current - 1 });
+    await page.waitForTimeout(300);
+    expect(await eyeState(page)).toContain("thinking");
+
+    socket.send({
+      type: "turn_aborted",
+      turn_id: current,
+      reason: "no_speech",
+      text: ""
+    });
+    await expect.poll(() => eyeState(page)).toEqual([]);
   });
 
   test("a tts cycle outside commentary does release the turn", async ({ page }) => {

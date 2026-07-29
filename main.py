@@ -878,7 +878,13 @@ _PERM_DENY_RE = re.compile(
 # addressed to HAL. The match is check-only — the full utterance still goes
 # to the agent, so voice mission triggers ("HAL, start mission…") keep
 # working and the persona is addressed the way it expects.
-_WAKE_RE = re.compile(r"^\s*(?:hey|ok|okay)?[,\s]*hal\b[,.!?:]*\s*(.*)$", re.I | re.S)
+# base.en commonly renders the spoken name "HAL" as "Hell" or "Hall"
+# (confirmed on the local voice path). Accept those exact homophones only;
+# broader guesses such as "how" would wake on ordinary ambient questions.
+_WAKE_RE = re.compile(
+    r"^\s*(?:hey|ok|okay)?[,\s]*(?:hal|hall|hell)\b[,.!?:]*\s*(.*)$",
+    re.I | re.S,
+)
 
 
 def _wake_word_required(
@@ -1942,15 +1948,15 @@ class SentenceAssembler:
     def _outside_markup(self, pos: int) -> bool:
         """Whether ``pos`` is safe to hand to speech normalization.
 
-        A partial inline-code span or Markdown link cannot be normalized yet:
-        splitting there would send raw backticks, brackets, or a URL to Piper.
-        This small scanner tracks only the constructs that must remain intact;
-        ordinary parentheses and prose punctuation stay eligible boundaries.
+        Partial code, links, emphasis, strikethrough, and table rows cannot be
+        normalized yet: splitting there would send raw Markdown to Piper.
+        Ordinary parentheses and prose punctuation stay eligible boundaries.
         """
         in_fence = False
         inline_ticks = 0
         bracket_depth = 0
         link_depth = 0
+        emphasis: dict[str, bool] = {}
         index = 0
         while index < pos:
             if self._buf[index] == "\\":
@@ -1999,8 +2005,39 @@ class SentenceAssembler:
                     link_depth = 1
                     index += 2
                     continue
+            if bracket_depth:
+                index += 1
+                continue
+
+            if char in "*_~":
+                end = index + 1
+                while end < pos and self._buf[end] == char:
+                    end += 1
+                run = end - index
+                line_start = self._buf.rfind("\n", 0, index) + 1
+                in_table = (
+                    self._buf[line_start : index + 1].lstrip().startswith("|")
+                )
+                if not in_table:
+                    if char == "~":
+                        if (run // 2) % 2:
+                            emphasis["~~"] = not emphasis.get("~~", False)
+                    elif run <= 3:
+                        token = char * run
+                        emphasis[token] = not emphasis.get(token, False)
+                index = end
+                continue
             index += 1
-        return not (in_fence or inline_ticks or bracket_depth or link_depth)
+        line_start = self._buf.rfind("\n", 0, pos) + 1
+        in_table_row = self._buf[line_start:pos].lstrip().startswith("|")
+        return not (
+            in_fence
+            or inline_ticks
+            or bracket_depth
+            or link_depth
+            or in_table_row
+            or any(emphasis.values())
+        )
 
     def _first_outside_boundary(self, pattern: re.Pattern) -> re.Match | None:
         pos = 0
@@ -2063,25 +2100,53 @@ class SentenceAssembler:
         return tail
 
 
-async def _ws_send_tts(websocket: WebSocket, text: str) -> None:
+def _ws_frame(kind: str, turn_id: int | str | None = None, **payload) -> dict:
+    """Build a socket frame, tagging user-owned turns when one is available."""
+    frame = {"type": kind, **payload}
+    if turn_id is not None:
+        frame["turn_id"] = turn_id
+    return frame
+
+
+async def _ws_send_tts(
+    websocket: WebSocket,
+    text: str,
+    turn_id: int | str | None = None,
+) -> None:
     """Speak one reply over the socket: tts_start, PCM frames, tts_done."""
-    await websocket.send_json({"type": "tts_start", "sample_rate": SAMPLE_RATE})
+    await websocket.send_json(
+        _ws_frame("tts_start", turn_id, sample_rate=SAMPLE_RATE)
+    )
     async for chunk in synthesize_hal_stream_async(speakable(text)):
         await websocket.send_bytes(chunk)
-    await websocket.send_json({"type": "tts_done"})
+    await websocket.send_json(_ws_frame("tts_done", turn_id))
 
 
-async def _ws_abort_turn(websocket: WebSocket, reason: str, text: str) -> None:
+async def _ws_abort_turn(
+    websocket: WebSocket,
+    reason: str,
+    text: str,
+    turn_id: int | str | None = None,
+) -> None:
     """Tell the client this turn produced no reply so it can unlock its UI."""
-    await websocket.send_json({"type": "turn_aborted", "reason": reason, "text": text})
+    await websocket.send_json(
+        _ws_frame("turn_aborted", turn_id, reason=reason, text=text)
+    )
 
 
-async def _speak_over_ws(session_id: str, websocket: WebSocket, text: str) -> None:
+async def _speak_over_ws(
+    session_id: str,
+    websocket: WebSocket,
+    text: str,
+    turn_id: int | str | None = None,
+) -> None:
     """Transcript frame + TTS as one unit, serialized per session so two
     replies (a turn and a mission report, say) can't interleave PCM frames."""
     async with _ws_speech_locks.hold(session_id):
-        await websocket.send_json({"type": "transcript", "role": "hal", "text": text})
-        await _ws_send_tts(websocket, text)
+        await websocket.send_json(
+            _ws_frame("transcript", turn_id, role="hal", text=text)
+        )
+        await _ws_send_tts(websocket, text, turn_id)
 
 
 async def _ws_run_turn(
@@ -2091,6 +2156,7 @@ async def _ws_run_turn(
     speaker: str | None = None,
     timings: dict[str, int] | None = None,
     total_start: float | None = None,
+    turn_id: int | str | None = None,
 ) -> None:
     all_timings = dict(timings or {})
     if not COMMENTARY:
@@ -2099,7 +2165,7 @@ async def _ws_run_turn(
         if total_start is not None:
             all_timings["total"] = _elapsed_ms(total_start)
         _log_latency(session_id, all_timings)
-        await _speak_over_ws(session_id, websocket, hal_text)
+        await _speak_over_ws(session_id, websocket, hal_text, turn_id)
         return
 
     # Speak-while-thinking: agent chunks flow through a sentence assembler
@@ -2131,8 +2197,10 @@ async def _ws_run_turn(
                 continue
             async with _ws_speech_locks.hold(session_id):
                 try:
-                    await websocket.send_json({"type": "commentary", "text": sentence})
-                    await _ws_send_tts(websocket, speakable(sentence))
+                    await websocket.send_json(
+                        _ws_frame("commentary", turn_id, text=sentence)
+                    )
+                    await _ws_send_tts(websocket, speakable(sentence), turn_id)
                     spoken_count += 1
                 except Exception:
                     pass  # socket gone — keep draining so the turn can end
@@ -2154,12 +2222,14 @@ async def _ws_run_turn(
     await speaker_task
 
     async with _ws_speech_locks.hold(session_id):
-        await websocket.send_json({"type": "transcript", "role": "hal", "text": hal_text})
+        await websocket.send_json(
+            _ws_frame("transcript", turn_id, role="hal", text=hal_text)
+        )
         if spoken_count == 0:
             # Nothing streamed (template reply, chess, error line) — speak
             # the reply whole, as before.
-            await _ws_send_tts(websocket, speakable(hal_text))
-    await websocket.send_json({"type": "turn_done"})
+            await _ws_send_tts(websocket, speakable(hal_text), turn_id)
+    await websocket.send_json(_ws_frame("turn_done", turn_id))
 
 
 async def _ws_turn_task(
@@ -2169,6 +2239,7 @@ async def _ws_turn_task(
     audio_bytes: bytes | None = None,
     timings: dict[str, int] | None = None,
     total_start: float | None = None,
+    turn_id: int | str | None = None,
 ) -> None:
     """One turn as a background task. Turns run concurrently with the receive
     loop so a spoken 'yes' can answer a permission request while the asking
@@ -2186,7 +2257,7 @@ async def _ws_turn_task(
                 if total_start is not None:
                     enrollment_timings["total"] = _elapsed_ms(total_start)
                 _log_latency(session_id, enrollment_timings)
-                await _speak_over_ws(session_id, websocket, enroll_reply)
+                await _speak_over_ws(session_id, websocket, enroll_reply, turn_id)
                 return
         await _ws_run_turn(
             websocket,
@@ -2195,13 +2266,19 @@ async def _ws_turn_task(
             speaker,
             timings=timings,
             total_start=total_start,
+            turn_id=turn_id,
         )
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         print(f"[ws] turn failed (session={session_id[:8]}): {exc!r}")
         try:
-            await _ws_abort_turn(websocket, "error", "Something went wrong on my end, Dave.")
+            await _ws_abort_turn(
+                websocket,
+                "error",
+                "Something went wrong on my end, Dave.",
+                turn_id,
+            )
         except Exception:
             pass  # socket already gone
 
@@ -2334,6 +2411,7 @@ async def ws_conversation(websocket: WebSocket):
     interim_last = 0.0
     interim_task: asyncio.Task | None = None
     manual_capture = False
+    capture_turn_id: int | str | None = None
 
     async def send_interim(snapshot: bytes, gen: int) -> None:
         if gen != interim_gen:
@@ -2389,12 +2467,26 @@ async def ws_conversation(websocket: WebSocket):
                 except json.JSONDecodeError:
                     continue
                 kind = data.get("type")
+                raw_turn_id = data.get("turn_id")
+                turn_id = (
+                    raw_turn_id
+                    if (
+                        isinstance(raw_turn_id, int)
+                        and not isinstance(raw_turn_id, bool)
+                    )
+                    or (
+                        isinstance(raw_turn_id, str)
+                        and 0 < len(raw_turn_id) <= 64
+                    )
+                    else None
+                )
 
                 if kind == "start_speech":
                     audio_chunks = []
                     audio_size = 0
                     audio_overflow = False
                     manual_capture = bool(data.get("manual"))
+                    capture_turn_id = turn_id
                     interim_gen += 1
                     interim_last = time.monotonic()
                     continue
@@ -2417,17 +2509,23 @@ async def ws_conversation(websocket: WebSocket):
                 turn_timings: dict[str, int] = {}
                 from_speech = False
                 turn_was_manual = False
+                active_turn_id = turn_id
                 turn_audio: bytes | None = None
                 if kind == "text_input":
                     user_text = (data.get("text") or "").strip()
                 elif kind == "end_speech":
                     turn_was_manual = manual_capture
                     manual_capture = False
+                    active_turn_id = capture_turn_id
+                    capture_turn_id = None
                     interim_gen += 1  # stale interim results must not surface
                     if audio_overflow:
                         audio_overflow = False
                         await _ws_abort_turn(
-                            websocket, "too_long", "That recording was too long for me, Dave."
+                            websocket,
+                            "too_long",
+                            "That recording was too long for me, Dave.",
+                            active_turn_id,
                         )
                         continue
                     audio_bytes = b"".join(audio_chunks)
@@ -2435,7 +2533,10 @@ async def ws_conversation(websocket: WebSocket):
                     audio_size = 0
                     if not audio_bytes:
                         await _ws_abort_turn(
-                            websocket, "no_speech", "I didn't quite catch that, Dave."
+                            websocket,
+                            "no_speech",
+                            "I didn't quite catch that, Dave.",
+                            active_turn_id,
                         )
                         continue
                     stage_start = time.perf_counter()
@@ -2448,7 +2549,10 @@ async def ws_conversation(websocket: WebSocket):
 
                 if not user_text:
                     await _ws_abort_turn(
-                        websocket, "no_speech", "I didn't quite catch that, Dave."
+                        websocket,
+                        "no_speech",
+                        "I didn't quite catch that, Dave.",
+                        active_turn_id,
                     )
                     continue
 
@@ -2463,21 +2567,41 @@ async def ws_conversation(websocket: WebSocket):
                     wake = _WAKE_RE.match(user_text)
                     if wake is None:
                         # Ambient speech, not addressed to HAL — drop silently.
-                        await _ws_abort_turn(websocket, "no_wake_word", "")
+                        await _ws_abort_turn(
+                            websocket,
+                            "no_wake_word",
+                            "",
+                            active_turn_id,
+                        )
                         continue
                     if not wake.group(1).strip():
                         # A bare "HAL." — acknowledge without engaging the brain.
                         await websocket.send_json(
-                            {"type": "transcript", "role": "user", "text": user_text}
+                            _ws_frame(
+                                "transcript",
+                                active_turn_id,
+                                role="user",
+                                text=user_text,
+                            )
                         )
-                        await _speak_over_ws(session_id, websocket, "Yes, Dave?")
+                        await _speak_over_ws(
+                            session_id,
+                            websocket,
+                            "Yes, Dave?",
+                            active_turn_id,
+                        )
                         continue
                     # Keep the full utterance: the persona expects to be
                     # addressed, and voice mission triggers rely on the prefix.
                 # Acknowledge what HAL heard before speaker matching or Hermes
                 # inference. The old HTTP path hid this until the whole answer.
                 await websocket.send_json(
-                    {"type": "transcript", "role": "user", "text": user_text}
+                    _ws_frame(
+                        "transcript",
+                        active_turn_id,
+                        role="user",
+                        text=user_text,
+                    )
                 )
                 _spawn(
                     _ws_turn_task(
@@ -2487,6 +2611,7 @@ async def ws_conversation(websocket: WebSocket):
                         turn_audio,
                         timings=turn_timings,
                         total_start=turn_start,
+                        turn_id=active_turn_id,
                     ),
                     name=f"ws-turn-{session_id[:8]}",
                 )

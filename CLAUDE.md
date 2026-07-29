@@ -47,11 +47,11 @@ curl -fsS http://127.0.0.1:8000/api/health     # want status: operational, bridg
 .venv/bin/python tests/run.py                  # zero-dep, seconds, "all tests passed"
 .venv/bin/ruff check .
 npm run check                                  # tsc --noEmit && vite build
-npm run test:e2e                               # Playwright, ~30s, boots its own server
+npm run test:e2e                               # Playwright, boots its own server
 ```
 
 `test:e2e` covers the behaviour layer the Python suite can only reach with
-substring assertions. 43 tests across six specs: the session-reset path
+substring assertions. 45 tests across six specs: the session-reset path
 (`reset.spec.ts`), push-to-talk and duplex WebSocket transport
 (`websocket.spec.ts`), the Allow/Deny bar (`permission.spec.ts`),
 full-duplex/VAD mode

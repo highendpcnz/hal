@@ -3,6 +3,8 @@ import type { Page, WebSocketRoute } from "@playwright/test";
 export interface Socket {
   /** Frames the page sent us. */
   sent: string[];
+  /** Raw binary frames the page sent us. */
+  sentBinary: Buffer[];
   /** Push a server frame to the page. */
   send: (frame: unknown) => void;
   /** Push raw PCM bytes from the server to the page. */
@@ -19,6 +21,7 @@ export interface Socket {
  */
 export async function mockSocket(page: Page): Promise<Socket> {
   const sent: string[] = [];
+  const sentBinary: Buffer[] = [];
   let route: WebSocketRoute | null = null;
   let markReady!: () => void;
   const ready = new Promise<void>((resolve) => {
@@ -28,13 +31,19 @@ export async function mockSocket(page: Page): Promise<Socket> {
   await page.routeWebSocket(/\/ws\/conversation/, (ws) => {
     route = ws;
     ws.onMessage((message) => {
-      sent.push(typeof message === "string" ? message : "<binary>");
+      if (typeof message === "string") {
+        sent.push(message);
+      } else {
+        sent.push("<binary>");
+        sentBinary.push(Buffer.from(message));
+      }
     });
     markReady();
   });
 
   return {
     sent,
+    sentBinary,
     send: (frame) => route?.send(JSON.stringify(frame)),
     sendBinary: (frame) => route?.send(frame),
     ready
