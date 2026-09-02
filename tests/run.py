@@ -1794,11 +1794,10 @@ from robot.cyberpi import (  # noqa: E402
     DEFAULT_PROFILE,
     F3F4FrameDecoder,
     MAX_ONLINE_SCRIPT_BYTES,
-    ONLINE_ENTRY_SCRIPTS,
-    ONLINE_RESTART_WAIT,
     decode_current_mode_response,
     decode_firmware_version_response,
     ONLINE_MODE_MARKER,
+    UPLOAD_MODE_MARKER,
     CyberPiOnlineRequest,
     CyberPiOnlineResponse,
     CyberPiFrame,
@@ -1812,8 +1811,9 @@ from robot.cyberpi import (  # noqa: E402
     encode_f3f4_frame,
     encode_current_mode_query_frame,
     encode_firmware_version_query_frame,
-    encode_online_entry_frames,
+    encode_online_mode_frame,
     encode_online_request_payload,
+    encode_upload_mode_frame,
     extract_boot_lines,
 )
 from robot.safety import MotionLimits, SafetyController, SafetyError  # noqa: E402
@@ -1825,12 +1825,12 @@ from robot.telemetry import (  # noqa: E402
     CyberPiTelemetryClient,
 )
 from robot.estop import (  # noqa: E402
-    ONLINE_ENTRY_SETTLE_SECONDS as ESTOP_ONLINE_ENTRY_SETTLE_SECONDS,
+    MODE_SWITCH_SETTLE_SECONDS as ESTOP_MODE_SWITCH_SETTLE_SECONDS,
     STOP_ALL_SCRIPT,
     CyberPiEmergencyStopClient,
 )
 from robot.motion import (  # noqa: E402
-    ONLINE_ENTRY_SETTLE_SECONDS as MOTION_ONLINE_ENTRY_SETTLE_SECONDS,
+    MODE_SWITCH_SETTLE_SECONDS as MOTION_MODE_SWITCH_SETTLE_SECONDS,
     CyberPiMotionClient,
 )
 
@@ -2099,31 +2099,20 @@ class _FakeCyberPiSerial:
 
     def write(self, data: bytes) -> int:
         self.writes.append(data)
+        if data == ONLINE_MODE_MARKER:
+            # The real mode-switch command (see cyberpi.ONLINE_MODE_MARKER).
+            self.mode_byte = 0x01
+            self._incoming.extend(b"boot noise\r\n" + data)
+            return len(data)
+        if data == UPLOAD_MODE_MARKER:
+            self.mode_byte = 0x00
+            self._incoming.extend(b"boot noise\r\n" + data)
+            return len(data)
         payload = decode_f3f4_frame(data).payload
         if payload == bytes((0x0D, 0x80)):
             response_payload = bytes((0x0D, 0x80, self.mode_byte))
         elif payload == bytes((0x06,)):
             response_payload = bytes((0x06,)) + b"44.01.016"
-        elif len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
-            # The mBlock online-mode bootstrap sequence (see
-            # cyberpi.ONLINE_ENTRY_SCRIPTS). Mirrors real hardware: only the
-            # final `online_restart` step actually flips the reported mode.
-            sequence = int.from_bytes(payload[2:4], "little")
-            script_length = int.from_bytes(payload[4:6], "little")
-            script = payload[6 : 6 + script_length].decode("utf-8")
-            if script == ONLINE_ENTRY_SCRIPTS[-1]:
-                self.mode_byte = 0x01
-            response_body = repr({"ret": None}).encode()
-            response_payload = bytes(
-                (
-                    0x28,
-                    0x01,
-                    sequence & 0xFF,
-                    sequence >> 8,
-                    len(response_body) & 0xFF,
-                    len(response_body) >> 8,
-                )
-            ) + response_body
         else:
             request = decode_online_request_payload(payload)
             if request.script in self.error_scripts:
@@ -2280,19 +2269,10 @@ finally:
     _estop_error_client.close()
 check("CyberPi estop surfaces a structured remote error", _estop_error_decoded)
 
-_online_entry_frames = encode_online_entry_frames()
-_online_entry_decoded = []
-for _frame_bytes in _online_entry_frames:
-    _payload = decode_f3f4_frame(_frame_bytes).payload
-    _length = int.from_bytes(_payload[4:6], "little")
-    _online_entry_decoded.append(
-        (_payload[0], _payload[1], _payload[6 : 6 + _length].decode("utf-8"))
-    )
 check(
-    "encode_online_entry_frames produces mBlock's exact captured online-mode bootstrap sequence",
-    len(_online_entry_frames) == 3
-    and _online_entry_decoded
-    == [(0x28, ONLINE_RESTART_WAIT, script) for script in ONLINE_ENTRY_SCRIPTS],
+    "encode_online_mode_frame/encode_upload_mode_frame return the hardware-confirmed mode markers",
+    encode_online_mode_frame() == ONLINE_MODE_MARKER
+    and encode_upload_mode_frame() == UPLOAD_MODE_MARKER,
 )
 
 _estop_upload_mode_serial = _FakeCyberPiSerial(mode_byte=0x00)
@@ -2303,26 +2283,25 @@ _estop_upload_mode_client = CyberPiEmergencyStopClient(
 _estop_bootstrap_mode = _estop_upload_mode_client.initialize()
 _estop_upload_mode_client.close()
 check(
-    "CyberPi estop self-bootstraps into online mode via mBlock's entry sequence",
+    "CyberPi estop self-bootstraps into online mode via ONLINE_MODE_MARKER",
     _estop_bootstrap_mode is CyberPiMode.ONLINE
     and _estop_upload_mode_serial.mode_byte == 0x01
-    and _estop_bootstrap_sleeps == [ESTOP_ONLINE_ENTRY_SETTLE_SECONDS],
+    and ONLINE_MODE_MARKER in _estop_upload_mode_serial.writes
+    and _estop_bootstrap_sleeps == [ESTOP_MODE_SWITCH_SETTLE_SECONDS],
 )
 
 _estop_stuck_upload_serial = _FakeCyberPiSerial(mode_byte=0x00)
-_estop_stuck_upload_serial.mode_byte = 0x00
 _original_estop_write = _estop_stuck_upload_serial.write
-def _estop_write_ignoring_online_restart(data: bytes) -> int:  # noqa: E306
+def _estop_write_ignoring_mode_marker(data: bytes) -> int:  # noqa: E306
     # Simulate a board that never actually settles into online mode, even
-    # after the bootstrap sequence -- initialize() must still raise, not
+    # after the mode-marker command -- initialize() must still raise, not
     # silently proceed.
-    payload = decode_f3f4_frame(data).payload
-    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
+    if data == ONLINE_MODE_MARKER:
         written = _original_estop_write(data)
         _estop_stuck_upload_serial.mode_byte = 0x00
         return written
     return _original_estop_write(data)
-_estop_stuck_upload_serial.write = _estop_write_ignoring_online_restart
+_estop_stuck_upload_serial.write = _estop_write_ignoring_mode_marker
 _estop_stuck_upload_client = CyberPiEmergencyStopClient(
     _estop_stuck_upload_serial, timeout_seconds=0.1, sleeper=lambda _seconds: None
 )
@@ -2335,39 +2314,8 @@ else:
 finally:
     _estop_stuck_upload_client.close()
 check(
-    "CyberPi estop still refuses to arm if the bootstrap sequence doesn't take",
+    "CyberPi estop still refuses to arm if the mode-marker command doesn't take",
     _estop_stuck_upload_refused,
-)
-
-# Firmware-version-dependent behavior, hardware-confirmed both ways (see
-# docs/termux-usb-bringup.md): online_restart alone works on 44.01.011 but
-# NOT on 44.01.016, where config.write_config must precede it. This fake
-# mirrors the .016-shaped board -- online_restart alone does not take, so
-# initialize() must fall through to the full sequence and succeed there.
-_estop_two_tier_serial = _FakeCyberPiSerial(mode_byte=0x00)
-_estop_write_config_seen = [False]
-_original_estop_two_tier_write = _estop_two_tier_serial.write
-def _estop_write_two_tier(data: bytes) -> int:  # noqa: E306
-    payload = decode_f3f4_frame(data).payload
-    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
-        script_length = int.from_bytes(payload[4:6], "little")
-        script = payload[6 : 6 + script_length].decode("utf-8")
-        if script == ONLINE_ENTRY_SCRIPTS[1]:
-            _estop_write_config_seen[0] = True
-        written = _original_estop_two_tier_write(data)
-        if script == ONLINE_ENTRY_SCRIPTS[-1] and not _estop_write_config_seen[0]:
-            _estop_two_tier_serial.mode_byte = 0x00
-        return written
-    return _original_estop_two_tier_write(data)
-_estop_two_tier_serial.write = _estop_write_two_tier
-_estop_two_tier_client = CyberPiEmergencyStopClient(
-    _estop_two_tier_serial, timeout_seconds=0.1, sleeper=lambda _seconds: None
-)
-_estop_two_tier_mode = _estop_two_tier_client.initialize()
-_estop_two_tier_client.close()
-check(
-    "CyberPi estop falls back to the full sequence when online_restart alone doesn't take",
-    _estop_two_tier_mode is CyberPiMode.ONLINE,
 )
 
 _motion_safety = SafetyController(MotionLimits(max_distance_cm=10, max_turn_degrees=45))
@@ -2445,22 +2393,22 @@ _motion_upload_mode_client = CyberPiMotionClient(
 _motion_bootstrap_mode = _motion_upload_mode_client.initialize()
 _motion_upload_mode_client.close()
 check(
-    "CyberPi motion client self-bootstraps into online mode via mBlock's entry sequence",
+    "CyberPi motion client self-bootstraps into online mode via ONLINE_MODE_MARKER",
     _motion_bootstrap_mode is CyberPiMode.ONLINE
     and _motion_upload_mode_serial.mode_byte == 0x01
-    and _motion_bootstrap_sleeps == [MOTION_ONLINE_ENTRY_SETTLE_SECONDS],
+    and ONLINE_MODE_MARKER in _motion_upload_mode_serial.writes
+    and _motion_bootstrap_sleeps == [MOTION_MODE_SWITCH_SETTLE_SECONDS],
 )
 
 _motion_stuck_upload_serial = _FakeCyberPiSerial(mode_byte=0x00)
 _original_motion_write = _motion_stuck_upload_serial.write
-def _motion_write_ignoring_online_restart(data: bytes) -> int:  # noqa: E306
-    payload = decode_f3f4_frame(data).payload
-    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
+def _motion_write_ignoring_mode_marker(data: bytes) -> int:  # noqa: E306
+    if data == ONLINE_MODE_MARKER:
         written = _original_motion_write(data)
         _motion_stuck_upload_serial.mode_byte = 0x00
         return written
     return _original_motion_write(data)
-_motion_stuck_upload_serial.write = _motion_write_ignoring_online_restart
+_motion_stuck_upload_serial.write = _motion_write_ignoring_mode_marker
 _motion_stuck_upload_safety = SafetyController(MotionLimits(max_distance_cm=10))
 _motion_stuck_upload_safety.connect(now=0.0)
 _motion_stuck_upload_safety.arm(now=0.0)
@@ -2480,41 +2428,8 @@ else:
 finally:
     _motion_stuck_upload_client.close()
 check(
-    "CyberPi motion client still refuses to arm if the bootstrap sequence doesn't take",
+    "CyberPi motion client still refuses to arm if the mode-marker command doesn't take",
     _motion_stuck_upload_refused,
-)
-
-_motion_two_tier_serial = _FakeCyberPiSerial(mode_byte=0x00)
-_motion_write_config_seen = [False]
-_original_motion_two_tier_write = _motion_two_tier_serial.write
-def _motion_write_two_tier(data: bytes) -> int:  # noqa: E306
-    payload = decode_f3f4_frame(data).payload
-    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
-        script_length = int.from_bytes(payload[4:6], "little")
-        script = payload[6 : 6 + script_length].decode("utf-8")
-        if script == ONLINE_ENTRY_SCRIPTS[1]:
-            _motion_write_config_seen[0] = True
-        written = _original_motion_two_tier_write(data)
-        if script == ONLINE_ENTRY_SCRIPTS[-1] and not _motion_write_config_seen[0]:
-            _motion_two_tier_serial.mode_byte = 0x00
-        return written
-    return _original_motion_two_tier_write(data)
-_motion_two_tier_serial.write = _motion_write_two_tier
-_motion_two_tier_safety = SafetyController(MotionLimits(max_distance_cm=10))
-_motion_two_tier_safety.connect(now=0.0)
-_motion_two_tier_safety.arm(now=0.0)
-_motion_two_tier_safety.update_telemetry(_telemetry)
-_motion_two_tier_client = CyberPiMotionClient(
-    _motion_two_tier_serial,
-    _motion_two_tier_safety,
-    timeout_seconds=0.1,
-    sleeper=lambda _seconds: None,
-)
-_motion_two_tier_mode = _motion_two_tier_client.initialize()
-_motion_two_tier_client.close()
-check(
-    "CyberPi motion client falls back to the full sequence when online_restart alone doesn't take",
-    _motion_two_tier_mode is CyberPiMode.ONLINE,
 )
 
 import robot.android_usb as _android_usb_mod  # noqa: E402

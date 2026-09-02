@@ -27,8 +27,7 @@ from .cyberpi import (
     decode_current_mode_response,
     decode_online_response_payload,
     encode_current_mode_query_frame,
-    encode_online_entry_frames,
-    encode_online_restart_only_frame,
+    encode_online_mode_frame,
     encode_online_request_frame,
 )
 from .telemetry import (
@@ -41,10 +40,11 @@ from .telemetry import (
 
 STOP_ALL_SCRIPT = 'cyberpi.mbot2.EM_stop(port = "all")'
 
-# Empirically observed settle time after the online-entry sequence's third
-# frame before the device reliably reports online mode — not documented or
-# guaranteed, see cyberpi.encode_online_entry_frames().
-ONLINE_ENTRY_SETTLE_SECONDS = 2.5
+# Empirically observed settle time after sending ONLINE_MODE_MARKER before the
+# device reliably reports online mode on a re-query — two live round trips on
+# the Mac (see docs/termux-usb-bringup.md) both confirmed within this window;
+# not documented or guaranteed by CyberPi's firmware.
+MODE_SWITCH_SETTLE_SECONDS = 1.5
 
 
 class CyberPiEmergencyStopClient:
@@ -109,23 +109,21 @@ class CyberPiEmergencyStopClient:
         failure mode that cannot be tolerated, so this refuses to arm outside
         genuine online mode rather than merely logging it.
 
-        If the board isn't online yet, this tries mBlock's own online-mode
-        bootstrap in two tiers, since the correct sequence turned out to be
-        firmware-version dependent (hardware-confirmed both ways — see
-        docs/termux-usb-bringup.md): `online_restart` alone first (fast,
-        correct on newer firmware like 44.01.011), then the full
-        `encode_online_entry_frames()` sequence if that alone didn't take
-        (needed on older firmware like 44.01.016, where the single-step form
-        is not sufficient) — so a Pixel-only session with no prior
-        Mac/mBlock connection can still arm on either.
+        If the board isn't online yet, this sends ONLINE_MODE_MARKER —
+        the real mode-switch command, hardware-confirmed via a full USB
+        capture of a real mBlock session plus a direct live round-trip test
+        (see cyberpi.ONLINE_MODE_MARKER's docstring and
+        docs/termux-usb-bringup.md). An earlier version of this bootstrap
+        tried to trigger the switch by running mBlock's `online_restart`
+        script instead; that was a misread of the capture — the script
+        reference was a bare name lookup, not a call, and hardware-confirmed
+        to do nothing to the reported mode either way.
         """
 
         mode = self._query_mode()
         if mode is not CyberPiMode.ONLINE:
-            self._attempt_online_entry(encode_online_restart_only_frame())
-            mode = self._query_mode()
-        if mode is not CyberPiMode.ONLINE:
-            self._attempt_online_entry(*encode_online_entry_frames())
+            self._write(encode_online_mode_frame())
+            self._sleeper(MODE_SWITCH_SETTLE_SECONDS)
             mode = self._query_mode()
         if mode is not CyberPiMode.ONLINE:
             raise CyberPiNotReadyError(f"CyberPi reports mode={mode.value!r}, not online")
@@ -139,24 +137,6 @@ class CyberPiEmergencyStopClient:
             "current-mode response",
         )
         return decode_current_mode_response(frame.payload)
-
-    def _attempt_online_entry(self, *frames: bytes) -> None:
-        """Best-effort: send each given online-entry frame and wait out its
-        response, tolerating a timeout on any step since the sequence is
-        what matters, not confirming each ack. Does not raise on its own —
-        initialize() re-checks mode afterward."""
-
-        for frame in frames:
-            self._write(frame)
-            try:
-                self._read_matching(
-                    lambda item: len(item.payload) >= 2
-                    and item.payload[:2] == bytes((ONLINE_PROTOCOL_ID, ONLINE_WAIT)),
-                    "online-entry step acknowledgment",
-                )
-            except CyberPiTimeoutError:
-                pass
-        self._sleeper(ONLINE_ENTRY_SETTLE_SECONDS)
 
     def stop_all(self) -> None:
         """Send EM_stop(port="all"). Raises if CyberPi reports an execution error."""

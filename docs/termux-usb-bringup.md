@@ -388,6 +388,91 @@ Practical implication going forward: don't assume either sequence is *the*
 answer — if this stops working again after some future firmware change,
 re-capture rather than assume it's the same bug.
 
+**Correction, found later (see next section): the "confirmed live" claim
+above rested on a flawed test.** That verification ran `CyberPiMotionClient`
+directly against a board that was already online from an earlier diagnostic
+session — `initialize()`'s early-return-if-already-online path short-circuited
+before the two-tier bootstrap logic ever ran. The bootstrap itself was never
+actually exercised end to end until the genuine cold-boot test below, which
+is where it was found not to work at all.
+
+## Correction: the real trigger was never `online_restart` — it was an unsent frame
+
+The two-tier fix above shipped on the strength of the flawed verification
+noted above. The first genuine test against it — a real cold boot, CyberPi
+connected to the Pixel, powered on fresh, driven through the actual
+`/api/say` → Gemma tool-call → `CyberPiMotionClient` path — failed:
+`"the mode is set to upload and is not online."`
+
+A raw diagnostic mirroring `initialize()`'s exact logic against the same
+cold-booted board (bypassing the try/except-wrapped scripts, which swallow
+every exception and can't show whether anything really happened) showed
+both tiers completing with clean `{"ret": None}` acks and the mode still
+`upload` afterward. Evaluating the bare name `online_restart` (no call) via
+a raw request confirmed why: it decoded as
+`{"ret": "<function online_restart at 0x...>"}` — a real function, and
+`ONLINE_ENTRY_SCRIPTS[-1]`'s `try:\n    online_restart\nexcept:\n    pass`
+only *references* it, never calls it. A follow-up test that called it for
+real — `online_restart()`, with parens — also returned cleanly with no
+exception, and *still* didn't flip the mode. The whole script-based theory
+was wrong: mBlock's own capture had genuinely shown this exact bare
+reference (confirming the transcription was accurate), but nothing about it
+ever caused the mode switch, on either firmware version, in this codebase
+or in mBlock's own traffic.
+
+A third, complete USB capture (same method, `tshark` on `XHC0`/`XHC1`) was
+taken from *before* the board was even powered on, capturing mBlock's full
+"Enter Live" flow from a genuine cold boot rather than a guessed mid-session
+fragment. It showed something the earlier captures had missed entirely: a
+short host→device frame, `f3 f6 03 00 0d 00 01 0e f4`, sent independently of
+any script. Decoded, its payload is `0d 00 01` — `MODE_QUERY_ID` (`0x0D`)
+again, but with command byte `0x00` (not the query's `0x80`) and a
+target-mode data byte (`0x01`). This is *exactly* the bytes already sitting
+in `robot/cyberpi.py` as `ONLINE_MODE_MARKER` — present in the codebase
+since the very first bring-up, but only ever used as something to *decode*
+(`decode_mode_marker()`), never something to *send*. The device echoes the
+same three bytes back as an acknowledgment (`0d 00 01`).
+
+Confirmed live, directly, isolating just this one frame (mBlock quit, so
+nothing else was touching the port): sending `UPLOAD_MODE_MARKER`
+(`f3 f6 03 00 0d 00 00 0d f4`) flips a genuinely-online board to `upload`
+immediately (echoed `0d0000`, query confirms); sending `ONLINE_MODE_MARKER`
+right after flips it straight back to `online` (echoed `0d0001`, query
+confirms). Repeated, both directions, same result. No script, no settle
+dance, no firmware-version branching — one frame, sent directly.
+
+**Fixed properly this time**: `robot/cyberpi.py` gained
+`encode_online_mode_frame()`/`encode_upload_mode_frame()` (thin wrappers
+around the existing marker constants), and `estop.py`/`motion.py`'s
+`initialize()` now sends `ONLINE_MODE_MARKER` directly instead of the
+script dance — one write, a short settle (`MODE_SWITCH_SETTLE_SECONDS`,
+1.5s, based on the two live round trips above), then re-query. The old
+`ONLINE_RESTART_WAIT`/`ONLINE_ENTRY_SCRIPTS`/`encode_online_entry_frames()`/
+`encode_online_restart_only_frame()`/two-tier fallback machinery was removed
+outright rather than kept alongside — it is confirmed to do nothing for
+mode-switching, on either firmware version, so keeping it as a fallback
+would just be dead weight with a false sense of redundancy.
+
+Lesson for next time, stated plainly: a script that returns `{"ret": None}`
+with no exception is not evidence it *did* anything — `try/except: pass`
+guarantees that response whether the wrapped code succeeded, no-opped, or
+never ran. The only trustworthy signal here is the mode re-query itself.
+
+**Confirmed live, real hardware, genuine Pixel cold boot, through the full
+production stack** (not a raw capture-replay script): CyberPi power-cycled
+fresh with the fix already deployed, `upload` → raw diagnostic sends
+`ONLINE_MODE_MARKER` directly over `Ch340UsbTransport` → `online`, matching
+`motion.py`'s exact new `initialize()` logic byte for byte. Then, separately,
+a real `/api/say` request through the actual running `main.py` → Gemma tool
+call → `CyberPiMotionClient` produced actual wheel movement — operator-
+confirmed. (Two earlier attempts through the chat API that day failed with
+generic "error accessing the motor port" replies; root cause was operator
+error, not this fix — `main.py` had been launched as a plain `./run.sh`
+instead of wrapped in `termux-usb -r -E -e "./run.sh" ...`, so
+`TERMUX_USB_FD` was never set and `_open_robot_transport()` silently fell
+back to a pyserial path that doesn't exist on Android. Once relaunched
+correctly, the very next attempt worked.)
+
 ## Still open
 - An initial raw device-descriptor read via `os.read(fd, 18)` returned zero
   bytes (superseded — the working path is `libusb_control_transfer`, not a
