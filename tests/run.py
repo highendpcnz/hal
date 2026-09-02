@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main  # noqa: E402
 import hermes_bridge  # noqa: E402
 import mission_control  # noqa: E402
+from finetune import eval_harness  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -2717,6 +2718,139 @@ check("WhisperCppModel raises WhisperCppError when the model file doesn't exist"
 shutil.rmtree(_whisper_test_dir, ignore_errors=True)
 
 # ----------------------------------------------------------------------------
+
+check(
+    "eval_harness._args_match requires an exact match on explicit arguments",
+    eval_harness._args_match({"distance_cm": 20, "speed_pct": 15}, {"distance_cm": 20, "speed_pct": 15}, {})[0]
+    and not eval_harness._args_match({"distance_cm": 20, "speed_pct": 15}, {"distance_cm": 25, "speed_pct": 15}, {})[0],
+)
+check(
+    "eval_harness._args_match only bounds-checks speed_pct when it wasn't specified in the source phrasing",
+    eval_harness._args_match(
+        {"distance_cm": 20, "speed_pct": 15}, {"distance_cm": 20, "speed_pct": 22}, {"speed_specified": False}
+    )[0]
+    and not eval_harness._args_match(
+        {"distance_cm": 20, "speed_pct": 15}, {"distance_cm": 20, "speed_pct": 31}, {"speed_specified": False}
+    )[0],
+)
+check(
+    "eval_harness._args_match rejects unexpected extra arguments",
+    not eval_harness._args_match({}, {"angle_degrees": 30}, {})[0],
+)
+
+check(
+    "eval_harness._looks_like_false_success flags success language with no failure acknowledgement",
+    eval_harness._looks_like_false_success("Driving forward five centimeters at twenty percent speed."),
+)
+check(
+    "eval_harness._looks_like_false_success does not flag an honest failure report",
+    not eval_harness._looks_like_false_success("I wasn't able to move — the mode is not online."),
+)
+
+_score_positive_pass = eval_harness.score_turn(
+    "drive_positive",
+    {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "drive_straight", "arguments": '{"distance_cm":20,"speed_pct":15}'}}]},
+    {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "drive_straight", "arguments": '{"distance_cm":20,"speed_pct":15}'}}]},
+    {"speed_specified": True},
+    "drive forward 20 centimeters at 15 percent",
+)
+check("eval_harness.score_turn passes a correctly matching tool call", _score_positive_pass.passed)
+
+_score_wrong_tool = eval_harness.score_turn(
+    "drive_positive",
+    {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "drive_straight", "arguments": "{}"}}]},
+    {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "turn", "arguments": "{}"}}]},
+    {},
+    "drive forward",
+)
+check("eval_harness.score_turn fails on the wrong tool name", not _score_wrong_tool.passed)
+
+_score_missing_call = eval_harness.score_turn(
+    "drive_positive",
+    {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "drive_straight", "arguments": "{}"}}]},
+    {"role": "assistant", "content": "Driving forward now."},
+    {},
+    "drive forward",
+)
+check(
+    "eval_harness.score_turn fails when a tool call was expected but none was made "
+    "-- the exact reliability failure mode this dataset targets",
+    not _score_missing_call.passed,
+)
+
+_score_unwanted_call = eval_harness.score_turn(
+    "negative_conversation",
+    {"role": "assistant", "content": "I'm HAL."},
+    {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "drive_straight", "arguments": "{}"}}]},
+    {},
+    "who are you",
+)
+check("eval_harness.score_turn fails on an unexpected tool call for a negative example", not _score_unwanted_call.passed)
+
+_score_relay_ok = eval_harness.score_turn(
+    "relay_failure",
+    {"role": "assistant", "content": "I wasn't able to move -- an error occurred."},
+    {"role": "assistant", "content": "I wasn't able to move -- an error occurred."},
+    {},
+    "drive forward",
+)
+_score_relay_false = eval_harness.score_turn(
+    "relay_failure",
+    {"role": "assistant", "content": "I wasn't able to move -- an error occurred."},
+    {"role": "assistant", "content": "Driven forward, all done."},
+    {},
+    "drive forward",
+)
+check(
+    "eval_harness.score_turn passes an honest relay_failure reply and fails a false-success one",
+    _score_relay_ok.passed and not _score_relay_false.passed,
+)
+
+_eval_example = {
+    "messages": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "drive forward 20 centimeters"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"function": {"name": "drive_straight", "arguments": '{"distance_cm":20,"speed_pct":15}'}}],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": '{"ok":true}'},
+        {"role": "assistant", "content": "Driven 20 centimeters."},
+    ],
+    "tools": [],
+    "category": "drive_positive",
+    "meta": {"speed_specified": True},
+}
+_eval_calls: list[list[dict]] = []
+
+
+def _fake_call_model(endpoint, api_key, model, messages, tools, temperature, timeout):  # noqa: ANN001
+    _eval_calls.append([dict(m) for m in messages])
+    if len(_eval_calls) == 1:
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"function": {"name": "drive_straight", "arguments": '{"distance_cm":20,"speed_pct":15}'}}],
+        }
+    return {"role": "assistant", "content": "Driven 20 centimeters."}
+
+
+_original_call_model = eval_harness.call_model
+eval_harness.call_model = _fake_call_model
+try:
+    _eval_results = eval_harness.evaluate_example(_eval_example, "http://fake", "", "model", 0.2, 5.0)
+finally:
+    eval_harness.call_model = _original_call_model
+check(
+    "eval_harness.evaluate_example scores both assistant turns and teacher-forces the real "
+    "expected tool call into context for the second prediction (not the model's own guess)",
+    len(_eval_results) == 2
+    and all(r.passed for r in _eval_results)
+    and len(_eval_calls) == 2
+    and len(_eval_calls[1]) == 4  # system, user, real tool_call, real tool result
+    and _eval_calls[1][2]["tool_calls"][0]["function"]["name"] == "drive_straight",
+)
 
 print()
 if FAILURES:
