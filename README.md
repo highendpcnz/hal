@@ -1,9 +1,9 @@
-# HAL 9000 — voice frontend for Hermes Agent
+# HAL 9000 — local voice and robotics frontend
 
-Push-to-talk web interface that makes HAL 9000 the face (and voice) of
-[Hermes Agent CLI](https://github.com/NousResearch/Hermes-Agent). Hold the
-red eye, speak, release — Hermes does the thinking (with full tool access),
-and the reply comes back in HAL's voice.
+HAL is a local voice interface and embodied-agent frontend targeting Gemma 4
+E2B on a Pixel 7 Pro with an mBot2 chassis. Hold the red eye, speak, and release;
+local speech recognition, local Gemma inference, and Piper return HAL's reply.
+Hermes remains available only as an explicit compatibility provider.
 
 On screens wider than 760px the eye sits in a **Bridge** layout — mission log,
 telemetry bar, live waveform, mission cards, always-visible input — with an
@@ -20,7 +20,7 @@ to run fully local with zero cloud API keys:
 | Stage | Original (HF Space)     | This fork                                          |
 |-------|-------------------------|----------------------------------------------------|
 | STT   | Groq Whisper API        | faster-whisper, local (`base.en` by default)       |
-| Brain | Claude API              | **Hermes Agent CLI** — named sessions, tools, skills |
+| Brain | Claude API              | **Gemma 4 E2B** through local llama-server/Ollama |
 | TTS   | Piper (plain)           | [campwill/HAL-9000-Piper-TTS](https://huggingface.co/campwill/HAL-9000-Piper-TTS) with Hermes' HAL text normalization and optional ffmpeg mastering |
 
 ## How it works
@@ -29,30 +29,24 @@ to run fully local with zero cloud API keys:
 browser (hold-to-talk)
   └─ WS /ws/conversation (POST /api/talk fallback; webm/mp4 audio)
        ├─ faster-whisper  → transcript
-       ├─ persistent hermes-acp process (Agent Client Protocol over stdio)
-       │    · session/prompt per turn — no CLI startup cost (~4s/turn all-in)
-       │    · cookie session ↔ ACP session map: data/hermes_sessions.json
-       │    · ACP sessions persist in ~/.hermes/state.db → survive restarts
-       │      of both the bridge and the agent (session/load)
-       │    · persona injected via AGENTS.md in this directory (cwd rules)
-       │    · agent stderr → data/acp.log
+       ├─ brain/runtime.py → local OpenAI-compatible Gemma endpoint
+       │    · HAL-owned sessions in data/brain/gemma/
+       │    · bounded local tool loop
+       │    · read-only robot telemetry tool during safe bring-up
        └─ piper (hal9000.onnx) → WAV reply
 ```
 
-The bridge speaks ACP through the official `agent-client-protocol` library
-(included in `requirements.txt`, and in the Hermes venv through the
-`hermes-agent[acp]` extra). Set
-`HAL_BRIDGE=subprocess` to fall back to the original one-`hermes chat -Q`
--per-turn bridge if ACP ever misbehaves.
+See [docs/brain-runtime.md](docs/brain-runtime.md) for the provider contract,
+local endpoint configuration, and current tool-safety boundary. Install
+`requirements-hermes.txt` and set `HAL_BRAIN=hermes` only when exercising the
+legacy ACP/subprocess adapter.
 
-- **Persona** lives in [AGENTS.md](AGENTS.md) — Hermes auto-injects it because the
-  agent runs with this directory as cwd. Edit it to change how HAL speaks or
-  what he calls you. No global Hermes config is touched.
-- **Sessions**: each browser session continues one Hermes session
-  (`hermes sessions list --source hal-web`). Clear the `hal_session` cookie
-  for a fresh one. Hermes' builtin memory still carries facts across sessions.
-- **Tools**: it's real Hermes — "Hal, what's in my downloads folder?" works.
-  Dangerous-command permission requests follow `HAL_PERMISSION_MODE`:
+- **Persona**: local Gemma uses [brain/GEMMA_SYSTEM.md](brain/GEMMA_SYSTEM.md).
+  [AGENTS.md](AGENTS.md) remains the compatibility-provider persona.
+- **Sessions**: each browser session has local model history under
+  `data/brain/gemma/`. Starting a new session removes that provider history.
+- **Tools**: Gemma currently receives only getter-only spatial telemetry.
+  The Hermes compatibility provider retains its broader permission modes:
   - `deny` (default) — every request is rejected and HAL tells you the
     action was blocked.
   - `ask` — HAL asks ("Dave, I need your permission: …") and waits up to
@@ -66,13 +60,19 @@ The bridge speaks ACP through the official `agent-client-protocol` library
 
 ## Run
 
-```
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python download_model.py
+cp .env.example .env    # then edit paths/vars for your machine
 ./run.sh                # http://127.0.0.1:8000
 ```
 
-Runs inside the Hermes venv — no separate environment, no `.env`, no API keys.
+HAL runs in its repository-local environment and Gemma requires no cloud API key.
 First start downloads the STT model (~75 MB) to the Hugging Face cache.
-`run.sh` is plain bash and works on macOS and Linux.
+`run.sh` is plain bash and works on macOS and Linux; it loads `.env` itself
+(gitignored — see `.env.example`), without overriding variables you already
+exported in the shell.
 
 Or just type `hal` anywhere — [bin/hal](bin/hal) starts the server if
 needed, waits for it to become healthy, and opens the eye in your browser
@@ -84,8 +84,9 @@ ln -s "$(pwd)/bin/hal" ~/.local/bin/hal
 
 ## Tests
 
-```
-~/.hermes/hermes-agent/venv/bin/python tests/run.py
+```sh
+python3 tests/independent.py    # stdlib-only brain and safety boundary
+.venv/bin/python tests/run.py  # broader frontend regression suite
 ```
 
 Zero-dependency (no pytest) checks of the pure-python parts — `speakable()`
@@ -130,11 +131,24 @@ fallback when the socket or streaming audio support is unavailable.
 |-----|---------|---------|
 | `HAL_PORT` / `HAL_HOST` | `8000` / `127.0.0.1` | bind address (keep loopback; there is no auth) |
 | `HAL_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Host-header allowlist (blocks DNS rebinding) **and** the `Origin` allowlist for state-changing requests (see Security); add your hostname/IP — or `*` — if you bind beyond loopback |
+| `HAL_BRAIN` | `gemma` | local `gemma` provider or legacy `hermes` compatibility adapter |
+| `HAL_GEMMA_URL` | `http://127.0.0.1:8080/v1/chat/completions` | llama-server/Ollama OpenAI-compatible endpoint |
+| `HAL_GEMMA_MODEL` | `gemma-4-e2b` | model identifier sent to the local endpoint |
+| `HAL_MANAGE_GEMMA` | `auto` | start and stop local llama.cpp when no custom URL is supplied; set `0` for an external server |
+| `HAL_LLAMA_SERVER` | `~/llama.cpp/build/bin/llama-server` | managed llama.cpp server binary |
+| `HAL_GEMMA_MODEL_PATH` | `~/models/gemma-4-e2b/gemma-4-E2B-it-Q4_0.gguf` | managed local GGUF model |
+| `HAL_GEMMA_CTX` / `HAL_GEMMA_GPU_LAYERS` | `8192` / `99` | managed server context and Metal offload |
+| `HAL_GEMMA_MMPROJ` | *(unset)* | optional multimodal projector GGUF; also gates whether the `capture_visual_scene` tool is offered to Gemma |
+| `HAL_ROBOT_PORT` | `/dev/ttyACM0` | CyberPi serial device used by the read-only sensor tool |
+| `HAL_CAMERA_DEVICE` | `0` | avfoundation video device index `capture_visual_scene` reads from (dev-Mac stand-in for the Pixel camera) |
+| `HAL_CAMERA_WIDTH` / `HAL_CAMERA_HEIGHT` | `640` / `480` | captured frame resolution |
+| `HAL_CAMERA_TIMEOUT` | `5` | seconds before a stalled capture is treated as a failure |
+| `HAL_FFMPEG_BIN` | `ffmpeg` | ffmpeg binary used to grab a still frame |
 | `HAL_STT_MODEL` | `base.en` | any faster-whisper model; `tiny.en` = fastest, `small.en` = better accuracy, slower |
 | `HAL_STT_DEVICE` | `auto` | `auto` uses a CUDA GPU if present, else CPU; force with `cpu`/`cuda` |
 | `HAL_STT_COMPUTE_TYPE` | `auto` | quantization for the resolved device (int8 on CPU, float16 on GPU); override with e.g. `int8_float16` |
 | `HAL_STT_CPU_THREADS` | `0` | CPU threads for decoding; `0` = ctranslate2 picks (usually all cores) |
-| `HAL_VOICE` | `~/.hermes/voices/hal9000/hal9000.onnx` | Piper voice model |
+| `HAL_VOICE` | `models/hal.onnx` | repository-local Piper voice model |
 | `HAL_BRIDGE` | `acp` | `acp` = persistent agent process; `subprocess` = one CLI call per turn |
 | `HAL_PERMISSION_MODE` | `deny` | `deny` / `ask` / `yolo` — how ACP tool-permission requests are answered (see above) |
 | `HAL_PERMISSION_TIMEOUT` | `30` | seconds an `ask` waits before the request is denied |
@@ -148,6 +162,7 @@ fallback when the socket or streaming audio support is unavailable.
 | `HAL_VIEWSCREEN_POLL` | `2` | seconds between scans of `data/viewscreen/` for new visuals |
 | `HAL_VOICE_THRESHOLD` | `0.5` | cosine similarity a voiceprint match must reach (see Crew Manifest) |
 | `HAL_BOOT_RITUAL` | `1` | speak a short self-test greeting to the first arrival after a server start |
+| `HAL_TERMUX_LISTEN` | `0` | Termux/Pixel only: run `termux_voice.py`'s on-device listen/speak loop (phone mic + speaker), separate from the browser-audio endpoints |
 | `HAL_VITALS_REALERT` | `21600` | seconds before an unrecovered vitals trigger re-alerts |
 | `HAL_HERMES_ACP_BIN` | auto-detected from the Hermes install | ACP adapter path |
 | `HAL_HERMES_BIN` | auto-detected from the Hermes install | Hermes CLI path (subprocess mode) |
@@ -344,7 +359,9 @@ HTML/PDF) appears in a Bridge panel within `HAL_VIEWSCREEN_POLL` seconds —
 "On the viewscreen, Dave." One drop-folder gives every Hermes toolset
 (image generation, screenshots, charts written by shell tools) a visual
 output channel with zero per-tool integration; the persona file teaches HAL
-the convention. ◀ ▶ flip through history (newest first), CLEAR empties the
+the convention. Gemma's `capture_visual_scene` tool reuses the same
+drop-folder, so a frame it looks at also shows up here for Dave. ◀ ▶ flip
+through history (newest first), CLEAR empties the
 folder, clicking an image opens it full-size. Agent HTML renders in a
 sandboxed iframe (no scripts inside the Bridge). Endpoints:
 `GET /api/viewscreen`, `POST /api/viewscreen/clear`; files served under
@@ -390,9 +407,10 @@ launchctl load ~/Library/LaunchAgents/com.hal9000.frontend.plist
 
 ## Vestigial files from the original Space
 
-`Dockerfile`, `download_model.py`, `.env.example`, and `hal_prompt.py` are no
-longer used by this fork (persona and user context now live in `AGENTS.md`).
-They are kept for reference / upstream diffing. In particular the Dockerfile
+`Dockerfile`, `download_model.py`, and `hal_prompt.py` are no longer used by
+this fork (persona and user context now live in `AGENTS.md`). They are kept
+for reference / upstream diffing. `.env.example` is not vestigial — `run.sh`
+loads a sibling `.env` on every start; see Run above. In particular the Dockerfile
 predates the Hermes rewiring and **does not build a working image** — it
 neither copies `hermes_bridge.py`/`mission_control.py` nor provides the
 Hermes CLI or the HAL voice model.

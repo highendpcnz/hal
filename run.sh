@@ -1,54 +1,46 @@
 #!/usr/bin/env bash
-# Launch the HAL 9000 web frontend for Hermes Agent.
-# Runs inside the Hermes venv — no separate environment needed.
+# Launch the provider-neutral HAL 9000 web frontend.
 # Plain bash so it works on Linux as well as macOS (zsh runs it fine too).
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load .env (see .env.example) without clobbering variables the caller already
+# exported — an explicit `FOO=bar ./run.sh` or shell export always wins.
+if [[ -f "$APP_DIR/.env" ]]; then
+  while IFS='=' read -r _env_key _env_value; do
+    [[ -z "$_env_key" || "$_env_key" == \#* ]] && continue
+    if [[ -z "${!_env_key:-}" ]]; then
+      export "$_env_key=$_env_value"
+    fi
+  done < <(grep -Ev '^\s*(#|$)' "$APP_DIR/.env")
+fi
+
 PORT="${HAL_PORT:-8000}"
 HOST="${HAL_HOST:-127.0.0.1}"
 
-# The venv that RUNS HAL needs fastapi/uvicorn/piper/faster-whisper. That is
-# normally the Hermes venv, but a repo-local .venv takes precedence when one
-# exists: some Hermes installs ship without the STT/TTS stack, and preferring
-# Hermes would select an environment that cannot even import main.py.
-if [[ -n "${HAL_HERMES_VENV:-}" ]]; then
-  HERMES_VENV="$HAL_HERMES_VENV"
+# HAL owns its runtime environment. HAL_HERMES_VENV remains a compatibility
+# alias for existing installations, but it is never searched automatically.
+if [[ -n "${HAL_VENV:-}" ]]; then
+  APP_VENV="$HAL_VENV"
+elif [[ -n "${HAL_HERMES_VENV:-}" ]]; then
+  APP_VENV="$HAL_HERMES_VENV"
 elif [[ -x "$APP_DIR/.venv/bin/uvicorn" ]]; then
-  HERMES_VENV="$APP_DIR/.venv"
-elif [[ -x "$HOME/.hermes/hermes-agent/venv/bin/uvicorn" ]]; then
-  HERMES_VENV="$HOME/.hermes/hermes-agent/venv"
-elif [[ -x "$HOME/hermes-agent/.venv/bin/uvicorn" ]]; then
-  HERMES_VENV="$HOME/hermes-agent/.venv"
+  APP_VENV="$APP_DIR/.venv"
 else
-  echo "No Python environment with uvicorn was found." >&2
-  echo "Install Hermes Agent, create a repo-local .venv from requirements.txt," >&2
-  echo "or set HAL_HERMES_VENV to an environment path." >&2
+  echo "HAL's repository-local Python environment is missing." >&2
+  echo "Run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+  echo "Alternatively, set HAL_VENV to an environment containing the app dependencies." >&2
   exit 1
 fi
 
-# The agent binaries are spawned as subprocesses, so they are independent of the
-# venv running HAL — resolve them against a real Hermes install rather than
-# assuming they sit beside uvicorn. An isolated .venv has neither.
-_find_hermes_bin() {
-  local name="$1" candidate
-  for candidate in "$HERMES_VENV/bin/$name" \
-                   "$HOME/.hermes/hermes-agent/venv/bin/$name" \
-                   "$HOME/hermes-agent/.venv/bin/$name"; do
-    [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
-  done
-  command -v "$name" 2>/dev/null || printf '%s\n' "$HERMES_VENV/bin/$name"
-}
-
-export HAL_HERMES_BIN="${HAL_HERMES_BIN:-$(_find_hermes_bin hermes)}"
-export HAL_HERMES_ACP_BIN="${HAL_HERMES_ACP_BIN:-$(_find_hermes_bin hermes-acp)}"
-
-# Fall back to the repo-local voice model if the shared Hermes voice install
-# is absent (e.g. a machine where ~/.hermes/voices was never populated).
-if [[ -z "${HAL_VOICE:-}" ]]; then
-  DEFAULT_VOICE="$HOME/.hermes/voices/hal9000/hal9000.onnx"
-  if [[ ! -f "$DEFAULT_VOICE" && -f "$APP_DIR/models/hal.onnx" ]]; then
-    export HAL_VOICE="$APP_DIR/models/hal.onnx"
+# Compatibility mode resolves Hermes only when explicitly selected.
+if [[ "${HAL_BRAIN:-gemma}" == "hermes" ]]; then
+  if [[ -z "${HAL_HERMES_BIN:-}" ]] && command -v hermes >/dev/null 2>&1; then
+    export HAL_HERMES_BIN="$(command -v hermes)"
+  fi
+  if [[ -z "${HAL_HERMES_ACP_BIN:-}" ]] && command -v hermes-acp >/dev/null 2>&1; then
+    export HAL_HERMES_ACP_BIN="$(command -v hermes-acp)"
   fi
 fi
 
@@ -63,7 +55,105 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-exec "$HERMES_VENV/bin/uvicorn" main:app \
+GEMMA_PID=""
+cleanup() {
+  if [[ -n "$GEMMA_PID" ]] && kill -0 "$GEMMA_PID" 2>/dev/null; then
+    kill "$GEMMA_PID" 2>/dev/null || true
+    wait "$GEMMA_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# With no custom endpoint, own a loopback llama.cpp process for the lifetime of
+# HAL. A supplied HAL_GEMMA_URL is assumed to be managed externally unless
+# HAL_MANAGE_GEMMA=1 is set explicitly.
+if [[ "${HAL_BRAIN:-gemma}" == "gemma" ]]; then
+  GEMMA_HOST="${HAL_GEMMA_HOST:-127.0.0.1}"
+  GEMMA_PORT="${HAL_GEMMA_PORT:-8080}"
+  GEMMA_URL_WAS_SET="${HAL_GEMMA_URL+x}"
+  export HAL_GEMMA_URL="${HAL_GEMMA_URL:-http://$GEMMA_HOST:$GEMMA_PORT/v1/chat/completions}"
+  MANAGE_GEMMA="${HAL_MANAGE_GEMMA:-auto}"
+  if [[ "$MANAGE_GEMMA" == "auto" ]]; then
+    [[ -z "$GEMMA_URL_WAS_SET" ]] && MANAGE_GEMMA=1 || MANAGE_GEMMA=0
+  fi
+
+  if [[ "$MANAGE_GEMMA" == "1" ]]; then
+    LLAMA_SERVER="${HAL_LLAMA_SERVER:-$HOME/llama.cpp/build/bin/llama-server}"
+    GEMMA_MODEL="${HAL_GEMMA_MODEL_PATH:-$HOME/models/gemma-4-e2b/gemma-4-E2B-it-Q4_0.gguf}"
+    GEMMA_HEALTH="http://$GEMMA_HOST:$GEMMA_PORT/v1/models"
+    if ! curl -sf -m 2 "$GEMMA_HEALTH" >/dev/null 2>&1; then
+      if [[ ! -x "$LLAMA_SERVER" || ! -f "$GEMMA_MODEL" ]]; then
+        echo "Local Gemma assets are missing; HAL will start in degraded mode." >&2
+        echo "Set HAL_LLAMA_SERVER and HAL_GEMMA_MODEL_PATH to enable inference." >&2
+      else
+        export HAL_GEMMA_API_KEY="${HAL_GEMMA_API_KEY:-$($APP_VENV/bin/python -c 'import secrets; print(secrets.token_hex(24))')}"
+        mkdir -p "$APP_DIR/data"
+        GEMMA_ARGS=(
+          --model "$GEMMA_MODEL"
+          --alias "${HAL_GEMMA_MODEL:-gemma-4-e2b}"
+          --ctx-size "${HAL_GEMMA_CTX:-8192}"
+          --parallel "${HAL_GEMMA_PARALLEL:-1}"
+          --n-gpu-layers "${HAL_GEMMA_GPU_LAYERS:-99}"
+          --flash-attn auto
+          # Off by default: Gemma's chat template enables reasoning under
+          # "auto" (llama-server's own default), and its hidden thinking
+          # phase before any visible content dominates turn latency on CPU
+          # (30-40s+ of a ~40-46s turn on the Pixel, confirmed live) for no
+          # visible benefit in HAL's short, conversational replies. Set
+          # HAL_GEMMA_REASONING=auto (or on) to restore it.
+          --reasoning "${HAL_GEMMA_REASONING:-off}"
+          --host "$GEMMA_HOST"
+          --port "$GEMMA_PORT"
+          --api-key "$HAL_GEMMA_API_KEY"
+          --no-webui
+        )
+        if [[ -n "${HAL_GEMMA_MMPROJ:-}" ]]; then
+          GEMMA_ARGS+=(--mmproj "$HAL_GEMMA_MMPROJ")
+        fi
+        # CPU thread count/affinity tuning: off (llama-server's own defaults)
+        # unless explicitly set. Deliberately not a shared default — this
+        # matters on Termux/Android's heterogeneous big.LITTLE ARM cores
+        # (confirmed live on the Pixel's Tensor G2: pinning 4 threads to the
+        # 4 fast cores nearly doubled token generation, 7.3->13.3 tok/s,
+        # while unpinned or wrongly-sized configs were *worse* than doing
+        # nothing at all — see docs/termux-port-status.md), and is
+        # meaningless-to-harmful on the Mac, which does its real compute on
+        # the Metal GPU via --n-gpu-layers, not CPU threading. Set
+        # HAL_GEMMA_THREADS/HAL_GEMMA_CPU_MASK/HAL_GEMMA_CPU_STRICT in the
+        # phone's own .env, not here.
+        if [[ -n "${HAL_GEMMA_THREADS:-}" ]]; then
+          GEMMA_ARGS+=(--threads "$HAL_GEMMA_THREADS" --threads-batch "$HAL_GEMMA_THREADS")
+        fi
+        if [[ -n "${HAL_GEMMA_CPU_MASK:-}" ]]; then
+          GEMMA_ARGS+=(--cpu-mask "$HAL_GEMMA_CPU_MASK" --cpu-mask-batch "$HAL_GEMMA_CPU_MASK")
+        fi
+        if [[ -n "${HAL_GEMMA_CPU_STRICT:-}" ]]; then
+          GEMMA_ARGS+=(--cpu-strict "$HAL_GEMMA_CPU_STRICT" --cpu-strict-batch "$HAL_GEMMA_CPU_STRICT")
+        fi
+        "$LLAMA_SERVER" "${GEMMA_ARGS[@]}" >"$APP_DIR/data/gemma-server.log" 2>&1 &
+        GEMMA_PID=$!
+        for _attempt in {1..240}; do
+          if curl -sf -m 1 -H "Authorization: Bearer $HAL_GEMMA_API_KEY" \
+            "$GEMMA_HEALTH" >/dev/null 2>&1; then
+            break
+          fi
+          if ! kill -0 "$GEMMA_PID" 2>/dev/null; then
+            echo "llama-server exited during startup; see data/gemma-server.log" >&2
+            exit 1
+          fi
+          sleep 0.25
+        done
+        if ! curl -sf -m 1 -H "Authorization: Bearer $HAL_GEMMA_API_KEY" \
+          "$GEMMA_HEALTH" >/dev/null 2>&1; then
+          echo "Timed out waiting for local Gemma; see data/gemma-server.log" >&2
+          exit 1
+        fi
+      fi
+    fi
+  fi
+fi
+
+"$APP_VENV/bin/uvicorn" main:app \
   --app-dir "$APP_DIR" \
   --host "$HOST" \
   --port "$PORT"

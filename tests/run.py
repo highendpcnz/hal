@@ -11,12 +11,14 @@ suite finishes in seconds and touches no audio, network, or inference.
 import asyncio
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 os.environ["HAL_SKIP_MODELS"] = "1"
+os.environ["HAL_BRAIN"] = "hermes"  # legacy-provider regression coverage
 _tmp = tempfile.TemporaryDirectory(prefix="hal-tests-")
 os.environ["HAL_DATA_DIR"] = _tmp.name
 
@@ -515,7 +517,7 @@ async def _exercise_steering():
         return "I scanned the pod bay."
 
     hermes_bridge.ask_hermes = fake_ask
-    main.ask_hermes = fake_ask
+    main.ask_brain = fake_ask
     try:
         mgr = mc.MissionManager(Path(_tmp.name) / "missions-steer")
         running = mgr.create_mission("st-ck", "pod bay scan", "scan it")
@@ -551,7 +553,7 @@ async def _exercise_steering():
         return after, cancelled, foreign, journal_absent, steer, ok_dismiss, steer_after_dismiss, listed, stale
     finally:
         hermes_bridge.ask_hermes = orig_ask
-        main.ask_hermes = orig_ask
+        main.ask_brain = orig_ask
 
 
 (_after, _cancelled, _foreign, _journal_absent, _steer, _ok_dismiss,
@@ -569,14 +571,14 @@ check("reaper releases sessions past the TTL", _stale.session_dropped)
 
 
 async def _exercise_followup_turn():
-    orig_ask = main.ask_hermes
+    orig_ask = main.ask_brain
     seen: list[tuple[str, str]] = []
 
     async def fake_ask(text, sid):
         seen.append((sid, text))
         return "I found nothing unusual, Dave."
 
-    main.ask_hermes = fake_ask
+    main.ask_brain = fake_ask
     orig_manager = mission_control.manager
     try:
         mission_control.manager = mc.MissionManager(Path(_tmp.name) / "missions-turn")
@@ -591,7 +593,7 @@ async def _exercise_followup_turn():
         status_line, _t4 = await main.run_turn_text("ft-ck", "HAL, missions status")
         return seen, reply, empty_reply, no_target, status_line
     finally:
-        main.ask_hermes = orig_ask
+        main.ask_brain = orig_ask
         mission_control.manager = orig_manager
 
 
@@ -951,7 +953,7 @@ check(
 
 
 def _exercise_exact_slash_routing():
-    original_ask = main.ask_hermes
+    original_ask = main.ask_brain
     original_drain = main.mission_control.manager.drain_notes
     original_daily = main.ledger.manager.daily_note
     prompts: list[str] = []
@@ -969,13 +971,13 @@ def _exercise_exact_slash_routing():
         notes_touched.append(True)
         return "A ledger note."
 
-    main.ask_hermes = fake_ask
+    main.ask_brain = fake_ask
     main.mission_control.manager.drain_notes = fake_drain
     main.ledger.manager.daily_note = fake_daily
     try:
         asyncio.run(main.run_turn_text("slash-routing", "/help"))
     finally:
-        main.ask_hermes = original_ask
+        main.ask_brain = original_ask
         main.mission_control.manager.drain_notes = original_drain
         main.ledger.manager.daily_note = original_daily
     return prompts, notes_touched
@@ -1771,6 +1773,969 @@ check(
     "not-ready selections are dropped, not persisted",
     "localStorage.removeItem(DIRECTION_STORAGE_KEY)" in _entry_src,
 )
+
+# --- robot control plane ----------------------------------------------------
+# This is deliberately model-free. The codec and safety boundary must be
+# reliable before a real USB transport, Gemma tool loop, or motor command is
+# allowed into the application.
+from robot.protocol import (  # noqa: E402
+    CMD_DRIVE_DISTANCE,
+    CMD_ESTOP,
+    Frame,
+    FrameDecoder,
+    Telemetry,
+    decode_frame,
+    decode_telemetry,
+    encode_frame,
+    encode_telemetry_frame,
+)
+from robot.cyberpi import (  # noqa: E402
+    BAUD_RATE,
+    DEFAULT_PROFILE,
+    F3F4FrameDecoder,
+    MAX_ONLINE_SCRIPT_BYTES,
+    ONLINE_ENTRY_SCRIPTS,
+    ONLINE_RESTART_WAIT,
+    decode_current_mode_response,
+    decode_firmware_version_response,
+    ONLINE_MODE_MARKER,
+    CyberPiOnlineRequest,
+    CyberPiOnlineResponse,
+    CyberPiFrame,
+    CyberPiMode,
+    CyberPiProtocolError,
+    decode_f3f4_frame,
+    decode_mode_marker,
+    decode_online_request_payload,
+    decode_online_response_payload,
+    decode_subscription_report,
+    encode_f3f4_frame,
+    encode_current_mode_query_frame,
+    encode_firmware_version_query_frame,
+    encode_online_entry_frames,
+    encode_online_request_payload,
+    extract_boot_lines,
+)
+from robot.safety import MotionLimits, SafetyController, SafetyError  # noqa: E402
+from robot.simulator import SimulatedRobot  # noqa: E402
+from robot.watchdog import HeartbeatWatchdog  # noqa: E402
+from robot.telemetry import (  # noqa: E402
+    CyberPiNotReadyError,
+    CyberPiRemoteError,
+    CyberPiTelemetryClient,
+)
+from robot.estop import (  # noqa: E402
+    ONLINE_ENTRY_SETTLE_SECONDS as ESTOP_ONLINE_ENTRY_SETTLE_SECONDS,
+    STOP_ALL_SCRIPT,
+    CyberPiEmergencyStopClient,
+)
+from robot.motion import (  # noqa: E402
+    ONLINE_ENTRY_SETTLE_SECONDS as MOTION_ONLINE_ENTRY_SETTLE_SECONDS,
+    CyberPiMotionClient,
+)
+
+_stop_wire = encode_frame(CMD_ESTOP)
+_decoder = FrameDecoder()
+check(
+    "frame decoder handles split serial chunks",
+    _decoder.feed(_stop_wire[:2]) == []
+    and _decoder.feed(_stop_wire[2:]) == [Frame(CMD_ESTOP, b"")],
+)
+_decoder = FrameDecoder()
+_valid_wire = encode_frame(CMD_DRIVE_DISTANCE, b"probe")
+check(
+    "frame decoder resynchronizes after noise",
+    _decoder.feed(b"noise" + _valid_wire) == [Frame(CMD_DRIVE_DISTANCE, b"probe")]
+    and _decoder.dropped_bytes == 5,
+)
+_decoder = FrameDecoder()
+_corrupt_wire = bytearray(_valid_wire)
+_corrupt_wire[-1] ^= 0x01
+check(
+    "frame decoder rejects a bad CRC",
+    _decoder.feed(bytes(_corrupt_wire)) == [] and _decoder.crc_errors == 1,
+)
+
+_telemetry = Telemetry(12, -8, 90.0, -1.2, 42.5, 3.9)
+_telemetry_roundtrip = decode_telemetry(decode_frame(encode_telemetry_frame(_telemetry)))
+check(
+    "telemetry round-trips through the wire format",
+    _telemetry_roundtrip.left_ticks == 12
+    and _telemetry_roundtrip.right_ticks == -8
+    and abs(_telemetry_roundtrip.yaw_deg - 90.0) < 0.01
+    and abs(_telemetry_roundtrip.pitch_deg + 1.2) < 0.01
+    and abs(_telemetry_roundtrip.obstacle_dist_cm - 42.5) < 0.01
+    and abs(_telemetry_roundtrip.battery_volts - 3.9) < 0.001,
+)
+
+_robot = SimulatedRobot()
+try:
+    _robot.drive_distance(5, 10)
+except SafetyError:
+    _blocked_before_connect = True
+else:
+    _blocked_before_connect = False
+check("simulator blocks motion before connection", _blocked_before_connect)
+
+_robot.connect(now=0.0)
+try:
+    _robot.drive_distance(5, 10, now=0.01)
+except SafetyError:
+    _blocked_before_arm = True
+else:
+    _blocked_before_arm = False
+check("simulator starts emergency-stopped", _blocked_before_arm)
+
+_robot.arm(now=0.0)
+_robot.set_telemetry(_telemetry)
+_drive_wire = _robot.drive_distance(5, 10, now=0.05)
+check(
+    "simulator emits a bounded drive frame",
+    decode_frame(_drive_wire).message_id == CMD_DRIVE_DISTANCE
+    and decode_frame(_drive_wire).payload[:4] == (50).to_bytes(4, "little", signed=True),
+)
+
+_robot.set_telemetry(Telemetry(12, -8, 90.0, -1.2, 5.0, 3.9))
+try:
+    _robot.drive_distance(5, 10, now=0.06)
+except SafetyError:
+    _blocked_by_obstacle = True
+else:
+    _blocked_by_obstacle = False
+check("proximity interlock blocks forward motion", _blocked_by_obstacle)
+
+_watchdog_wire = _robot.safety.watchdog_stop(now=0.31)
+check(
+    "expired heartbeat produces an emergency stop",
+    _watchdog_wire is not None
+    and decode_frame(_watchdog_wire).message_id == CMD_ESTOP
+    and _robot.safety.estopped,
+)
+
+
+class _FakeStopClient:
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    def stop_all(self) -> None:
+        self.stop_calls += 1
+
+
+_hb_controller = SafetyController(MotionLimits(watchdog_seconds=0.25))
+_hb_stop_client = _FakeStopClient()
+_hb_watchdog = HeartbeatWatchdog(_hb_controller, _hb_stop_client)
+check(
+    "heartbeat watchdog does nothing before connection",
+    _hb_watchdog.poll_once(now=0.0) is False and _hb_stop_client.stop_calls == 0,
+)
+
+_hb_controller.connect(now=0.0)
+_hb_controller.arm(now=0.0)
+check(
+    "heartbeat watchdog stays quiet while the heartbeat is fresh",
+    _hb_watchdog.poll_once(now=0.1) is False and _hb_stop_client.stop_calls == 0,
+)
+
+_hb_stop_events: list[None] = []
+_hb_watchdog_with_hook = HeartbeatWatchdog(
+    _hb_controller, _hb_stop_client, on_stop=lambda: _hb_stop_events.append(None)
+)
+_hb_fired = _hb_watchdog_with_hook.poll_once(now=0.4)
+check(
+    "an overdue heartbeat sends exactly one real stop",
+    _hb_fired is True
+    and _hb_stop_client.stop_calls == 1
+    and _hb_controller.estopped
+    and _hb_stop_events == [None],
+)
+
+_hb_fired_again = _hb_watchdog_with_hook.poll_once(now=0.45)
+check(
+    "polling an already-latched estop does not resend the stop command",
+    _hb_fired_again is False and _hb_stop_client.stop_calls == 1,
+)
+
+_cyberpi_sample = bytes.fromhex("f3 f5 02 00 08 c0 c8 f4")
+_cyberpi_frame = decode_f3f4_frame(_cyberpi_sample)
+check(
+    "CyberPi decoder accepts the observed f3f4 frame",
+    _cyberpi_frame
+    == CyberPiFrame(bytes.fromhex("08 c0"), header_checksum=0xF5, payload_checksum=0xC8),
+)
+check(
+    "CyberPi encoder reproduces the observed f3f4 frame",
+    encode_f3f4_frame(bytes.fromhex("08 c0")) == _cyberpi_sample,
+)
+_current_mode_query = bytes.fromhex("f3 f5 02 00 0d 80 8d f4")
+_current_mode_response = bytes.fromhex("f3 f6 03 00 0d 80 01 8e f4")
+check(
+    "live CyberPi mode query exchange decodes",
+    encode_current_mode_query_frame() == _current_mode_query
+    and decode_current_mode_response(decode_f3f4_frame(_current_mode_response).payload)
+    is CyberPiMode.ONLINE,
+)
+_firmware_query = bytes.fromhex("f3 f4 01 00 06 06 f4")
+_firmware_response = bytes.fromhex("f3 fd 0a 00 06 34 34 2e 30 31 2e 30 31 36 c2 f4")
+check(
+    "live CyberPi firmware query exchange decodes",
+    encode_firmware_version_query_frame() == _firmware_query
+    and decode_firmware_version_response(decode_f3f4_frame(_firmware_response).payload)
+    == "44.01.016",
+)
+_online_script = 'cyberpi.mbot2.EM_stop("ALL")'
+_online_payload = encode_online_request_payload(
+    _online_script, sequence=7, wait_for_response=True
+)
+check(
+    "CyberPi online request layout round-trips",
+    decode_online_request_payload(_online_payload)
+    == CyberPiOnlineRequest(sequence=7, wait_for_response=True, script=_online_script)
+    and _online_payload[:6]
+    == bytes((0x28, 0x01, 0x07, 0x00, len(_online_script), 0x00)),
+)
+check(
+    "CyberPi online request accepts the verified script boundary",
+    len(encode_online_request_payload(" " * MAX_ONLINE_SCRIPT_BYTES))
+    == MAX_ONLINE_SCRIPT_BYTES + 6,
+)
+try:
+    encode_online_request_payload(" " * (MAX_ONLINE_SCRIPT_BYTES + 1))
+except CyberPiProtocolError:
+    _oversized_online_script_rejected = True
+else:
+    _oversized_online_script_rejected = False
+check("CyberPi online request rejects a 250-byte script", _oversized_online_script_rejected)
+_direct_ultrasonic_response = bytes.fromhex(
+    "f3 05 12 00 28 01 50 00 0c 00 7b 22 72 65 74 22 3a 31 30 2e 30 7d 05 f4"
+)
+check(
+    "live direct ultrasonic response decodes",
+    decode_online_response_payload(decode_f3f4_frame(_direct_ultrasonic_response).payload)
+    == CyberPiOnlineResponse(sequence=80, result=10.0),
+)
+_online_error_response = bytes.fromhex(
+    "f3 0c 19 00 28 01 64 00 13 00 7b 22 65 72 72 22 3a 22 4e 61 6d 65 45 72 72 6f 72 22 7d 2e f4"
+)
+check(
+    "live CyberPi online error response decodes",
+    decode_online_response_payload(decode_f3f4_frame(_online_error_response).payload)
+    == CyberPiOnlineResponse(sequence=100, error="NameError"),
+)
+_ultrasonic_report = bytes.fromhex(
+    "f3 0c 19 00 29 00 15 00 7b 27 6f 64 5f 70 72 6f 62 65 5f 31 27 3a 20 33 30 30 2e 30 7d a9 f4"
+)
+check(
+    "live CyberPi ultrasonic subscription report decodes",
+    decode_subscription_report(decode_f3f4_frame(_ultrasonic_report).payload)
+    == {"od_probe_1": 300.0},
+)
+_primed_ultrasonic_report = bytes.fromhex(
+    "f3 10 1d 00 29 00 19 00 7b 27 6f 64 5f 61 66 74 65 72 5f 64 69 72 65 63 74 27 3a 20 31 30 2e 35 7d c4 f4"
+)
+check(
+    "live primed ultrasonic subscription report decodes",
+    decode_subscription_report(decode_f3f4_frame(_primed_ultrasonic_report).payload)
+    == {"od_after_direct": 10.5},
+)
+_cyberpi_decoder = F3F4FrameDecoder()
+check(
+    "CyberPi decoder handles a split mode marker",
+    _cyberpi_decoder.feed(b"\x00\x99" + ONLINE_MODE_MARKER[:4]) == []
+    and _cyberpi_decoder.feed(ONLINE_MODE_MARKER[4:])
+    == [
+        CyberPiFrame(
+            bytes.fromhex("0d 00 01"), header_checksum=0xF6, payload_checksum=0x0E
+        )
+    ]
+    and _cyberpi_decoder.dropped_bytes == 2,
+)
+check(
+    "CyberPi decoder identifies mBlock online mode",
+    decode_mode_marker(ONLINE_MODE_MARKER) is CyberPiMode.ONLINE,
+)
+_cyberpi_bad = bytearray(_cyberpi_sample)
+_cyberpi_bad[-2] ^= 0x01
+_cyberpi_decoder = F3F4FrameDecoder()
+check(
+    "CyberPi decoder rejects a bad payload checksum",
+    _cyberpi_decoder.feed(bytes(_cyberpi_bad)) == []
+    and _cyberpi_decoder.checksum_errors == 1,
+)
+_cyberpi_bad_header = bytearray(_cyberpi_sample)
+_cyberpi_bad_header[1] ^= 0x01
+_cyberpi_decoder = F3F4FrameDecoder()
+check(
+    "CyberPi decoder rejects a bad header checksum",
+    _cyberpi_decoder.feed(bytes(_cyberpi_bad_header)) == []
+    and _cyberpi_decoder.checksum_errors == 1,
+)
+check(
+    "CyberPi profile matches the connected USB identity",
+    DEFAULT_PROFILE.matches_usb(6790, 29987) and BAUD_RATE == 115200,
+)
+check(
+    "CyberPi boot output is recognized",
+    extract_boot_lines(b"\r\nPYB: fast reboot\r\nMicroPython 44.")
+    == ("PYB: fast reboot", "MicroPython 44."),
+)
+
+
+class _FakeCyberPiSerial:
+    def __init__(self, *, error_scripts: set[str] | None = None, mode_byte: int = 0x01) -> None:
+        self.error_scripts = error_scripts or set()
+        self.mode_byte = mode_byte
+        self.writes: list[bytes] = []
+        self._incoming = bytearray()
+        self.closed = False
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._incoming)
+
+    def read(self, size: int = 1) -> bytes:
+        chunk = bytes(self._incoming[:size])
+        del self._incoming[:size]
+        return chunk
+
+    def write(self, data: bytes) -> int:
+        self.writes.append(data)
+        payload = decode_f3f4_frame(data).payload
+        if payload == bytes((0x0D, 0x80)):
+            response_payload = bytes((0x0D, 0x80, self.mode_byte))
+        elif payload == bytes((0x06,)):
+            response_payload = bytes((0x06,)) + b"44.01.016"
+        elif len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
+            # The mBlock online-mode bootstrap sequence (see
+            # cyberpi.ONLINE_ENTRY_SCRIPTS). Mirrors real hardware: only the
+            # final `online_restart` step actually flips the reported mode.
+            sequence = int.from_bytes(payload[2:4], "little")
+            script_length = int.from_bytes(payload[4:6], "little")
+            script = payload[6 : 6 + script_length].decode("utf-8")
+            if script == ONLINE_ENTRY_SCRIPTS[-1]:
+                self.mode_byte = 0x01
+            response_body = repr({"ret": None}).encode()
+            response_payload = bytes(
+                (
+                    0x28,
+                    0x01,
+                    sequence & 0xFF,
+                    sequence >> 8,
+                    len(response_body) & 0xFF,
+                    len(response_body) >> 8,
+                )
+            ) + response_body
+        else:
+            request = decode_online_request_payload(payload)
+            if request.script in self.error_scripts:
+                response_body = repr({"err": "NameError"}).encode()
+            else:
+                response_body = repr({"ret": self._value_for(request.script)}).encode()
+            response_payload = bytes(
+                (
+                    0x28,
+                    0x01,
+                    request.sequence & 0xFF,
+                    request.sequence >> 8,
+                    len(response_body) & 0xFF,
+                    len(response_body) >> 8,
+                )
+            ) + response_body
+        self._incoming.extend(b"boot noise\r\n" + encode_f3f4_frame(response_payload))
+        return len(data)
+
+    def _value_for(self, script: str) -> object:
+        values: dict[str, object] = {
+            "mbuild.ultrasonic2.get(1)": 10.5,
+            "cyberpi.get_battery()": 100,
+            "[cyberpi.get_pitch(),cyberpi.get_roll(),cyberpi.get_yaw()]": [0, 2, 44],
+            '[cyberpi.mbot2.EM_get_speed("EM1"),cyberpi.mbot2.EM_get_speed("EM2")]': [
+                -0.0,
+                -0.0,
+            ],
+            '[cyberpi.mbot2.EM_get_power("EM1"),cyberpi.mbot2.EM_get_power("EM2")]': [
+                -0.0,
+                -0.0,
+            ],
+            '[cyberpi.mbot2.EM_get_angle("EM1"),cyberpi.mbot2.EM_get_angle("EM2")]': [
+                15,
+                0,
+            ],
+            STOP_ALL_SCRIPT: None,
+            "cyberpi.mbot2.straight(5, speed = 20)": None,
+            "cyberpi.mbot2.turn(30, speed = 20)": None,
+        }
+        if script not in values:
+            raise AssertionError(f"unexpected fake CyberPi script: {script}")
+        return values[script]
+
+    def flush(self) -> None:
+        pass
+
+    def reset_input_buffer(self) -> None:
+        self._incoming.clear()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+_fake_serial = _FakeCyberPiSerial()
+_telemetry_client = CyberPiTelemetryClient(_fake_serial, timeout_seconds=0.1)
+try:
+    _telemetry_client.read_snapshot()
+except CyberPiNotReadyError:
+    _snapshot_blocked_before_initialize = True
+else:
+    _snapshot_blocked_before_initialize = False
+check("CyberPi telemetry requires successful initialization", _snapshot_blocked_before_initialize)
+
+_bring_up = _telemetry_client.initialize()
+_snapshot = _telemetry_client.read_snapshot()
+check(
+    "CyberPi telemetry client validates a getter-only snapshot",
+    _bring_up.mode is CyberPiMode.ONLINE
+    and _bring_up.firmware_version == "44.01.016"
+    and _bring_up.ultrasonic_cm == 10.5
+    and _snapshot.battery_percent == 100
+    and _snapshot.ultrasonic_cm == 10.5
+    and (_snapshot.pitch_deg, _snapshot.roll_deg, _snapshot.yaw_deg) == (0, 2, 44)
+    and (_snapshot.left_angle_deg, _snapshot.right_angle_deg) == (15, 0)
+    and _snapshot.motors_stationary,
+)
+_telemetry_scripts = [
+    decode_online_request_payload(decode_f3f4_frame(raw).payload).script
+    for raw in _fake_serial.writes
+    if decode_f3f4_frame(raw).payload[:1] == bytes((0x28,))
+]
+check(
+    "CyberPi telemetry sends only bounded getter scripts",
+    bool(_telemetry_scripts)
+    and all(len(script.encode()) <= MAX_ONLINE_SCRIPT_BYTES for script in _telemetry_scripts)
+    and all("get" in script for script in _telemetry_scripts)
+    and all(
+        forbidden not in script
+        for script in _telemetry_scripts
+        for forbidden in ("EM_set", "EM_stop", "drive", "straight", "turn(")
+    ),
+)
+_telemetry_client.close()
+check("CyberPi telemetry client closes its serial transport", _fake_serial.closed)
+
+_remote_error_serial = _FakeCyberPiSerial(error_scripts={"cyberpi.get_battery()"})
+_remote_error_client = CyberPiTelemetryClient(_remote_error_serial, timeout_seconds=0.1)
+_remote_error_client.initialize()
+try:
+    _remote_error_client.read_snapshot()
+except CyberPiRemoteError as error:
+    _remote_error_decoded = error.error == "NameError" and error.script == "cyberpi.get_battery()"
+else:
+    _remote_error_decoded = False
+finally:
+    _remote_error_client.close()
+check("CyberPi telemetry surfaces structured remote errors", _remote_error_decoded)
+
+_upload_mode_serial = _FakeCyberPiSerial(mode_byte=0x00)
+_upload_mode_client = CyberPiTelemetryClient(_upload_mode_serial, timeout_seconds=0.1)
+_upload_mode_bring_up = _upload_mode_client.initialize()
+_upload_mode_snapshot = _upload_mode_client.read_snapshot()
+_upload_mode_client.close()
+check(
+    "CyberPi telemetry proceeds when mode reports upload, not online",
+    _upload_mode_bring_up.mode is CyberPiMode.UPLOAD and _upload_mode_snapshot.battery_percent == 100,
+)
+
+_estop_serial = _FakeCyberPiSerial()
+_estop_client = CyberPiEmergencyStopClient(_estop_serial, timeout_seconds=0.1)
+try:
+    _estop_client.stop_all()
+except CyberPiNotReadyError:
+    _estop_blocked_before_initialize = True
+else:
+    _estop_blocked_before_initialize = False
+check("CyberPi estop refuses to run before initialize", _estop_blocked_before_initialize)
+
+_estop_mode = _estop_client.initialize()
+_estop_client.stop_all()
+_estop_scripts = [
+    decode_online_request_payload(decode_f3f4_frame(raw).payload).script
+    for raw in _estop_serial.writes
+    if decode_f3f4_frame(raw).payload[:1] == bytes((0x28,))
+]
+check(
+    "CyberPi estop sends exactly one EM_stop(all) command",
+    _estop_mode is CyberPiMode.ONLINE and _estop_scripts == [STOP_ALL_SCRIPT],
+)
+_estop_client.close()
+check("CyberPi estop client closes its serial transport", _estop_serial.closed)
+
+_estop_error_serial = _FakeCyberPiSerial(error_scripts={STOP_ALL_SCRIPT})
+_estop_error_client = CyberPiEmergencyStopClient(_estop_error_serial, timeout_seconds=0.1)
+_estop_error_client.initialize()
+try:
+    _estop_error_client.stop_all()
+except CyberPiRemoteError as error:
+    _estop_error_decoded = error.error == "NameError" and error.script == STOP_ALL_SCRIPT
+else:
+    _estop_error_decoded = False
+finally:
+    _estop_error_client.close()
+check("CyberPi estop surfaces a structured remote error", _estop_error_decoded)
+
+_online_entry_frames = encode_online_entry_frames()
+_online_entry_decoded = []
+for _frame_bytes in _online_entry_frames:
+    _payload = decode_f3f4_frame(_frame_bytes).payload
+    _length = int.from_bytes(_payload[4:6], "little")
+    _online_entry_decoded.append(
+        (_payload[0], _payload[1], _payload[6 : 6 + _length].decode("utf-8"))
+    )
+check(
+    "encode_online_entry_frames produces mBlock's exact captured online-mode bootstrap sequence",
+    len(_online_entry_frames) == 3
+    and _online_entry_decoded
+    == [(0x28, ONLINE_RESTART_WAIT, script) for script in ONLINE_ENTRY_SCRIPTS],
+)
+
+_estop_upload_mode_serial = _FakeCyberPiSerial(mode_byte=0x00)
+_estop_bootstrap_sleeps: list[float] = []
+_estop_upload_mode_client = CyberPiEmergencyStopClient(
+    _estop_upload_mode_serial, timeout_seconds=0.1, sleeper=_estop_bootstrap_sleeps.append
+)
+_estop_bootstrap_mode = _estop_upload_mode_client.initialize()
+_estop_upload_mode_client.close()
+check(
+    "CyberPi estop self-bootstraps into online mode via mBlock's entry sequence",
+    _estop_bootstrap_mode is CyberPiMode.ONLINE
+    and _estop_upload_mode_serial.mode_byte == 0x01
+    and _estop_bootstrap_sleeps == [ESTOP_ONLINE_ENTRY_SETTLE_SECONDS],
+)
+
+_estop_stuck_upload_serial = _FakeCyberPiSerial(mode_byte=0x00)
+_estop_stuck_upload_serial.mode_byte = 0x00
+_original_estop_write = _estop_stuck_upload_serial.write
+def _estop_write_ignoring_online_restart(data: bytes) -> int:  # noqa: E306
+    # Simulate a board that never actually settles into online mode, even
+    # after the bootstrap sequence -- initialize() must still raise, not
+    # silently proceed.
+    payload = decode_f3f4_frame(data).payload
+    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
+        written = _original_estop_write(data)
+        _estop_stuck_upload_serial.mode_byte = 0x00
+        return written
+    return _original_estop_write(data)
+_estop_stuck_upload_serial.write = _estop_write_ignoring_online_restart
+_estop_stuck_upload_client = CyberPiEmergencyStopClient(
+    _estop_stuck_upload_serial, timeout_seconds=0.1, sleeper=lambda _seconds: None
+)
+try:
+    _estop_stuck_upload_client.initialize()
+except CyberPiNotReadyError:
+    _estop_stuck_upload_refused = True
+else:
+    _estop_stuck_upload_refused = False
+finally:
+    _estop_stuck_upload_client.close()
+check(
+    "CyberPi estop still refuses to arm if the bootstrap sequence doesn't take",
+    _estop_stuck_upload_refused,
+)
+
+_motion_safety = SafetyController(MotionLimits(max_distance_cm=10, max_turn_degrees=45))
+_motion_safety.connect(now=0.0)
+_motion_safety.arm(now=0.0)
+_motion_safety.update_telemetry(_telemetry)
+
+_motion_serial = _FakeCyberPiSerial()
+_motion_client = CyberPiMotionClient(_motion_serial, _motion_safety, timeout_seconds=0.1)
+try:
+    _motion_client.drive_straight(5, 20, now=0.01)
+except CyberPiNotReadyError:
+    _motion_blocked_before_initialize = True
+else:
+    _motion_blocked_before_initialize = False
+check("CyberPi motion client refuses to run before initialize", _motion_blocked_before_initialize)
+
+_motion_client.initialize()
+_motion_writes_before_limit_check = len(_motion_serial.writes)
+try:
+    _motion_client.drive_straight(999, 20, now=0.02)
+except SafetyError:
+    _motion_over_limit_blocked = True
+else:
+    _motion_over_limit_blocked = False
+check(
+    "CyberPi motion client enforces the same distance limit as the simulator",
+    _motion_over_limit_blocked and len(_motion_serial.writes) == _motion_writes_before_limit_check,
+)
+
+_motion_client.drive_straight(5, 20, now=0.03)
+_motion_client.turn(30, 20, now=0.04)
+_motion_scripts = [
+    decode_online_request_payload(decode_f3f4_frame(raw).payload).script
+    for raw in _motion_serial.writes
+    if decode_f3f4_frame(raw).payload[:1] == bytes((0x28,))
+]
+check(
+    "CyberPi motion client sends the exact bounded straight/turn scripts",
+    _motion_scripts
+    == ["cyberpi.mbot2.straight(5, speed = 20)", "cyberpi.mbot2.turn(30, speed = 20)"],
+)
+_motion_client.close()
+check("CyberPi motion client closes its serial transport", _motion_serial.closed)
+
+_motion_error_serial = _FakeCyberPiSerial(error_scripts={"cyberpi.mbot2.straight(5, speed = 20)"})
+_motion_error_safety = SafetyController(MotionLimits(max_distance_cm=10))
+_motion_error_safety.connect(now=0.0)
+_motion_error_safety.arm(now=0.0)
+_motion_error_safety.update_telemetry(_telemetry)
+_motion_error_client = CyberPiMotionClient(_motion_error_serial, _motion_error_safety, timeout_seconds=0.1)
+_motion_error_client.initialize()
+try:
+    _motion_error_client.drive_straight(5, 20, now=0.01)
+except CyberPiRemoteError as error:
+    _motion_error_decoded = error.error == "NameError"
+else:
+    _motion_error_decoded = False
+finally:
+    _motion_error_client.close()
+check("CyberPi motion client surfaces a structured remote error", _motion_error_decoded)
+
+_motion_upload_mode_serial = _FakeCyberPiSerial(mode_byte=0x00)
+_motion_upload_mode_safety = SafetyController(MotionLimits(max_distance_cm=10))
+_motion_upload_mode_safety.connect(now=0.0)
+_motion_upload_mode_safety.arm(now=0.0)
+_motion_upload_mode_safety.update_telemetry(_telemetry)
+_motion_bootstrap_sleeps: list[float] = []
+_motion_upload_mode_client = CyberPiMotionClient(
+    _motion_upload_mode_serial,
+    _motion_upload_mode_safety,
+    timeout_seconds=0.1,
+    sleeper=_motion_bootstrap_sleeps.append,
+)
+_motion_bootstrap_mode = _motion_upload_mode_client.initialize()
+_motion_upload_mode_client.close()
+check(
+    "CyberPi motion client self-bootstraps into online mode via mBlock's entry sequence",
+    _motion_bootstrap_mode is CyberPiMode.ONLINE
+    and _motion_upload_mode_serial.mode_byte == 0x01
+    and _motion_bootstrap_sleeps == [MOTION_ONLINE_ENTRY_SETTLE_SECONDS],
+)
+
+_motion_stuck_upload_serial = _FakeCyberPiSerial(mode_byte=0x00)
+_original_motion_write = _motion_stuck_upload_serial.write
+def _motion_write_ignoring_online_restart(data: bytes) -> int:  # noqa: E306
+    payload = decode_f3f4_frame(data).payload
+    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
+        written = _original_motion_write(data)
+        _motion_stuck_upload_serial.mode_byte = 0x00
+        return written
+    return _original_motion_write(data)
+_motion_stuck_upload_serial.write = _motion_write_ignoring_online_restart
+_motion_stuck_upload_safety = SafetyController(MotionLimits(max_distance_cm=10))
+_motion_stuck_upload_safety.connect(now=0.0)
+_motion_stuck_upload_safety.arm(now=0.0)
+_motion_stuck_upload_safety.update_telemetry(_telemetry)
+_motion_stuck_upload_client = CyberPiMotionClient(
+    _motion_stuck_upload_serial,
+    _motion_stuck_upload_safety,
+    timeout_seconds=0.1,
+    sleeper=lambda _seconds: None,
+)
+try:
+    _motion_stuck_upload_client.initialize()
+except CyberPiNotReadyError:
+    _motion_stuck_upload_refused = True
+else:
+    _motion_stuck_upload_refused = False
+finally:
+    _motion_stuck_upload_client.close()
+check(
+    "CyberPi motion client still refuses to arm if the bootstrap sequence doesn't take",
+    _motion_stuck_upload_refused,
+)
+
+import robot.android_usb as _android_usb_mod  # noqa: E402
+from brain.events import EventHub  # noqa: E402
+from brain.gemma import GemmaProvider  # noqa: E402
+
+_gemma_provider = GemmaProvider(EventHub())
+_gemma_provider.robot_port = "/dev/fake-cyberpi-test-port"
+
+os.environ.pop("TERMUX_USB_FD", None)
+try:
+    _gemma_provider._open_telemetry_client()
+except Exception as error:
+    _gemma_pyserial_branch_error = error
+else:
+    _gemma_pyserial_branch_error = None
+check(
+    "Gemma telemetry client defaults to the pyserial HAL_ROBOT_PORT path",
+    _gemma_pyserial_branch_error is not None
+    and "fake-cyberpi-test-port" in str(_gemma_pyserial_branch_error),
+)
+
+
+class _FakeCh340Transport:
+    def __init__(self, fd: int, **kwargs: object) -> None:
+        self.fd = fd
+
+
+_real_ch340_transport = _android_usb_mod.Ch340UsbTransport
+_android_usb_mod.Ch340UsbTransport = _FakeCh340Transport
+try:
+    os.environ["TERMUX_USB_FD"] = "42"
+    _gemma_android_client = _gemma_provider._open_telemetry_client()
+    check(
+        "Gemma telemetry client switches to Ch340UsbTransport when TERMUX_USB_FD is set",
+        isinstance(_gemma_android_client.transport, _FakeCh340Transport)
+        and _gemma_android_client.transport.fd == 42,
+    )
+finally:
+    _android_usb_mod.Ch340UsbTransport = _real_ch340_transport
+    del os.environ["TERMUX_USB_FD"]
+
+_gemma_drive_serial = _FakeCyberPiSerial(mode_byte=0x01)
+_gemma_provider._open_robot_transport = lambda: _gemma_drive_serial
+_gemma_drive_result = _gemma_provider._drive_straight(5, 20)
+check(
+    "Gemma drive_straight tool drives and closes the transport against a fake CyberPi",
+    _gemma_drive_result == {"ok": True} and _gemma_drive_serial.closed,
+)
+
+_gemma_turn_serial = _FakeCyberPiSerial(mode_byte=0x01)
+_gemma_provider._open_robot_transport = lambda: _gemma_turn_serial
+_gemma_turn_result = _gemma_provider._turn(30, 20)
+check(
+    "Gemma turn tool turns and closes the transport against a fake CyberPi",
+    _gemma_turn_result == {"ok": True} and _gemma_turn_serial.closed,
+)
+
+_gemma_estop_serial = _FakeCyberPiSerial(mode_byte=0x01)
+_gemma_provider._open_robot_transport = lambda: _gemma_estop_serial
+_gemma_estop_result = _gemma_provider._emergency_stop()
+check(
+    "Gemma emergency_stop tool stops and closes the transport against a fake CyberPi",
+    _gemma_estop_result == {"ok": True} and _gemma_estop_serial.closed,
+)
+
+
+def _gemma_transport_unavailable():  # noqa: E306
+    raise RuntimeError("no such device")
+
+
+_gemma_provider._open_robot_transport = _gemma_transport_unavailable
+_gemma_drive_failure = _gemma_provider._drive_straight(5, 20)
+check(
+    "Gemma drive_straight tool fails cleanly when the transport can't open",
+    _gemma_drive_failure == {"ok": False, "error": "no such device"},
+)
+
+_gemma_out_of_bounds_serial = _FakeCyberPiSerial(mode_byte=0x01)
+_gemma_provider._open_robot_transport = lambda: _gemma_out_of_bounds_serial
+_gemma_out_of_bounds_result = _gemma_provider._drive_straight(500, 20)
+check(
+    "Gemma drive_straight tool refuses an out-of-bounds distance via SafetyController",
+    _gemma_out_of_bounds_result["ok"] is False
+    and "50 cm limit" in _gemma_out_of_bounds_result["error"],
+)
+
+_gemma_provider._capture_frame_termux = lambda: (b"termux", 1, 1)
+_gemma_provider._capture_frame_ffmpeg = lambda: (b"ffmpeg", 2, 2)
+_real_shutil_which = shutil.which
+
+shutil.which = lambda name: ("/fake/bin/" + name if name == _gemma_provider.termux_camera_bin else None)
+try:
+    _gemma_camera_auto_termux = _gemma_provider._capture_frame_auto()
+finally:
+    shutil.which = _real_shutil_which
+check(
+    "Gemma capture_frame_auto picks termux-camera-photo when it's on PATH",
+    _gemma_camera_auto_termux == (b"termux", 1, 1),
+)
+
+shutil.which = lambda name: None
+try:
+    _gemma_camera_auto_ffmpeg = _gemma_provider._capture_frame_auto()
+finally:
+    shutil.which = _real_shutil_which
+check(
+    "Gemma capture_frame_auto falls back to ffmpeg when termux-camera-photo is absent",
+    _gemma_camera_auto_ffmpeg == (b"ffmpeg", 2, 2),
+)
+
+import termux_voice  # noqa: E402
+
+check(
+    "wake word matches as a whole word, case-insensitively",
+    termux_voice._heard_wake_word("Hal, drive forward", "hal")
+    and termux_voice._heard_wake_word("hey HAL what do you see", "hal")
+    and termux_voice._heard_wake_word("HAL", "hal"),
+)
+check(
+    "wake word does not match inside another word",
+    not termux_voice._heard_wake_word("please halt", "hal")
+    and not termux_voice._heard_wake_word("shall we begin", "hal"),
+)
+check(
+    "wake word does not match when absent entirely",
+    not termux_voice._heard_wake_word("just some ambient conversation nearby", "hal"),
+)
+check(
+    "empty wake word disables the gate",
+    termux_voice._heard_wake_word("anything at all", ""),
+)
+
+
+async def _exercise_wake_word_gate() -> tuple[list[tuple[str, str]], list[bytes]]:
+    calls: list[tuple[str, str]] = []
+    spoken: list[bytes] = []
+    utterances = iter(
+        [
+            "just some unrelated ambient conversation",
+            "HAL, please respond",
+            None,
+        ]
+    )
+
+    async def fake_listen_once(timeout: float = 0.0) -> str:
+        text = next(utterances)
+        if text is None:
+            raise asyncio.CancelledError()
+        return text
+
+    async def fake_run_turn(session_id: str, user_text: str) -> tuple[str, bytes, dict]:
+        calls.append((session_id, user_text))
+        return "acknowledged", b"wav-bytes", {}
+
+    async def fake_speak(wav_bytes: bytes) -> None:
+        spoken.append(wav_bytes)
+
+    original_listen_once = termux_voice.listen_once
+    original_speak = termux_voice.speak
+    termux_voice.listen_once = fake_listen_once
+    termux_voice.speak = fake_speak
+    try:
+        try:
+            await termux_voice.listen_loop(fake_run_turn)
+        except asyncio.CancelledError:
+            pass
+    finally:
+        termux_voice.listen_once = original_listen_once
+        termux_voice.speak = original_speak
+    return calls, spoken
+
+
+_wake_gate_calls, _wake_gate_spoken = asyncio.run(_exercise_wake_word_gate())
+check(
+    "listen_loop ignores an utterance without the wake word and answers one with it",
+    _wake_gate_calls == [(termux_voice.SESSION_ID, "HAL, please respond")]
+    and _wake_gate_spoken == [b"wav-bytes"],
+)
+
+import io  # noqa: E402
+import wave as _wave_mod  # noqa: E402
+
+from termux_whisper_cpp import WhisperCppError, WhisperCppModel  # noqa: E402
+
+_whisper_test_dir = tempfile.mkdtemp(prefix="hal-whisper-cpp-test-")
+
+_whisper_fake_model_path = os.path.join(_whisper_test_dir, "fake-model.bin")
+with open(_whisper_fake_model_path, "wb") as _f:
+    _f.write(b"not a real ggml model, just needs to exist on disk")
+
+_whisper_argv_capture_path = os.path.join(_whisper_test_dir, "argv.txt")
+_whisper_fake_cli_path = os.path.join(_whisper_test_dir, "fake-whisper-cli")
+with open(_whisper_fake_cli_path, "w") as _f:
+    _f.write(
+        "#!/bin/sh\n"
+        f'echo "$@" > "{_whisper_argv_capture_path}"\n'
+        "printf ' Hello Dave, this is a test transcript.'\n"
+    )
+os.chmod(_whisper_fake_cli_path, 0o755)
+
+_whisper_fake_cli_failing_path = os.path.join(_whisper_test_dir, "fake-whisper-cli-fail")
+with open(_whisper_fake_cli_failing_path, "w") as _f:
+    _f.write("#!/bin/sh\necho 'synthetic failure for testing' 1>&2\nexit 1\n")
+os.chmod(_whisper_fake_cli_failing_path, 0o755)
+
+
+def _whisper_test_wav_bytes() -> bytes:
+    buf = io.BytesIO()
+    with _wave_mod.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(b"\x00\x00" * 1600)
+    return buf.getvalue()
+
+
+_whisper_model = WhisperCppModel(_whisper_fake_model_path, binary_path=_whisper_fake_cli_path, threads=2)
+check("WhisperCppModel.model.device reports cpu", _whisper_model.model.device == "cpu")
+
+_whisper_segments, _whisper_info = _whisper_model.transcribe(
+    io.BytesIO(_whisper_test_wav_bytes()), language="en", initial_prompt="Dave", beam_size=3
+)
+check(
+    "WhisperCppModel.transcribe returns the fake CLI's stdout as one segment",
+    [s.text for s in _whisper_segments] == ["Hello Dave, this is a test transcript."]
+    and _whisper_info.language == "en",
+)
+
+_whisper_argv = open(_whisper_argv_capture_path).read().split()
+check(
+    "WhisperCppModel passes model/file/language/beam-size/prompt flags to whisper-cli",
+    "-m" in _whisper_argv
+    and _whisper_fake_model_path in _whisper_argv
+    and "-l" in _whisper_argv
+    and "en" in _whisper_argv
+    and "-bs" in _whisper_argv
+    and "3" in _whisper_argv
+    and "--prompt" in _whisper_argv
+    and "Dave" in _whisper_argv
+    and "-np" in _whisper_argv
+    and "-nt" in _whisper_argv,
+)
+
+_whisper_model.transcribe(io.BytesIO(_whisper_test_wav_bytes()), initial_prompt=None)
+_whisper_argv_no_prompt = open(_whisper_argv_capture_path).read().split()
+check(
+    "WhisperCppModel omits --prompt when no initial_prompt is given",
+    "--prompt" not in _whisper_argv_no_prompt,
+)
+
+_whisper_np_segments, _ = _whisper_model.transcribe(_np.zeros(1600, dtype=_np.float32))
+check(
+    "WhisperCppModel accepts a raw numpy float32 array (main.py's startup self-test shape)",
+    [s.text for s in _whisper_np_segments] == ["Hello Dave, this is a test transcript."],
+)
+
+_whisper_failing_model = WhisperCppModel(_whisper_fake_model_path, binary_path=_whisper_fake_cli_failing_path)
+try:
+    _whisper_failing_model.transcribe(io.BytesIO(_whisper_test_wav_bytes()))
+except WhisperCppError as error:
+    _whisper_fail_ok = "synthetic failure" in str(error)
+else:
+    _whisper_fail_ok = False
+check("WhisperCppModel raises WhisperCppError with stderr detail on a nonzero exit", _whisper_fail_ok)
+
+try:
+    WhisperCppModel(
+        _whisper_fake_model_path, binary_path=os.path.join(_whisper_test_dir, "does-not-exist")
+    ).transcribe(io.BytesIO(_whisper_test_wav_bytes()))
+except WhisperCppError:
+    _whisper_missing_binary_ok = True
+else:
+    _whisper_missing_binary_ok = False
+check("WhisperCppModel raises WhisperCppError when the whisper-cli binary is missing", _whisper_missing_binary_ok)
+
+try:
+    WhisperCppModel(os.path.join(_whisper_test_dir, "missing-model.bin"))
+except WhisperCppError:
+    _whisper_missing_model_ok = True
+else:
+    _whisper_missing_model_ok = False
+check("WhisperCppModel raises WhisperCppError when the model file doesn't exist", _whisper_missing_model_ok)
+
+shutil.rmtree(_whisper_test_dir, ignore_errors=True)
 
 # ----------------------------------------------------------------------------
 

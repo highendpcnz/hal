@@ -1248,7 +1248,7 @@
   <form id="cmdline" class="cmdline">
     <div class="command-composer">
       <div id="cmd-command-menu" class="slash-command-menu" role="listbox"
-           aria-label="HAL and Hermes slash commands" hidden></div>
+           aria-label="HAL and brain-provider slash commands" hidden></div>
       <input id="cmd-input" type="text" autocomplete="off" spellcheck="false"
              role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
              aria-expanded="false" aria-controls="cmd-command-menu"
@@ -1292,7 +1292,7 @@
   <div class="bridge-input">
     <div class="command-composer">
       <div id="bridge-command-menu" class="slash-command-menu" role="listbox"
-           aria-label="HAL and Hermes slash commands" hidden></div>
+           aria-label="HAL and brain-provider slash commands" hidden></div>
       <form id="bridge-form">
         <input id="bridge-cmd" type="text" autocomplete="off" spellcheck="false"
                role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
@@ -1346,7 +1346,7 @@
         <div id="system-local" class="status-grid"></div>
         <div class="drawer-grid">
           <div class="surface">
-            <h3>Hermes status</h3>
+            <h3>Brain status</h3>
             <pre id="surface-status" class="surface-output"></pre>
           </div>
           <div class="surface">
@@ -3082,7 +3082,7 @@
       name: name.toLowerCase(),
       description: String(command.description || '').trim(),
       inputHint: command.input_hint ? String(command.input_hint).trim() : '',
-      source: command.source === 'hal' ? 'hal' : 'hermes',
+      source: command.source === 'hal' ? 'hal' : 'brain',
     };
   }
 
@@ -3177,7 +3177,7 @@
     menu.appendChild(header);
 
     if (commandCatalogLoading && !commandCatalogLoaded) {
-      appendCommandState(menu, 'Synchronizing with Hermes ACP.');
+      appendCommandState(menu, 'Synchronizing with the brain provider.');
     } else if (!filtered.length) {
       appendCommandState(
         menu,
@@ -3201,7 +3201,7 @@
         copy.className = 'slash-command-copy';
         const description = document.createElement('span');
         description.className = 'slash-command-description';
-        description.textContent = command.description || 'Hermes command';
+        description.textContent = command.description || 'Brain command';
         copy.appendChild(description);
         if (command.inputHint) {
           const hint = document.createElement('span');
@@ -3251,10 +3251,10 @@
           .map(normalizeCommand)
           .filter(Boolean);
         commandCatalogLoaded = true;
-        commandCatalogError = payload.hermes_error || '';
+        commandCatalogError = payload.provider_error || payload.hermes_error || '';
         announceCommandStatus(
           commandCatalog.length + ' slash commands available'
-          + (commandCatalogError ? '. Hermes is unavailable; HAL commands remain.' : '.'),
+          + (commandCatalogError ? '. Provider commands are unavailable; HAL commands remain.' : '.'),
         );
         return commandCatalog;
       } catch (error) {
@@ -3414,7 +3414,8 @@
 
       document.getElementById('system-local').innerHTML =
         stat('Session', shortId(local.session_id)) +
-        stat('ACP', shortId(local.acp_session_id)) +
+        stat('Brain', local.brain_provider || '(unknown)') +
+        stat('Model session', shortId(local.provider_session_id || local.acp_session_id)) +
         stat('Bridge', local.bridge_mode || '(unknown)') +
         stat('Tools',
           ({ yolo: 'auto-approved', ask: 'ask Dave', deny: 'denied' })[local.permission_mode] ||

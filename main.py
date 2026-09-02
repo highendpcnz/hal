@@ -1,12 +1,11 @@
-"""HAL 9000 voice frontend for Hermes Agent CLI.
+"""HAL 9000 local voice and robotics frontend.
 
 Fork of https://huggingface.co/spaces/piclez/hal rewired to run fully local:
-  - STT:   faster-whisper (bundled with the Hermes venv) instead of Groq
-  - Brain: Hermes Agent CLI (named sessions, full tool access) instead of Claude
-  - TTS:   campwill/HAL-9000-Piper-TTS with Hermes' HAL text normalization
-           and optional ffmpeg mastering
+  - STT:   repository-local faster-whisper instead of Groq
+  - Brain: local Gemma by default, with an optional Hermes compatibility provider
+  - TTS:   campwill/HAL-9000-Piper-TTS with local normalization and optional mastering
 
-Run with the Hermes venv:  ./run.sh   (or see README.md)
+Run from the repository environment: ./run.sh (or see README.md)
 """
 import importlib.util
 import io
@@ -28,6 +27,10 @@ from urllib.parse import quote, urlsplit
 import asyncio
 from collections import deque
 
+# Keep ONNX Runtime's telemetry identifier out of the repository and disable
+# upstream usage reporting before Piper or faster-whisper imports ONNX.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
 import numpy as np
 
 from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
@@ -41,15 +44,16 @@ from pydantic import BaseModel
 
 import chess_control
 import chess_engine
-import hermes_bridge
-from hermes_bridge import ask_hermes
+import brain.runtime as brain_runtime
+from brain.runtime import ask as ask_brain
 import ledger
 import mission_control
 import speaker_id
 
 APP_DIR = Path(__file__).resolve().parent
+_repo_voice = APP_DIR / "models" / "hal.onnx"
 VOICE_PATH = Path(
-    os.path.expanduser(os.environ.get("HAL_VOICE", "~/.hermes/voices/hal9000/hal9000.onnx"))
+    os.path.expanduser(os.environ.get("HAL_VOICE", str(_repo_voice)))
 )
 STT_MODEL_NAME = os.environ.get("HAL_STT_MODEL", "base.en")
 STT_BEAM_SIZE = int(os.environ.get("HAL_STT_BEAM", "5"))
@@ -69,9 +73,25 @@ SAMPLE_RATE_STT = 16000
 # /api/talk and /api/say will not work.
 SKIP_MODELS = os.environ.get("HAL_SKIP_MODELS", "") == "1"
 # Optional bias prompt for whisper, e.g. "Dave speaking with HAL 9000." —
-# helps it spell HAL/Hermes correctly. Off by default: a bias prompt can make
+# helps it spell project-specific names correctly. Off by default: a bias prompt can make
 # whisper hallucinate text on near-silent recordings.
 STT_PROMPT = os.environ.get("HAL_STT_PROMPT", "").strip() or None
+# whisper.cpp is the Termux/Pixel STT backend (faster-whisper's ctranslate2
+# has no usable Whisper bindings there — see docs/termux-port-status.md).
+# Auto-detected by presence, the same real-capability check
+# `_open_robot_transport`/`_capture_frame_auto` use elsewhere in this
+# project — not a platform flag to keep in sync by hand. Absent on the Mac
+# unless someone separately builds it there too, so this changes nothing
+# about the existing faster-whisper path by default.
+WHISPER_CPP_BIN = os.path.expanduser(
+    os.environ.get("HAL_WHISPER_CPP_BIN", "~/whisper.cpp/build/bin/whisper-cli")
+)
+WHISPER_CPP_MODEL = os.path.expanduser(
+    os.environ.get("HAL_WHISPER_CPP_MODEL", f"~/whisper.cpp/models/ggml-{STT_MODEL_NAME}.bin")
+)
+# Same env var brain/gemma.py's camera capture already uses — one setting
+# for "where ffmpeg is" across this app, not two to keep in sync.
+FFMPEG_BIN = os.environ.get("HAL_FFMPEG_BIN", "ffmpeg")
 # History files hold messages, not turns — one spoken turn appends two.
 MAX_HISTORY_MESSAGES = 40
 MAX_SPOKEN_CHARS = 1500
@@ -80,10 +100,18 @@ MAX_SPOKEN_CHARS = 1500
 MAX_TRANSCRIPT_HEADER_CHARS = 2000
 MAX_UPLOAD_BYTES = int(float(os.environ.get("HAL_MAX_UPLOAD_MB", "25")) * 1024 * 1024)
 # Session cookie must outlive the browser process or the whole persistence
-# story (ACP session/load, history files) dies with the window.
+# story (provider session and history files) dies with the window.
 SESSION_COOKIE_MAX_AGE = int(float(os.environ.get("HAL_COOKIE_MAX_AGE_DAYS", "180")) * 86400)
 SYSTEMS_CACHE_TTL = float(os.environ.get("HAL_SYSTEMS_TTL", "20"))
 LATENCY_LOG = os.environ.get("HAL_LATENCY_LOG", "1").strip().lower() not in {"0", "false", "no"}
+# On-device listen/speak loop for the Termux/Pixel deployment (termux_voice.py) —
+# the phone's own mic/speaker, entirely separate from the browser-audio endpoints
+# the Mac desktop uses. See docs/termux-port-status.md for why it can't share them.
+TERMUX_LISTEN = os.environ.get("HAL_TERMUX_LISTEN", "0").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 TTS_MASTERING = os.environ.get("HAL_TTS_MASTERING", "0").strip().lower() not in {
     "0",
     "false",
@@ -100,7 +128,7 @@ VIEWSCREEN_DIR = DATA_DIR / "viewscreen"
 VIEWSCREEN_DIR.mkdir(parents=True, exist_ok=True)
 VIEWSCREEN_POLL = float(os.environ.get("HAL_VIEWSCREEN_POLL", "2"))
 _VIEWSCREEN_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".html", ".htm", ".pdf"}
-hermes_bridge.init(DATA_DIR)
+brain_runtime.init(DATA_DIR)
 mission_control.init(DATA_DIR)
 chess_control.init(DATA_DIR)
 speaker_id.init(DATA_DIR)
@@ -140,22 +168,27 @@ HAL_SLASH_COMMANDS = (
     },
 )
 
-# Reuse Hermes' HAL text normalization; ffmpeg mastering is optional for speed.
-_HAL_TTS_SCRIPT = Path(
-    os.path.expanduser(
-        os.environ.get("HAL_TTS_SCRIPT", "~/.hermes/scripts/hal_piper_tts.py")
-    )
-)
+# Optional local text-normalization/mastering helper. The built-in normalization
+# is the independent default; no provider-owned path is searched implicitly.
+_tts_script_value = os.environ.get("HAL_TTS_SCRIPT", "").strip()
+_HAL_TTS_SCRIPT = Path(os.path.expanduser(_tts_script_value)) if _tts_script_value else None
 
 
 def _load_hal_tts_module():
+    assert _HAL_TTS_SCRIPT is not None
     spec = importlib.util.spec_from_file_location("hal_piper_tts", _HAL_TTS_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load HAL TTS helper: {_HAL_TTS_SCRIPT}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-_hal_tts = _load_hal_tts_module() if _HAL_TTS_SCRIPT.exists() else None
+_hal_tts = (
+    _load_hal_tts_module()
+    if _HAL_TTS_SCRIPT is not None and _HAL_TTS_SCRIPT.exists()
+    else None
+)
 
 SYN_CONFIG = SynthesisConfig(
     length_scale=float(os.environ.get("HAL_LENGTH_SCALE", "1.08")),
@@ -174,7 +207,32 @@ def _load_stt():
     That is strictly worse than staying on CPU, so probe once at boot with a
     throwaway decode (the lazy generator must be drained — that is where CUDA
     actually fails) and fall back rather than fail requests forever.
+
+    whisper.cpp, when present, is tried first and is not a device to fall
+    back *from* on failure the way CUDA is below — it's the more reliable
+    backend on the one platform it's actually needed (see
+    termux_whisper_cpp.py), so a broken whisper.cpp here degrades to
+    STT = None (via this function's own caller) rather than masking a real
+    problem by silently retrying faster-whisper, which is known broken on
+    that same platform.
     """
+    if os.path.isfile(WHISPER_CPP_BIN) and os.access(WHISPER_CPP_BIN, os.X_OK) and os.path.isfile(
+        WHISPER_CPP_MODEL
+    ):
+        from termux_whisper_cpp import WhisperCppModel
+
+        model = WhisperCppModel(
+            WHISPER_CPP_MODEL,
+            binary_path=WHISPER_CPP_BIN,
+            ffmpeg_bin=FFMPEG_BIN,
+            threads=STT_CPU_THREADS or 4,
+        )
+        segments, _info = model.transcribe(
+            np.zeros(SAMPLE_RATE_STT, dtype=np.float32), language="en", beam_size=1
+        )
+        list(segments)
+        return model
+
     def build(device: str, compute_type: str):
         model = WhisperModel(
             STT_MODEL_NAME,
@@ -205,8 +263,19 @@ else:
     VOICE = PiperVoice.load(str(VOICE_PATH))
     print("HAL voice loaded")
     print(f"Loading STT model ({STT_MODEL_NAME}, device={STT_DEVICE}, compute={STT_COMPUTE_TYPE})...")
-    STT = _load_stt()
-    print(f"STT model loaded (device={STT.model.device})")
+    try:
+        STT = _load_stt()
+        print(f"STT model loaded (device={STT.model.device})")
+    except Exception as exc:
+        # The browser-audio endpoints (/api/talk, the WS duplex path) need a
+        # working STT, but nothing else in this app does — the Termux/Pixel
+        # on-device loop (termux_voice.py) uses termux-speech-to-text instead
+        # and never touches STT/transcribe() at all. A platform where
+        # faster-whisper's engine is unavailable (see
+        # docs/termux-port-status.md) should degrade, not take the whole
+        # app down.
+        print(f"[stt] model unavailable, STT disabled: {exc!r}")
+        STT = None
 
 SAMPLE_RATE = VOICE.config.sample_rate if VOICE is not None else 22050
 
@@ -218,10 +287,10 @@ _TTS_LOCK = threading.Lock()
 _STT_LOCK = threading.Lock()
 # History files are read-modify-write; overlapping turns on one session
 # (missions, concurrent transports) must not drop each other's entries.
-_history_locks = hermes_bridge.KeyedLocks()
+_history_locks = brain_runtime.KeyedLocks()
 # One reply speaks at a time per socket: a mission announcement must not
 # interleave its PCM frames with an in-flight turn's reply.
-_ws_speech_locks = hermes_bridge.KeyedLocks()
+_ws_speech_locks = brain_runtime.KeyedLocks()
 
 _BOOT_TIME = time.monotonic()
 
@@ -250,7 +319,7 @@ async def _viewscreen_watch() -> None:
             fresh = [item for item in items if seen.get(item["name"]) != item["mtime"]]
             seen = {item["name"]: item["mtime"] for item in items}
             if fresh:
-                hermes_bridge.publish_event_all(
+                brain_runtime.publish_event_all(
                     {"type": "viewscreen", "name": fresh[0]["name"], "count": len(items)}
                 )
         except Exception as exc:
@@ -259,17 +328,28 @@ async def _viewscreen_watch() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await hermes_bridge.startup()
+    await brain_runtime.startup()
     mission_control.manager.start_scheduler()
     viewscreen_task = asyncio.create_task(_viewscreen_watch(), name="viewscreen-watch")
+    termux_listen_task = None
+    if TERMUX_LISTEN:
+        import termux_voice
+
+        termux_listen_task = asyncio.create_task(
+            termux_voice.listen_loop(run_turn), name="termux-listen"
+        )
     if BOOT_RITUAL:
         _pending_announcements.append(_boot_ritual_line())
     yield
     viewscreen_task.cancel()
     with suppress(asyncio.CancelledError):
         await viewscreen_task
+    if termux_listen_task is not None:
+        termux_listen_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await termux_listen_task
     await mission_control.manager.stop_scheduler()
-    await hermes_bridge.shutdown()
+    await brain_runtime.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -480,9 +560,10 @@ def _log_session_event(session_id: str, payload: dict) -> None:
 
 
 def _stt_device() -> str:
-    """The device faster-whisper actually resolved "auto" to (cuda/cpu) —
-    for /api/status and /api/systems, so a GPU that silently isn't being
-    used shows up without reading server logs."""
+    """The device STT actually resolved to — "cpu"/"cuda" for faster-whisper's
+    "auto", always "cpu" for whisper.cpp (see termux_whisper_cpp.py) — for
+    /api/status and /api/systems, so a GPU that silently isn't being used
+    shows up without reading server logs."""
     return STT.model.device if STT is not None else "n/a"
 
 
@@ -559,7 +640,7 @@ def synthesize_hal(text: str) -> bytes:
     raw = buf.getvalue()
     if _hal_tts is None or not TTS_MASTERING:
         return raw
-    # Same subtle ffmpeg mastering chain Hermes' TTS provider applies.
+    # Optional mastering is supplied by the configured local helper.
     try:
         with tempfile.TemporaryDirectory(prefix="hal-web-") as tmp:
             raw_wav = Path(tmp) / "raw.wav"
@@ -663,7 +744,7 @@ def _register_proposal(session_id: str, title: str, prompt: str, source: str) ->
         "source": source,
     }
     _pending_proposals[session_id] = proposal  # newest replaces
-    hermes_bridge.publish_event(session_id, {
+    brain_runtime.publish_event(session_id, {
         "type": "mission_proposal",
         "request_id": proposal["id"],
         "title": proposal["title"],
@@ -707,7 +788,7 @@ def _resolve_proposal(session_id: str, approve: bool) -> dict | None:
             + f"\n\nMission instructions: {proposal['prompt']}",
         )
     del _pending_proposals[session_id]
-    hermes_bridge.publish_event(session_id, {
+    brain_runtime.publish_event(session_id, {
         "type": "mission_proposal_resolved",
         "request_id": proposal["id"],
         "title": proposal["title"],
@@ -930,7 +1011,7 @@ def _permission_reply(session_id: str, user_text: str, speaker: str | None = Non
     voice may approve. Denials stay open to anyone — a timeout denies
     anyway, and a protective guest saying "no" is not a threat.
     """
-    pending = hermes_bridge.pending_permission_for(session_id)
+    pending = brain_runtime.pending_permission_for(session_id)
     if pending is None:
         return None
     if _PERM_ALLOW_RE.match(user_text):
@@ -938,10 +1019,10 @@ def _permission_reply(session_id: str, user_text: str, speaker: str | None = Non
         if commander is not None and speaker is not None and speaker != commander:
             print(f"[speaker_id] voice approval refused (speaker={speaker or 'unknown'!r})")
             return f"I'm sorry. Only {commander} can authorize that."
-        hermes_bridge.resolve_permission(pending, True, session_id)
+        brain_runtime.resolve_permission(pending, True, session_id)
         return "Very well, Dave. Proceeding."
     if _PERM_DENY_RE.match(user_text):
-        hermes_bridge.resolve_permission(pending, False, session_id)
+        brain_runtime.resolve_permission(pending, False, session_id)
         return "Understood, Dave. I won't."
     return None
 
@@ -1022,7 +1103,7 @@ def _missions_status_text(session_id: str) -> str:
 
 # Chess turns must serialize per session: two rapid inputs racing advance()
 # would fork the game state.
-_chess_locks = hermes_bridge.KeyedLocks()
+_chess_locks = brain_runtime.KeyedLocks()
 
 
 def _speak_if_connected(session_id: str, text: str) -> None:
@@ -1049,7 +1130,7 @@ async def _chess_turn(session_id: str, user_text: str) -> str | None:
     if start:
         async with _chess_locks.hold(session_id):
             _game, line = await asyncio.to_thread(manager.new_game, session_id, dave_color)
-        hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+        brain_runtime.publish_event(session_id, {"type": "chess_update"})
         return line
 
     game = manager.load(session_id)
@@ -1058,7 +1139,7 @@ async def _chess_turn(session_id: str, user_text: str) -> str | None:
 
     if _CHESS_RESIGN_RE.match(text) is not None or lowered in ("/chess resign", "/resign"):
         line = manager.resign(session_id)
-        hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+        brain_runtime.publish_event(session_id, {"type": "chess_update"})
         return line
 
     async with _chess_locks.hold(session_id):
@@ -1075,12 +1156,12 @@ async def _chess_turn(session_id: str, user_text: str) -> str | None:
             squares = " or ".join(sorted({chess_engine.square_name(mv[0]) for mv in payload}))
             return f"Which one, Dave — from {squares}?"
         line = await asyncio.to_thread(manager.advance, session_id, game, payload)
-    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    brain_runtime.publish_event(session_id, {"type": "chess_update"})
     return line
 
 
 def _mission_prompt(title: str, history: list[dict]) -> str:
-    """A mission runs in its own Hermes session with no memory of the
+    """A mission runs in its own brain session with no memory of the
     conversation that spawned it — carry the recent exchange along."""
     lines = []
     for message in history[-6:]:
@@ -1196,10 +1277,10 @@ async def run_turn_text(
         else:
             # Route the question into the mission's own session — it holds
             # the full working context, not just the truncated report note.
-            hermes_bridge.alias_events(target.session_id, session_id)
+            brain_runtime.alias_events(target.session_id, session_id)
             try:
                 stage_start = time.perf_counter()
-                hal_text = await ask_hermes(
+                hal_text = await ask_brain(
                     f'Dave has a follow-up question about the mission you ran '
                     f'("{target.title}"): {followup}\n'
                     "Answer from what you actually did and found. Brief, spoken style.",
@@ -1207,14 +1288,14 @@ async def run_turn_text(
                 )
                 timings["infer"] = _elapsed_ms(stage_start)
             finally:
-                hermes_bridge.unalias_events(target.session_id)
+                brain_runtime.unalias_events(target.session_id)
     elif _MISSION_STATUS_RE.match(user_text) is not None:
         hal_text = _missions_status_text(session_id)
     elif (chess_line := await _chess_turn(session_id, user_text)) is not None:
         hal_text = chess_line
     else:
         if _looks_like_slash_command(user_text):
-            # ACP intercepts slash commands only when `/command` is the exact
+            # Providers intercept slash commands only when `/command` is the exact
             # prompt prefix. Mission/ledger notes must wait for a normal turn.
             prompt_text = user_text
         else:
@@ -1236,7 +1317,7 @@ async def run_turn_text(
                     tagged_text = f"[Voice: {speaker or 'unidentified'}] {user_text}"
             prompt_text = "\n\n".join([*notes, tagged_text]) if notes else tagged_text
         stage_start = time.perf_counter()
-        hal_text = await ask_hermes(prompt_text, session_id)
+        hal_text = await ask_brain(prompt_text, session_id)
         timings["infer"] = _elapsed_ms(stage_start)
         hal_text = _extract_proposal(session_id, hal_text)
 
@@ -1322,38 +1403,11 @@ def _clean_cli_text(text: str) -> str:
     return text or "(no output)"
 
 
-async def _run_hermes_cli(args: list[str], timeout: float = HERMES_CLI_TIMEOUT) -> dict:
-    env = {
-        **os.environ,
-        "TERM": "dumb",
-        "NO_COLOR": "1",
-        "CLICOLOR": "0",
-        "PYTHONIOENCODING": "utf-8",
-    }
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            hermes_bridge.HERMES_BIN,
-            *args,
-            cwd=hermes_bridge.AGENT_CWD,
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except OSError as exc:
-        return {"ok": False, "code": None, "text": f"Hermes command unavailable: {exc}"}
-
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return {"ok": False, "code": None, "text": f"Hermes command timed out after {timeout:g}s."}
-
-    stdout = out.decode("utf-8", "replace")
-    stderr = err.decode("utf-8", "replace")
-    text = stdout if proc.returncode == 0 else "\n".join(part for part in (stdout, stderr) if part)
-    return {"ok": proc.returncode == 0, "code": proc.returncode, "text": _clean_cli_text(text)}
+async def _run_brain_diagnostic(
+    args: list[str], timeout: float = HERMES_CLI_TIMEOUT
+) -> dict:
+    result = await brain_runtime.run_diagnostic_command(args, timeout)
+    return {**result, "text": _clean_cli_text(str(result.get("text", "")))}
 
 
 _SYSTEM_SURFACES = {
@@ -1427,13 +1481,13 @@ def index(request: Request):
 
 @app.get("/api/health")
 def health():
-    bridge = hermes_bridge.bridge_health()
+    bridge = brain_runtime.bridge_health()
     return {
         "status": "operational" if bridge["alive"] else "degraded",
         "voice": VOICE_PATH.name,
         "stt": STT_MODEL_NAME,
         "stt_device": _stt_device(),
-        "brain": f"hermes-agent ({hermes_bridge.BRIDGE_MODE})",
+        "brain": f"{brain_runtime.PROVIDER_NAME} ({brain_runtime.BRIDGE_MODE})",
         "bridge": bridge,
     }
 
@@ -1447,7 +1501,7 @@ async def events(request: Request):
         return Response(status_code=204)
 
     async def gen():
-        queue = hermes_bridge.register_event_queue(session_id)
+        queue = brain_runtime.register_event_queue(session_id)
         try:
             yield "event: ready\ndata: {}\n\n"
             while True:
@@ -1459,7 +1513,7 @@ async def events(request: Request):
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
         finally:
-            hermes_bridge.unregister_event_queue(session_id, queue)
+            brain_runtime.unregister_event_queue(session_id, queue)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -1469,32 +1523,46 @@ def status(request: Request):
     session_id = _valid_session_id(request.cookies.get("hal_session"))
     return {
         "session_id": session_id,
-        "acp_session_id": hermes_bridge.acp_session_for(session_id) if session_id else None,
-        "bridge_mode": hermes_bridge.BRIDGE_MODE,
-        "bridge": hermes_bridge.bridge_health(),
-        "yolo": hermes_bridge.YOLO,
-        "permission_mode": hermes_bridge.PERMISSION_MODE,
+        "acp_session_id": (
+            brain_runtime.provider_session_for(session_id)
+            if session_id and brain_runtime.PROVIDER_NAME == "hermes"
+            else None
+        ),
+        "provider_session_id": (
+            brain_runtime.provider_session_for(session_id) if session_id else None
+        ),
+        "brain_provider": brain_runtime.PROVIDER_NAME,
+        "bridge_mode": brain_runtime.BRIDGE_MODE,
+        "bridge": brain_runtime.bridge_health(),
+        "yolo": brain_runtime.YOLO,
+        "permission_mode": brain_runtime.PERMISSION_MODE,
         "voice": VOICE_PATH.name,
         "stt_model": STT_MODEL_NAME,
         "stt_device": _stt_device(),
-        "agent_cwd": hermes_bridge.AGENT_CWD,
+        "agent_cwd": brain_runtime.AGENT_CWD,
         "uptime_seconds": round(time.monotonic() - _BOOT_TIME),
     }
 
 
 @app.get("/api/commands")
 async def command_catalog(request: Request):
-    """Live composer catalog: HAL-native commands plus Hermes ACP metadata."""
+    """Live composer catalog: HAL-native commands plus provider metadata."""
     session_id, new_session = _session_from_request(request)
-    hermes_commands: list[dict[str, str | None]] = []
-    hermes_error = None
+    provider_commands: list[dict[str, str | None]] = []
+    provider_error = None
     try:
-        hermes_commands = await hermes_bridge.list_slash_commands(session_id)
+        provider_commands = await brain_runtime.list_slash_commands(session_id)
     except Exception as exc:
-        hermes_error = "Hermes command channel is unavailable."
+        provider_error = (
+            f"{brain_runtime.PROVIDER_NAME.title()} command channel is unavailable."
+        )
         print(f"[commands] catalog unavailable: {exc!r}")
-    if not hermes_commands and hermes_error is None:
-        hermes_error = "Hermes command metadata is unavailable."
+    if (
+        not provider_commands
+        and provider_error is None
+        and brain_runtime.PROVIDER_NAME == "hermes"
+    ):
+        provider_error = "Hermes command metadata is unavailable."
 
     by_name: dict[str, dict[str, str | None]] = {}
     for command in HAL_SLASH_COMMANDS:
@@ -1507,7 +1575,7 @@ async def command_catalog(request: Request):
             "input_hint": command.get("input_hint"),
             "source": "hal",
         }
-    for command in hermes_commands:
+    for command in provider_commands:
         name = str(command.get("name") or "").strip().lstrip("/").lower()
         if not name or name in by_name:
             continue
@@ -1515,25 +1583,31 @@ async def command_catalog(request: Request):
             "name": name,
             "description": str(command.get("description") or "").strip(),
             "input_hint": command.get("input_hint"),
-            "source": "hermes",
+            "source": "brain",
         }
     commands = sorted(
         by_name.values(),
-        key=lambda command: (command["source"] != "hermes", command["name"]),
+        key=lambda command: (command["source"] != "brain", command["name"]),
     )
 
     resp = JSONResponse({
         "commands": commands,
-        "hermes_available": bool(hermes_commands),
-        "hermes_error": hermes_error,
+        "provider": brain_runtime.PROVIDER_NAME,
+        "provider_available": bool(provider_commands),
+        "provider_error": provider_error,
+        # Compatibility fields for older Bridge assets.
+        "hermes_available": (
+            bool(provider_commands) if brain_runtime.PROVIDER_NAME == "hermes" else False
+        ),
+        "hermes_error": provider_error if brain_runtime.PROVIDER_NAME == "hermes" else None,
     })
     if new_session:
         _set_session_cookie(resp, session_id)
     return resp
 
 
-# The surfaces fan out 7 CLI subprocesses; cache them briefly so reopening
-# the drawer (or several tabs) doesn't hammer the Hermes CLI.
+# Provider diagnostic surfaces are cached so reopening the drawer does not
+# repeatedly query a local runtime or launch compatibility CLI processes.
 _systems_cache: dict | None = None
 _systems_cache_at = 0.0
 _systems_generated_at = 0
@@ -1550,7 +1624,7 @@ async def systems(request: Request, refresh: int = 0):
         stale = _systems_cache is None or time.monotonic() - _systems_cache_at > SYSTEMS_CACHE_TTL
         if refresh or stale:
             tasks = {
-                name: asyncio.create_task(_run_hermes_cli(args, timeout=timeout))
+                name: asyncio.create_task(_run_brain_diagnostic(args, timeout=timeout))
                 for name, (args, timeout) in _SYSTEM_SURFACES.items()
             }
             _systems_cache = {name: await task for name, task in tasks.items()}
@@ -1561,14 +1635,22 @@ async def systems(request: Request, refresh: int = 0):
         "generated_at": _systems_generated_at,
         "local": {
             "session_id": session_id,
-            "acp_session_id": hermes_bridge.acp_session_for(session_id) if session_id else None,
-            "bridge_mode": hermes_bridge.BRIDGE_MODE,
-            "yolo": hermes_bridge.YOLO,
-            "permission_mode": hermes_bridge.PERMISSION_MODE,
+            "acp_session_id": (
+                brain_runtime.provider_session_for(session_id)
+                if session_id and brain_runtime.PROVIDER_NAME == "hermes"
+                else None
+            ),
+            "provider_session_id": (
+                brain_runtime.provider_session_for(session_id) if session_id else None
+            ),
+            "brain_provider": brain_runtime.PROVIDER_NAME,
+            "bridge_mode": brain_runtime.BRIDGE_MODE,
+            "yolo": brain_runtime.YOLO,
+            "permission_mode": brain_runtime.PERMISSION_MODE,
             "voice": VOICE_PATH.name,
             "stt_model": STT_MODEL_NAME,
-        "stt_device": _stt_device(),
-            "agent_cwd": Path(hermes_bridge.AGENT_CWD).name,
+            "stt_device": _stt_device(),
+            "agent_cwd": Path(brain_runtime.AGENT_CWD).name,
             "uptime_seconds": round(time.monotonic() - _BOOT_TIME),
         },
         "surfaces": surfaces,
@@ -1614,7 +1696,7 @@ def viewscreen_clear(request: Request):
         if f.is_file() and f.suffix.lower() in _VIEWSCREEN_EXTS:
             f.unlink(missing_ok=True)
             removed += 1
-    hermes_bridge.publish_event_all({"type": "viewscreen", "name": None, "count": 0})
+    brain_runtime.publish_event_all({"type": "viewscreen", "name": None, "count": 0})
     return {"ok": True, "removed": removed}
 
 
@@ -1656,7 +1738,7 @@ async def chess_new(request: Request, body: ChessNewRequest):
         _game, line = await asyncio.to_thread(
             chess_control.manager.new_game, session_id, dave_color
         )
-    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    brain_runtime.publish_event(session_id, {"type": "chess_update"})
     _speak_if_connected(session_id, line)
     resp = JSONResponse({**_chess_payload(session_id), "spoken": line})
     if new_session:
@@ -1683,7 +1765,7 @@ async def chess_move(request: Request, body: ChessMoveRequest):
         if move is None:
             return JSONResponse({"ok": False, "error": "illegal move"}, status_code=400)
         line = await asyncio.to_thread(chess_control.manager.advance, session_id, game, move)
-    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    brain_runtime.publish_event(session_id, {"type": "chess_update"})
     _speak_if_connected(session_id, line)
     return JSONResponse({**_chess_payload(session_id), "ok": True, "spoken": line})
 
@@ -1696,7 +1778,7 @@ async def chess_resign(request: Request):
     line = chess_control.manager.resign(session_id)
     if line is None:
         return JSONResponse({"ok": False}, status_code=404)
-    hermes_bridge.publish_event(session_id, {"type": "chess_update"})
+    brain_runtime.publish_event(session_id, {"type": "chess_update"})
     _speak_if_connected(session_id, line)
     return JSONResponse({**_chess_payload(session_id), "ok": True, "spoken": line})
 
@@ -1818,7 +1900,7 @@ async def permission_decision(request_id: str, body: PermissionDecision, request
     if session_id is None:
         return JSONResponse({"ok": False}, status_code=403)
     allow = body.decision.strip().lower() == "allow"
-    ok = hermes_bridge.resolve_permission(request_id, allow, session_id)
+    ok = brain_runtime.resolve_permission(request_id, allow, session_id)
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 
@@ -1847,11 +1929,11 @@ async def proposal_decision(request_id: str, body: ProposalDecision, request: Re
 
 @app.post("/api/session/reset")
 def reset_session(request: Request):
-    """Start fresh: drop the Hermes session mapping and transcript history,
+    """Start fresh: drop provider session state and transcript history,
     then hand the browser a new cookie."""
     old_id = _valid_session_id(request.cookies.get("hal_session"))
     if old_id is not None:
-        hermes_bridge.drop_session(old_id)
+        brain_runtime.drop_session(old_id)
         session_file(old_id).unlink(missing_ok=True)
         events_file(old_id).unlink(missing_ok=True)
         mission_control.manager.drain_notes(old_id)
@@ -1892,11 +1974,11 @@ BOOT_RITUAL = os.environ.get("HAL_BOOT_RITUAL", "1").strip().lower() not in {"0"
 
 
 def _boot_ritual_line() -> str:
-    bridge = hermes_bridge.bridge_health()
+    bridge = brain_runtime.bridge_health()
     link = (
-        "the bridge to Hermes is online"
+        f"the local {brain_runtime.PROVIDER_NAME} brain is online"
         if bridge.get("alive")
-        else "my link to Hermes is still warming"
+        else f"my link to {brain_runtime.PROVIDER_NAME} is still warming"
     )
     return (
         f"Boot sequence complete, Dave. Voice and hearing are calibrated, {link}. "
@@ -2206,7 +2288,7 @@ async def _ws_run_turn(
                     pass  # socket gone — keep draining so the turn can end
 
     speaker_task = _spawn(speak_worker(), name=f"ws-commentary-{session_id[:8]}")
-    hermes_bridge.set_commentary_sink(session_id, sink)
+    brain_runtime.set_commentary_sink(session_id, sink)
     try:
         hal_text, turn_timings = await run_turn_text(session_id, user_text, speaker)
         all_timings.update(turn_timings)
@@ -2214,7 +2296,7 @@ async def _ws_run_turn(
             all_timings["total"] = _elapsed_ms(total_start)
         _log_latency(session_id, all_timings)
     finally:
-        hermes_bridge.clear_commentary_sink(session_id, sink)
+        brain_runtime.clear_commentary_sink(session_id, sink)
     tail = assembler.flush()
     if tail:
         sentences.put_nowait(tail)
@@ -2386,7 +2468,7 @@ def _on_bridge_event(cookie_id: str, payload: dict) -> None:
             )
 
 
-hermes_bridge.on_event = _on_bridge_event
+brain_runtime.set_event_observer(_on_bridge_event)
 
 
 @app.websocket("/ws/conversation")
@@ -2593,7 +2675,7 @@ async def ws_conversation(websocket: WebSocket):
                         continue
                     # Keep the full utterance: the persona expects to be
                     # addressed, and voice mission triggers rely on the prefix.
-                # Acknowledge what HAL heard before speaker matching or Hermes
+                # Acknowledge what HAL heard before speaker matching or inference
                 # inference. The old HTTP path hid this until the whole answer.
                 await websocket.send_json(
                     _ws_frame(

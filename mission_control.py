@@ -1,7 +1,7 @@
 """Autonomous mission orchestration for the HAL frontend.
 
 A mission is a named, single-prompt background task that runs in its own
-Hermes session while the user keeps talking on theirs. Lifecycle updates go
+brain session while the user keeps talking on theirs. Lifecycle updates go
 out over the owning browser session's SSE stream; completion is reported to
 main.py through the on_complete callback (which speaks over the WebSocket).
 """
@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, Optional
 
-import hermes_bridge
+import brain.runtime as brain_runtime
 
 # Missions created by scheduled/watch triggers rather than a browser session.
 TRIGGER_COOKIE = "hal-triggers"
@@ -31,7 +31,7 @@ MAX_ACTIVE_MISSIONS = int(os.environ.get("HAL_MAX_ACTIVE_MISSIONS", "3"))
 TRIGGERS_POLL = float(os.environ.get("HAL_TRIGGERS_POLL", "30"))
 # Cap on queued mission reports waiting to be fed back to a session's brain.
 MAX_PENDING_NOTES = 5
-# Seconds a finished mission's Hermes session stays alive for follow-up
+# Seconds a finished mission's brain session stays alive for follow-up
 # questions ("HAL, ask the mission: …") before the reaper drops it.
 STEERABLE_TTL = float(os.environ.get("HAL_MISSION_STEERABLE_TTL", str(30 * 60)))
 
@@ -133,7 +133,7 @@ class Mission:
     # overriding HAL_PERMISSION_MODE. Granted only by a trigger's
     # "permissions": "allow" — the trigger file is the trust boundary.
     allow_tools: bool = False
-    # A finished mission stays "steerable" — its Hermes session alive for
+    # A finished mission stays "steerable" — its brain session alive for
     # follow-up questions — until dismissed or reaped (STEERABLE_TTL).
     session_dropped: bool = False
     dismissed_at: Optional[float] = None
@@ -150,7 +150,7 @@ class MissionManager:
         # mission can be garbage-collected mid-flight.
         self._tasks: set[asyncio.Task] = set()
         # Mission reports queued for injection into the owning session's
-        # next Hermes prompt — how results reach HAL's brain, not just the
+        # next brain prompt — how results reach HAL's conversation, not just the
         # spoken announcement. In-memory: a restart loses only the note, the
         # mission record itself is on disk.
         self._notes: dict[str, list[str]] = {}
@@ -235,7 +235,7 @@ class MissionManager:
         return max(candidates, key=lambda m: m.created_at, default=None)
 
     def steerable_mission(self, cookie_id: str) -> Optional[Mission]:
-        """Newest finished mission whose Hermes session is still alive —
+        """Newest finished mission whose brain session is still alive —
         the target for follow-up questions."""
         now = time.time()
         candidates = [
@@ -257,7 +257,7 @@ class MissionManager:
             return None
         mission.status = "cancelled"
         self._save(mission)
-        await hermes_bridge.cancel_session(mission.session_id)
+        await brain_runtime.cancel_session(mission.session_id)
         return mission
 
     def dismiss_mission(self, mission_id: str, cookie_id: str) -> bool:
@@ -266,17 +266,17 @@ class MissionManager:
         if mission is None or mission.status == "active":
             return False
         if not mission.session_dropped:
-            hermes_bridge.drop_session(mission.session_id)
+            brain_runtime.drop_session(mission.session_id)
             mission.session_dropped = True
         mission.dismissed_at = time.time()
         self._save(mission)
-        hermes_bridge.publish_event(
+        brain_runtime.publish_event(
             mission.cookie_id, {"type": "mission_update", "mission": asdict(mission)}
         )
         return True
 
     def _reap_sessions(self, now: float | None = None) -> None:
-        """Release Hermes sessions of missions past their steerable window."""
+        """Release brain sessions of missions past their steerable window."""
         now = time.time() if now is None else now
         for mission in self.missions.values():
             if (
@@ -285,7 +285,7 @@ class MissionManager:
                 and mission.finished_at is not None
                 and now - mission.finished_at > STEERABLE_TTL
             ):
-                hermes_bridge.drop_session(mission.session_id)
+                brain_runtime.drop_session(mission.session_id)
                 mission.session_dropped = True
                 self._save(mission)
 
@@ -295,16 +295,16 @@ class MissionManager:
 
     async def run_mission(self, mission_id: str) -> None:
         mission = self.missions[mission_id]
-        hermes_bridge.publish_event(
+        brain_runtime.publish_event(
             mission.cookie_id, {"type": "mission_update", "mission": asdict(mission)}
         )
-        # The mission runs in its own Hermes session; alias it so the
+        # The mission runs in its own brain session; alias it so the
         # tool-call events it generates reach the owning browser's SSE stream.
-        hermes_bridge.alias_events(mission.session_id, mission.cookie_id)
+        brain_runtime.alias_events(mission.session_id, mission.cookie_id)
         if mission.allow_tools:
-            hermes_bridge.allow_tools_for(mission.session_id)
+            brain_runtime.allow_tools_for(mission.session_id)
         try:
-            result = await hermes_bridge.ask_hermes(mission.prompt, mission.session_id)
+            result = await brain_runtime.ask(mission.prompt, mission.session_id)
             # cancel_mission may have flipped the status while the turn was
             # in flight — a cancelled mission must not report as completed.
             if mission.status == "cancelled":
@@ -320,8 +320,8 @@ class MissionManager:
                 mission.result = str(exc)
         finally:
             mission.finished_at = time.time()
-            hermes_bridge.disallow_tools_for(mission.session_id)
-            hermes_bridge.unalias_events(mission.session_id)
+            brain_runtime.disallow_tools_for(mission.session_id)
+            brain_runtime.unalias_events(mission.session_id)
             # The session stays alive for follow-up questions ("HAL, ask the
             # mission: …"); dismiss_mission or _reap_sessions releases it.
             self._save(mission)
@@ -329,7 +329,7 @@ class MissionManager:
                 self._journal_failure(mission)
             if mission.cookie_id != TRIGGER_COOKIE:
                 # Queue the report for the owner's next prompt: the mission ran
-                # in its own (now discarded) Hermes session, so this is the only
+                # in its own isolated brain session, so this is the only
                 # way the result reaches the brain behind the conversation.
                 notes = self._notes.setdefault(mission.cookie_id, [])
                 notes.append(
@@ -337,7 +337,7 @@ class MissionManager:
                     f'{mission.status}. Report: {(mission.result or "(none)")[:2000]}]'
                 )
                 del notes[:-MAX_PENDING_NOTES]
-            hermes_bridge.publish_event(
+            brain_runtime.publish_event(
                 mission.cookie_id, {"type": "mission_update", "mission": asdict(mission)}
             )
             if self.on_complete:
