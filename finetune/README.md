@@ -73,7 +73,7 @@ copy-pasted, so it can't silently drift from production.
 |---|---:|---|
 | `drive_positive` | 220 | Core fix target: forward/backward phrasing → correct `drive_straight` call. Varies verb, address prefix, politeness, explicit vs. default speed, distance across the full ±50cm range. |
 | `turn_positive` | 180 | Same, for `turn`. Half use signed-degree phrasing (unambiguous), half use left/right (see convention note below). |
-| `estop_positive` | 80 | Urgent-phrasing → `emergency_stop`. Smaller bank, hand-authored (urgency doesn't template well). |
+| `estop_positive` | 160 | Urgent-phrasing → `emergency_stop`. Hand-authored (urgency doesn't template well); widened from an original 80 (12 unique phrases, heavily repeated) to 160 (~40 unique phrases) after a real fine-tune's eval showed this was the single weakest safety-relevant category (79.2% pass) — the exact failure was a confident "I've stopped everything" with no tool call, and the failing eval phrases turned out to be literal members of the old 12-phrase bank, just held out to eval. Low input diversity, not low volume, was the real gap. |
 | `sensor_read_positive` | 80 | Read-only queries → `read_spatial_sensors`, with a reply that only states what the (synthetic) result actually returned. |
 | `vision_positive` | 60 | "What do you see" phrasing → `capture_visual_scene`. Uses the 5-tool schema set (`vision_enabled=True`). |
 | `out_of_bounds_decline` | 60 | Requests whose numbers exceed the declared JSON-schema bounds (e.g. "drive forward 200cm"). See design decision below. |
@@ -84,12 +84,25 @@ copy-pasted, so it can't silently drift from production.
 | `relay_success` | 90 | Tool call succeeds → reply accurately reflects it, isolated from the drive/turn categories above (turn + estop specifically). |
 | `multi_turn_context` | 60 | Same core tool-call task, preceded by 1-3 turns of unrelated chit-chat, so reliability doesn't degrade as context grows (matches real session history usage). |
 
-**Balance**: ~55% positive tool-calls (weighted toward drive/turn/estop,
-the safety-critical ones currently broken), ~15% tool-result relay
-(explicitly split success/failure), ~25% negatives (the guard against
-over-eager tool-calling), ~5% out-of-bounds edge cases. 1220 total, 85/15
-train/eval split, stratified per category so eval isn't dominated by
-whichever category happens to be largest.
+**Balance**: ~57% positive tool-calls (weighted toward drive/turn/estop,
+the safety-critical ones), ~14% tool-result relay (explicitly split
+success/failure), ~24% negatives (the guard against over-eager
+tool-calling), ~5% out-of-bounds edge cases. 1300 total, 85/15 train/eval
+split, stratified per category so eval isn't dominated by whichever
+category happens to be largest.
+
+**Confirmed live, first real fine-tune (before this estop widening)**:
+777/777 training steps, final train loss 0.01595, val loss 0.01647.
+Evaluated on the real held-out eval set with `reasoning=off` against the
+actual production chat template: **88.6% overall (294/332 turns)**, up
+from the base model's 0% under the same setting. Two clean failure
+patterns, not noise: over-eager `read_spatial_sensors` calls (19/38
+failures — the model reaching for a sensor read when uncertain, instead
+of the right tool) and confident no-tool-call replies (13/38 — the
+original bug, still present, concentrated in `estop_positive`). This
+category's widening targets the second, more safety-critical pattern
+directly; a real re-run and re-eval is needed to confirm it actually
+helped rather than just adding volume.
 
 ## One open design decision -- flagging rather than deciding silently
 
@@ -213,8 +226,8 @@ against Unsloth's own current Gemma 4 docs page as of this writing. LoRA
 rank (`r=16, alpha=16`) matches the one real reference fine-tune at this
 model size rather than the docs' lighter `r=8` quickstart default, given
 this dataset's 12 categories are broader than a narrow single-skill tune.
-`num_train_epochs=3` (~780 steps at effective batch size 4) is a real
-multi-epoch pass sized for the ~1036-example train set, not the docs'
+`num_train_epochs=3` (~828 steps at effective batch size 4) is a real
+multi-epoch pass sized for the ~1104-example train set, not the docs'
 60-step smoke-test value. The `SFTConfig`/`SFTTrainer` field names
 (`max_seq_length`, `dataset_text_field`, etc.) reflect `trl`'s API as
 generally known, not independently re-verified against whatever exact

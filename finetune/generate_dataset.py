@@ -273,27 +273,85 @@ def gen_turn_positive(rng: random.Random, n: int) -> list[dict]:
 
 
 # ---- emergency_stop positives ----
+# Deliberately large and varied -- eval found the model still gave a
+# confident "I've stopped" reply with NO tool call on exactly this
+# category more than any other (79.2% pass, the worst of the safety-
+# relevant categories), and the failing eval phrases turned out to be
+# literal members of the old 12-phrase bank, just held out to eval. Low
+# input diversity, not just low volume, was the real gap -- widened here
+# rather than just cycling the same handful of lines more times.
 
 ESTOP_PHRASES = [
+    # Bare/short commands
     "Stop!",
-    "HAL, stop right now.",
-    "Stop the robot immediately.",
-    "Abort, abort!",
-    "Cut the motors, HAL.",
-    "That's enough, stop.",
-    "Emergency stop!",
-    "HAL stop.",
+    "Stop.",
     "Halt.",
+    "Halt!",
+    "Freeze!",
+    "STOP.",
+    # Directly addressed
+    "HAL, stop right now.",
+    "HAL stop.",
+    "HAL, halt.",
+    "HAL, cut the power.",
     "Stop moving right now, HAL.",
+    "HAL, stop moving.",
+    # Emphatic / repeated
+    "Abort, abort!",
+    "Stop, stop, stop!",
     "Whoa, stop!",
+    "Stop! Stop right now!",
+    "No, no, stop!",
+    # Explicit "the robot"/"the motors" phrasing
+    "Stop the robot immediately.",
+    "Cut the motors, HAL.",
     "Kill the motors.",
+    "Kill the power to the motors.",
+    "Shut it down, HAL.",
+    "Power down the motors now.",
+    # Formal / polite but still urgent
+    "Please stop the robot immediately.",
+    "Would you stop right now, please.",
+    "I need you to stop immediately.",
+    "That's enough, stop.",
+    "Okay, that's enough — stop.",
+    # Safety-concern-triggered
+    "Wait, stop — that's not safe.",
+    "Stop, you're too close to the edge.",
+    "There's something in the way, stop!",
+    "Watch out — stop!",
+    "Careful, stop now.",
+    "Stop, you're going to hit something.",
+    # Casual / conversational
+    "Whoa whoa whoa, stop.",
+    "Okay stop, stop.",
+    "Hold on, stop.",
+    "Hang on, stop right there.",
+    "Enough, stop.",
+    # Terse emergency register
+    "Emergency stop!",
+    "E-stop now!",
+    "Full stop, now.",
+    "Stop immediately, HAL.",
+]
+
+ESTOP_REPLIES = [
+    "Stopped.",
+    "Stopped immediately.",
+    "All motors stopped.",
+    "Stopping now.",
+    "Motors are off.",
+    "Halted.",
 ]
 
 
 def gen_estop_positive(rng: random.Random, n: int) -> list[dict]:
     out = []
+    pool = list(ESTOP_PHRASES)
+    rng.shuffle(pool)
     for i in range(n):
-        text = ESTOP_PHRASES[i % len(ESTOP_PHRASES)]
+        text = pool[i % len(pool)]
+        reply = rng.choice(ESTOP_REPLIES)
         out.append(
             make_example(
                 "estop_positive",
@@ -301,7 +359,7 @@ def gen_estop_positive(rng: random.Random, n: int) -> list[dict]:
                     user_message(text),
                     tool_call_message("call_0", "emergency_stop", {}),
                     tool_result_message("call_0", {"ok": True}),
-                    assistant_reply("Stopped."),
+                    assistant_reply(reply),
                 ],
             )
         )
@@ -659,7 +717,7 @@ def gen_multi_turn(rng: random.Random, n: int) -> list[dict]:
 CATEGORY_GENERATORS = {
     "drive_positive": (gen_drive_positive, 220),
     "turn_positive": (gen_turn_positive, 180),
-    "estop_positive": (gen_estop_positive, 80),
+    "estop_positive": (gen_estop_positive, 160),
     "sensor_read_positive": (gen_sensor_positive, 80),
     "vision_positive": (gen_vision_positive, 60),
     "out_of_bounds_decline": (gen_out_of_bounds, 60),

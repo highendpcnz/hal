@@ -89,8 +89,10 @@ LORA_R = 16
 LORA_ALPHA = 16
 LORA_DROPOUT = 0
 
-# ~1036 train examples; 3 epochs at effective batch size 4 (batch=1 x
-# grad_accum=4) is roughly 780 steps -- a real multi-epoch pass, not the
+# ~1104 train examples (widened from ~1036 after a real fine-tune's eval
+# showed estop_positive as the weakest safety-relevant category -- see
+# finetune/README.md); 3 epochs at effective batch size 4 (batch=1 x
+# grad_accum=4) is roughly 828 steps -- a real multi-epoch pass, not the
 # 60-step smoke-test value from Unsloth's own quickstart docs.
 NUM_TRAIN_EPOCHS = 3
 PER_DEVICE_TRAIN_BATCH_SIZE = 1
