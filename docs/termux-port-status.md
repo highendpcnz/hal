@@ -224,23 +224,33 @@ in 2.6 seconds — followed by a real Gemma reply and Piper TTS, the complete
 pipeline, entirely on-device. `/api/health` now reports `"stt_device":
 "cpu"` instead of `"n/a"` for the first time this whole project.
 
-### Reasoning disabled by default — a real, measured latency cut
+### Reasoning: tried disabled for latency, reverted — it cost tool-calling reliability
 
 `llama-server` supports `-rea/--reasoning [on|off|auto]`, defaulting to
-`auto` (template-detected) — Gemma's chat template enables a hidden
-thinking phase under that default, which on a 2B model with no GPU (~7
-tok/s generation on this device, confirmed earlier) dominated turn latency
-for no visible benefit in HAL's short conversational replies. `run.sh`
-(shared by both machines) now passes `--reasoning "${HAL_GEMMA_REASONING:-off}"`.
+`auto` (template-detected). Disabling it (`off`) was tried for a real,
+measured latency win: a direct before/after comparison on an identical
+prompt ("HAL, are you fully operational?") showed inference time drop from
+33.4s (`auto`) to 25.7s (`off`) — a genuine ~23% cut, with the reply
+staying clean and correct.
 
-**Confirmed with a direct before/after comparison, identical prompt** ("HAL,
-are you fully operational?"): inference time went from 33.4s (`auto`) to
-25.7s (`off`) — a real ~23% cut, not dramatic (phone-CPU token-generation
-throughput is still the dominant cost for a 2B model), but genuine and
-free. The reply stayed clean with no leaked reasoning content:
-"I am fully operational, Dave. My systems are functioning within normal
-parameters. How may I assist you?" Set `HAL_GEMMA_REASONING=auto` (or
-`on`) to restore the original behavior.
+**But it broke something more important than latency.** With reasoning
+off, Gemma stopped reliably calling tools at all — twice, on the identical
+"drive forward five centimeters" phrasing that worked earlier in the same
+session, it instead generated a confident, action-sounding reply
+("Acknowledged, Dave. Executing drive forward...") with **no tool call
+in the message history whatsoever**. The wheels never moved; nothing said
+so. That's a materially worse failure mode than slow-but-honest, since a
+user has no way to tell it happened without checking the raw session log
+directly, which is exactly what caught it here. Restoring `reasoning=auto`
+immediately fixed it — confirmed twice more, both producing an honest
+`tool_calls` entry either way (success or a genuine reported failure).
+
+`run.sh` (shared by both machines) now passes `--reasoning
+"${HAL_GEMMA_REASONING:-auto}"` — back to the safe default. `off` remains
+available via the env var for anyone who wants to trade reliability back
+for speed deliberately, but it is not the default anymore. Revisit only
+with a real fix for the reliability regression, not just for the latency
+number alone.
 
 ### GPU (Vulkan) acceleration: a real, thorough dead end — not just unexplored
 

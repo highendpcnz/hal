@@ -2339,6 +2339,37 @@ check(
     _estop_stuck_upload_refused,
 )
 
+# Firmware-version-dependent behavior, hardware-confirmed both ways (see
+# docs/termux-usb-bringup.md): online_restart alone works on 44.01.011 but
+# NOT on 44.01.016, where config.write_config must precede it. This fake
+# mirrors the .016-shaped board -- online_restart alone does not take, so
+# initialize() must fall through to the full sequence and succeed there.
+_estop_two_tier_serial = _FakeCyberPiSerial(mode_byte=0x00)
+_estop_write_config_seen = [False]
+_original_estop_two_tier_write = _estop_two_tier_serial.write
+def _estop_write_two_tier(data: bytes) -> int:  # noqa: E306
+    payload = decode_f3f4_frame(data).payload
+    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
+        script_length = int.from_bytes(payload[4:6], "little")
+        script = payload[6 : 6 + script_length].decode("utf-8")
+        if script == ONLINE_ENTRY_SCRIPTS[1]:
+            _estop_write_config_seen[0] = True
+        written = _original_estop_two_tier_write(data)
+        if script == ONLINE_ENTRY_SCRIPTS[-1] and not _estop_write_config_seen[0]:
+            _estop_two_tier_serial.mode_byte = 0x00
+        return written
+    return _original_estop_two_tier_write(data)
+_estop_two_tier_serial.write = _estop_write_two_tier
+_estop_two_tier_client = CyberPiEmergencyStopClient(
+    _estop_two_tier_serial, timeout_seconds=0.1, sleeper=lambda _seconds: None
+)
+_estop_two_tier_mode = _estop_two_tier_client.initialize()
+_estop_two_tier_client.close()
+check(
+    "CyberPi estop falls back to the full sequence when online_restart alone doesn't take",
+    _estop_two_tier_mode is CyberPiMode.ONLINE,
+)
+
 _motion_safety = SafetyController(MotionLimits(max_distance_cm=10, max_turn_degrees=45))
 _motion_safety.connect(now=0.0)
 _motion_safety.arm(now=0.0)
@@ -2451,6 +2482,39 @@ finally:
 check(
     "CyberPi motion client still refuses to arm if the bootstrap sequence doesn't take",
     _motion_stuck_upload_refused,
+)
+
+_motion_two_tier_serial = _FakeCyberPiSerial(mode_byte=0x00)
+_motion_write_config_seen = [False]
+_original_motion_two_tier_write = _motion_two_tier_serial.write
+def _motion_write_two_tier(data: bytes) -> int:  # noqa: E306
+    payload = decode_f3f4_frame(data).payload
+    if len(payload) >= 2 and payload[1] == ONLINE_RESTART_WAIT:
+        script_length = int.from_bytes(payload[4:6], "little")
+        script = payload[6 : 6 + script_length].decode("utf-8")
+        if script == ONLINE_ENTRY_SCRIPTS[1]:
+            _motion_write_config_seen[0] = True
+        written = _original_motion_two_tier_write(data)
+        if script == ONLINE_ENTRY_SCRIPTS[-1] and not _motion_write_config_seen[0]:
+            _motion_two_tier_serial.mode_byte = 0x00
+        return written
+    return _original_motion_two_tier_write(data)
+_motion_two_tier_serial.write = _motion_write_two_tier
+_motion_two_tier_safety = SafetyController(MotionLimits(max_distance_cm=10))
+_motion_two_tier_safety.connect(now=0.0)
+_motion_two_tier_safety.arm(now=0.0)
+_motion_two_tier_safety.update_telemetry(_telemetry)
+_motion_two_tier_client = CyberPiMotionClient(
+    _motion_two_tier_serial,
+    _motion_two_tier_safety,
+    timeout_seconds=0.1,
+    sleeper=lambda _seconds: None,
+)
+_motion_two_tier_mode = _motion_two_tier_client.initialize()
+_motion_two_tier_client.close()
+check(
+    "CyberPi motion client falls back to the full sequence when online_restart alone doesn't take",
+    _motion_two_tier_mode is CyberPiMode.ONLINE,
 )
 
 import robot.android_usb as _android_usb_mod  # noqa: E402

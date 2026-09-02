@@ -343,6 +343,51 @@ self-bootstrapping from cold `upload` mode into `online` automatically,
 mid-turn, with no special-casing needed), a real spoken reply via Piper.
 No mBlock, no Mac, at any point in either turn.
 
+## The online-entry sequence is firmware-version dependent — found and fixed later
+
+After a CyberPi firmware update (via mBlock's own firmware-update flow,
+`44.01.016` → `44.01.011` — triggered to clear a leftover custom user
+program from unrelated earlier experimentation, which turned out to be a
+red herring for this specific issue, ruled out by testing directly against
+the freshly reflashed board), the exact sequence above **stopped working**
+— `ONLINE_ENTRY_SCRIPTS` sent in full, in order, produced clean
+`{"ret": None}` acks at every step exactly as before, but the mode stayed
+`upload` afterward. Not a regression in this codebase — reproduced by
+replaying the raw captured bytes directly, no app code involved.
+
+A second live USB capture (same method: `tshark` on `XHC0`/`XHC1`, a real
+mBlock "Enter Live" + block run) against the *current* firmware showed a
+different real sequence: mBlock sent `online_restart` **alone**, first —
+no `import config`, no `config.write_config("repl_enable", False)` — and
+an unsolicited push (`0d 00 01`) confirmed online mode immediately after.
+Confirmed directly: replaying `online_restart` alone on this firmware
+reliably produces `online` mode. Replaying the **full** three-step
+sequence on this exact same board/firmware — tested moments apart, same
+live session — reliably **prevents** it. Not two inconsistent
+observations: two firmware versions, hardware-confirmed to need opposite
+sequences. `config.write_config("repl_enable", False)` is necessary on
+`44.01.016` and actively counterproductive on `44.01.011`.
+
+**Fixed** with a two-tier attempt in `robot/cyberpi.py`
+(`encode_online_restart_only_frame()` alongside the existing
+`encode_online_entry_frames()`), used by `estop.py`/`motion.py`'s
+`initialize()`: try the single `online_restart` frame first (fast, correct
+on newer firmware), and only fall back to the full three-step sequence if
+that alone didn't take (needed on older firmware). Two new regression
+tests per client cover the fallback path specifically, with a fake that
+mirrors the `.016`-shaped board (`online_restart` alone does not flip
+mode, only the full sequence does).
+
+**Confirmed live, real hardware, current firmware, through the actual
+production `CyberPiMotionClient` class** (not the raw capture-replay
+scripts used to diagnose this): `initialize()` correctly resolved online
+mode, `drive_straight(5, 20)` executed, and the wheels visibly turned —
+operator-confirmed, wheels raised and clear.
+
+Practical implication going forward: don't assume either sequence is *the*
+answer — if this stops working again after some future firmware change,
+re-capture rather than assume it's the same bug.
+
 ## Still open
 - An initial raw device-descriptor read via `os.read(fd, 18)` returned zero
   bytes (superseded — the working path is `libusb_control_transfer`, not a

@@ -243,11 +243,35 @@ ONLINE_ENTRY_SCRIPTS: Final = (
 CyberPi from upload mode into genuine online mode -- captured via USB packet
 capture of mBlock actually running a block against real hardware, and
 independently hardware-verified end to end (a real `drive_straight()`
-actually moved the wheels afterward, confirmed twice; see
-docs/termux-usb-bringup.md). `online_restart` alone is not sufficient --
-`config.write_config("repl_enable", False)` must precede it. All three use
-sequence=0 and ONLINE_RESTART_WAIT, matching mBlock's own traffic exactly;
-that pairing has not been tested with other sequence numbers."""
+actually moved the wheels afterward) on firmware 44.01.016, where
+`online_restart` alone was confirmed NOT sufficient --
+`config.write_config("repl_enable", False)` had to precede it. A second
+firmware version (44.01.011) reversed this: the full sequence here was
+hardware-confirmed to *prevent* the mode transition, while `online_restart`
+alone (encode_online_restart_only_frame()) reliably produced it. Both are
+real, verified, live results, not one superseding the other -- see
+docs/termux-usb-bringup.md. All three use sequence=0 and
+ONLINE_RESTART_WAIT, matching mBlock's own traffic exactly; that pairing
+has not been tested with other sequence numbers."""
+
+
+def _encode_online_entry_script(script: str) -> bytes:
+    script_bytes = script.encode("utf-8")
+    script_length = len(script_bytes)
+    payload = (
+        bytes(
+            (
+                ONLINE_PROTOCOL_ID,
+                ONLINE_RESTART_WAIT,
+                0,
+                0,
+                script_length & 0xFF,
+                script_length >> 8,
+            )
+        )
+        + script_bytes
+    )
+    return encode_f3f4_frame(payload)
 
 
 def encode_online_entry_frames() -> tuple[bytes, ...]:
@@ -255,27 +279,28 @@ def encode_online_entry_frames() -> tuple[bytes, ...]:
     order. The device takes on the order of a couple of seconds after the
     third frame's response to actually settle into online mode -- observed,
     not a documented or guaranteed duration -- so callers should wait before
-    re-checking mode or sending further commands."""
+    re-checking mode or sending further commands.
 
-    frames = []
-    for script in ONLINE_ENTRY_SCRIPTS:
-        script_bytes = script.encode("utf-8")
-        script_length = len(script_bytes)
-        payload = (
-            bytes(
-                (
-                    ONLINE_PROTOCOL_ID,
-                    ONLINE_RESTART_WAIT,
-                    0,
-                    0,
-                    script_length & 0xFF,
-                    script_length >> 8,
-                )
-            )
-            + script_bytes
-        )
-        frames.append(encode_f3f4_frame(payload))
-    return tuple(frames)
+    Firmware-version dependent (hardware-confirmed both ways): required in
+    full on 44.01.016. On 44.01.011, this full sequence -- specifically,
+    sending config.write_config("repl_enable", False) before online_restart
+    -- was confirmed to *prevent* the mode transition that online_restart
+    alone reliably produces on that version. See
+    encode_online_restart_only_frame() for the single-step form; callers
+    should try that first and fall back to this only if it doesn't take,
+    rather than picking one sequence and hardcoding a firmware assumption."""
+
+    return tuple(_encode_online_entry_script(script) for script in ONLINE_ENTRY_SCRIPTS)
+
+
+def encode_online_restart_only_frame() -> bytes:
+    """Just the online_restart frame, on its own -- confirmed live sufficient
+    by itself on firmware 44.01.011 (captured from a real mBlock session that
+    sent only this, no config.write_config step, before a real movement
+    command succeeded), unlike 44.01.016 where it alone was hardware-confirmed
+    NOT sufficient. Try this first: fast, and correct on newer firmware."""
+
+    return _encode_online_entry_script(ONLINE_ENTRY_SCRIPTS[-1])
 
 
 def decode_online_request_payload(payload: bytes) -> CyberPiOnlineRequest:

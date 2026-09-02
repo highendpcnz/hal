@@ -95,13 +95,15 @@ if [[ "${HAL_BRAIN:-gemma}" == "gemma" ]]; then
           --parallel "${HAL_GEMMA_PARALLEL:-1}"
           --n-gpu-layers "${HAL_GEMMA_GPU_LAYERS:-99}"
           --flash-attn auto
-          # Off by default: Gemma's chat template enables reasoning under
-          # "auto" (llama-server's own default), and its hidden thinking
-          # phase before any visible content dominates turn latency on CPU
-          # (30-40s+ of a ~40-46s turn on the Pixel, confirmed live) for no
-          # visible benefit in HAL's short, conversational replies. Set
-          # HAL_GEMMA_REASONING=auto (or on) to restore it.
-          --reasoning "${HAL_GEMMA_REASONING:-off}"
+          # Defaults to llama-server's own "auto" (template-detected). "off"
+          # was tried for a real latency win on the Pixel's CPU (~25% faster
+          # inference), but it turned out to cost tool-calling reliability --
+          # Gemma started confidently claiming to have driven the robot
+          # without ever calling the tool, confirmed live and reproduced
+          # twice (see docs/termux-port-status.md). Reverted to "auto" as
+          # the default until that tradeoff is revisited; set
+          # HAL_GEMMA_REASONING=off to trade reliability back for speed.
+          --reasoning "${HAL_GEMMA_REASONING:-auto}"
           --host "$GEMMA_HOST"
           --port "$GEMMA_PORT"
           --api-key "$HAL_GEMMA_API_KEY"

@@ -28,6 +28,7 @@ from .cyberpi import (
     decode_online_response_payload,
     encode_current_mode_query_frame,
     encode_online_entry_frames,
+    encode_online_restart_only_frame,
     encode_online_request_frame,
 )
 from .telemetry import (
@@ -108,16 +109,23 @@ class CyberPiEmergencyStopClient:
         failure mode that cannot be tolerated, so this refuses to arm outside
         genuine online mode rather than merely logging it.
 
-        If the board isn't online yet, this attempts mBlock's own online-mode
-        bootstrap sequence once (encode_online_entry_frames(), captured from a
-        real mBlock session and hardware-verified — see
-        docs/termux-usb-bringup.md) before giving up, so a Pixel-only session
-        with no prior Mac/mBlock connection can still arm.
+        If the board isn't online yet, this tries mBlock's own online-mode
+        bootstrap in two tiers, since the correct sequence turned out to be
+        firmware-version dependent (hardware-confirmed both ways — see
+        docs/termux-usb-bringup.md): `online_restart` alone first (fast,
+        correct on newer firmware like 44.01.011), then the full
+        `encode_online_entry_frames()` sequence if that alone didn't take
+        (needed on older firmware like 44.01.016, where the single-step form
+        is not sufficient) — so a Pixel-only session with no prior
+        Mac/mBlock connection can still arm on either.
         """
 
         mode = self._query_mode()
         if mode is not CyberPiMode.ONLINE:
-            self._attempt_online_entry()
+            self._attempt_online_entry(encode_online_restart_only_frame())
+            mode = self._query_mode()
+        if mode is not CyberPiMode.ONLINE:
+            self._attempt_online_entry(*encode_online_entry_frames())
             mode = self._query_mode()
         if mode is not CyberPiMode.ONLINE:
             raise CyberPiNotReadyError(f"CyberPi reports mode={mode.value!r}, not online")
@@ -132,13 +140,13 @@ class CyberPiEmergencyStopClient:
         )
         return decode_current_mode_response(frame.payload)
 
-    def _attempt_online_entry(self) -> None:
-        """Best-effort: send each frame of mBlock's online-mode bootstrap
-        sequence and wait out its response, tolerating a timeout on any step
-        since the sequence is what matters, not confirming each ack. Does not
-        raise on its own — initialize() re-checks mode afterward."""
+    def _attempt_online_entry(self, *frames: bytes) -> None:
+        """Best-effort: send each given online-entry frame and wait out its
+        response, tolerating a timeout on any step since the sequence is
+        what matters, not confirming each ack. Does not raise on its own —
+        initialize() re-checks mode afterward."""
 
-        for frame in encode_online_entry_frames():
+        for frame in frames:
             self._write(frame)
             try:
                 self._read_matching(
