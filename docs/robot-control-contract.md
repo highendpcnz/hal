@@ -321,6 +321,14 @@ itself never reorients with the wheels raised off the ground, only the wheels
 spin. Motors stationary immediately after; operator confirmed a smooth ~90°
 turn.
 
+**Real-world left/right direction, confirmed later, wheels down on a clear
+floor** (the run above couldn't show this — raised wheels spin without the
+chassis ever reorienting): `turn(90, 8)`, called directly against real
+hardware bypassing Gemma entirely, physically pivoted the chassis to the
+**right**. So **positive `angle_degrees` turns right, negative turns left** —
+this was genuinely unknown before this test; the tool's own description
+deliberately only said "one way" / "the other" until this was pinned down.
+
 All three of the above ran during a Mac/mBlock Live session — i.e. with the
 board in genuine online mode. `drive_straight(5, 20)` sent from the Pixel
 while the board reported *upload* mode instead was hardware-confirmed to

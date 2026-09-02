@@ -238,17 +238,40 @@ off, Gemma stopped reliably calling tools at all — twice, on the identical
 "drive forward five centimeters" phrasing that worked earlier in the same
 session, it instead generated a confident, action-sounding reply
 ("Acknowledged, Dave. Executing drive forward...") with **no tool call
-in the message history whatsoever**. The wheels never moved; nothing said
-so. That's a materially worse failure mode than slow-but-honest, since a
-user has no way to tell it happened without checking the raw session log
-directly, which is exactly what caught it here. Restoring `reasoning=auto`
-immediately fixed it — confirmed twice more, both producing an honest
-`tool_calls` entry either way (success or a genuine reported failure).
+in the message history whatsoever, per the session log**. The wheels
+never moved; nothing said so. Restoring `reasoning=auto` immediately
+"fixed" it, by the same check.
 
-`run.sh` (shared by both machines) now passes `--reasoning
-"${HAL_GEMMA_REASONING:-auto}"` — back to the safe default. `off` remains
-available via the env var for anyone who wants to trade reliability back
-for speed deliberately, but it is not the default anymore. Revisit only
+**Correction: that original evidence was invalid, though the conclusion
+holds.** `brain/gemma.py`'s `ask()` only ever persists the user's message
+and the final reply text to the session JSON file — the actual tool-calling
+exchange (the `working` list with `tool_calls`/tool-role entries, built
+inside `_complete()`) is never written anywhere. "No tool call in the
+session log" was never possible evidence of anything; the log can't show
+tool calls at all, present or absent. This was caught mid-session and
+disclosed at the time, but left the real question open rather than settled.
+
+**Properly re-verified later, with real ground truth this time**: reasoning
+was set to `off` again (confirmed via the running `llama-server`'s own argv,
+not a health check, after an earlier false start where a stale orphaned
+process answered health checks and masked the fact that no fresh
+`llama-server` had actually been spawned — see docs/termux-usb-bringup.md's
+process-orphan notes), and the identical "drive forward five centimeters"
+command was sent through the real, working `/api/say` → Gemma → motion
+pipeline (the one confirmed to physically move the robot with
+`reasoning=auto`, see docs/termux-usb-bringup.md). Gemma replied "Driving
+forward five centimeters at twenty percent speed." — confident, specific,
+and fast (`infer=9527ms`, roughly matching the measured `off` speedup above,
+versus 16-25s typical with `auto`). The wheels did not move — operator-
+confirmed by direct observation, not a log. That is the failure mode this
+section originally described, this time backed by evidence that actually
+supports it.
+
+`run.sh` (shared by both machines) passes `--reasoning
+"${HAL_GEMMA_REASONING:-auto}"` — the safe default, unchanged by any of
+this. `off` remains available via the env var for anyone who wants to trade
+reliability back for speed deliberately, but it is confirmed, not just
+suspected, to cost tool-calling reliability on this pipeline. Revisit only
 with a real fix for the reliability regression, not just for the latency
 number alone.
 

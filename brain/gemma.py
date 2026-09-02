@@ -80,8 +80,8 @@ _TURN = {
     "function": {
         "name": "turn",
         "description": (
-            "Rotate the robot in place. Positive angle_degrees turns one way, negative "
-            "the other. Bounded and safety-checked before anything moves. Use only when "
+            "Rotate the robot in place. Positive angle_degrees turns right, negative "
+            "turns left. Bounded and safety-checked before anything moves. Use only when "
             "Dave has actually asked the robot to turn."
         ),
         "parameters": {
