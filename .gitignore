@@ -16,3 +16,5 @@ data/
 playwright-report/
 test-results/
 finetune/data/*.jsonl
+finetune/output/
+finetune/*.safetensors

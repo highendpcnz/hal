@@ -126,14 +126,120 @@ Deterministic given the seed. Category sizes are a dict at the bottom of
 `generate_dataset.py` (`CATEGORY_GENERATORS`) — edit counts there to
 rebalance.
 
-## Not done yet
+## Files
 
-This is the dataset only — no training run, no eval harness, no merge/
-quantize/deploy step. Per docs/termux-port-status.md and the earlier
-research into this: Unsloth has an official Gemma 4 guide covering E2B
-directly (LoRA, r=16 in the one real reference fine-tune found), and a
-QLoRA run this size should be minutes on a single cloud GPU. The eval set
-here (`data/eval.jsonl`) is held out and category-stratified for exactly
-that step, but no eval harness exists yet to actually score a trained
-checkpoint against it — that, plus the actual train/merge/GGUF-convert/
-quantize/deploy pipeline, is the next chunk of work, not this one.
+- `generate_dataset.py` — builds `data/train.jsonl` / `data/eval.jsonl`.
+- `chat_template.jinja` — the **exact** production chat template, extracted
+  directly from the deployed GGUF's own `tokenizer.chat_template` metadata
+  (via `gguf-py`'s `GGUFReader` against
+  `~/models/gemma-4-e2b/gemma-4-E2B-it-Q4_0.gguf`), not a same-named
+  Unsloth preset. `train_lora.py` loads this file directly rather than
+  calling `unsloth.chat_templates.get_chat_template("gemma-4")` — trusting
+  a preset to be byte-identical to this specific deployed model's template
+  is exactly the kind of unverified assumption this project has learned
+  not to make. Re-extract this file (see the header of `train_lora.py`
+  for the `GGUFReader` snippet) if the deployed model ever changes.
+- `train_lora.py` — the LoRA training script itself.
+- `eval_harness.py` — scores a running llama-server checkpoint against
+  `data/eval.jsonl`. See its own docstring.
+
+## Running the training on Kaggle (free T4 tier)
+
+**Confirmed live**: this has actually been run successfully end to end on
+Kaggle. 777/777 steps across 3 epochs, final training loss 0.01595, final
+validation loss 0.01647 (down from 0.0626 at step 50) — close train/val
+loss, no sign of bad overfitting. Three real bugs turned up during that
+run and are now fixed in `train_lora.py` itself (not just documented
+here) — they're called out below at the exact step each one bit.
+
+1. [kaggle.com/code](https://www.kaggle.com/code) → **New Notebook**.
+2. Right sidebar → **Settings**:
+   - **Accelerator** → GPU T4 x2 (the free tier's only T4 option — but see
+     the single-GPU note below; this is about which session type to pick,
+     not how many GPUs the process actually uses).
+   - **Internet** → **On** (off by default; needed for `pip install` and
+     to download the base model from Hugging Face — easy to miss and the
+     run just fails on the first cell without it).
+3. Right sidebar → **Add Input** → **Upload** → add `data/train.jsonl`,
+   `data/eval.jsonl`, and `chat_template.jinja` as a new private Kaggle
+   Dataset. **Verify the actual mount path before assuming it** — it was
+   `/kaggle/input/datasets/<your-username>/<dataset-name>` on the real
+   run, not the plain `/kaggle/input/<dataset-name>` a bare dataset
+   attachment would suggest. Run `!ls /kaggle/input` (and `!find
+   /kaggle/input -maxdepth 3` if that's ambiguous) in a cell first and use
+   whatever it actually reports.
+4. First cell:
+   ```
+   !pip install unsloth trl datasets
+   %env HAL_FINETUNE_DIR=/kaggle/input/datasets/<your-username>/<dataset-name>
+   %env HAL_FINETUNE_OUTPUT_DIR=/kaggle/working/output
+   ```
+   (`train_lora.py` reads both env vars — input is on the read-only
+   `/kaggle/input/` mount, output has to go to the writable
+   `/kaggle/working/` instead, or saving the trained adapter fails.)
+5. Next cell: paste in `train_lora.py`'s contents and run it (or upload
+   the script as a second input dataset and `!python train_lora.py`). The
+   script itself now sets `CUDA_VISIBLE_DEVICES=0` and uses
+   `use_gradient_checkpointing="unsloth"` — both fix a real, confirmed
+   failure: Gemma 4 + Unsloth hit a cross-device tensor error on "GPU T4
+   x2" sessions with both GPUs visible to one process, and a single T4's
+   16GB needs the gradient-checkpointing headroom that two T4s' combined
+   memory didn't. You shouldn't need to do anything extra for this one —
+   it's handled in the script now, not a manual step.
+6. Free tier gives roughly 30 GPU-hours/week, reset weekly — this run
+   (777 steps on a single T4) took under an hour in practice.
+7. When it finishes, download the **entire** `output/merged_fp16/`
+   directory from the notebook's output panel, not just
+   `model.safetensors` — `config.json`, `generation_config.json`,
+   `tokenizer.json`, `tokenizer_config.json`, and `processor_config.json`
+   are all required for the GGUF conversion step and are easy to miss if
+   you only grab the (by far largest) weights file. Then continue with
+   the GGUF conversion steps the script prints at the end.
+
+## Running the training (general)
+
+**This cannot run on a Mac or any machine without an NVIDIA GPU** —
+Unsloth requires CUDA. Run `train_lora.py` on Kaggle's free T4 tier (the
+one real published Gemma-4-E2B fine-tune found during research,
+[helenk/gemma-4-E2B-finetune](https://huggingface.co/helenk/gemma-4-E2B-finetune),
+was trained exactly that way), Colab, or a rented GPU. Upload
+`data/train.jsonl`, `data/eval.jsonl`, and `chat_template.jinja` alongside
+the script (or clone the repo), `pip install unsloth trl datasets`, then
+`python3 train_lora.py`.
+
+Model id (`unsloth/gemma-4-E2B-it`), LoRA config, and the
+`get_chat_template`-vs-raw-template distinction above were confirmed
+against Unsloth's own current Gemma 4 docs page as of this writing. LoRA
+rank (`r=16, alpha=16`) matches the one real reference fine-tune at this
+model size rather than the docs' lighter `r=8` quickstart default, given
+this dataset's 12 categories are broader than a narrow single-skill tune.
+`num_train_epochs=3` (~780 steps at effective batch size 4) is a real
+multi-epoch pass sized for the ~1036-example train set, not the docs'
+60-step smoke-test value. The `SFTConfig`/`SFTTrainer` field names
+(`max_seq_length`, `dataset_text_field`, etc.) reflect `trl`'s API as
+generally known, not independently re-verified against whatever exact
+`trl`/`unsloth` versions are current when you actually run this — trl's
+API does move between releases, so watch for deprecation warnings on
+first run and adjust from there rather than assuming this script is
+final.
+
+**Real bug, also confirmed and fixed**: `apply_chat_template`'s tool-call
+rendering needs `function.arguments` as an actual dict, not the JSON-
+string form (`'{"distance_cm":20}'`) that `data/train.jsonl` stores and
+that matches production's OpenAI-compatible wire format (what
+`brain/gemma.py` actually sends/receives over HTTP, and what
+`eval_harness.py`'s scoring expects back). Without conversion, every
+tool-call example failed to render. `train_lora.py`'s
+`_template_ready_messages()` now parses `arguments` from string to dict
+right before calling `apply_chat_template`, on a deep copy — the stored
+JSONL itself is untouched, so it still matches production and still works
+with `eval_harness.py` unchanged.
+
+After training, `train_lora.py` prints the exact next steps: download the
+merged fp16 checkpoint, convert to GGUF and quantize to **Q4_0**
+specifically with your local `llama.cpp` checkout (matching the exact
+quantization already deployed — not Unsloth's own GGUF export helper's
+default `q4_k_m`, which would introduce an unvalidated quantization
+scheme on top of an already-narrow fine-tune), point
+`HAL_GEMMA_MODEL_PATH` at it, start `llama-server` with `--reasoning off`,
+and run `eval_harness.py` against it before trusting it on real hardware.

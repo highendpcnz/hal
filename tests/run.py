@@ -28,6 +28,7 @@ import main  # noqa: E402
 import hermes_bridge  # noqa: E402
 import mission_control  # noqa: E402
 from finetune import eval_harness  # noqa: E402
+from finetune import train_lora  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -2850,6 +2851,31 @@ check(
     and len(_eval_calls) == 2
     and len(_eval_calls[1]) == 4  # system, user, real tool_call, real tool result
     and _eval_calls[1][2]["tool_calls"][0]["function"]["name"] == "drive_straight",
+)
+
+_tlora_original_messages = [
+    {"role": "user", "content": "drive forward"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"function": {"name": "drive_straight", "arguments": '{"distance_cm":20,"speed_pct":15}'}}
+        ],
+    },
+    {"role": "tool", "tool_call_id": "call_0", "content": '{"ok":true}'},
+]
+_tlora_converted = train_lora._template_ready_messages(_tlora_original_messages)
+check(
+    "train_lora._template_ready_messages parses tool_calls[].function.arguments from a JSON "
+    "string into a dict for apply_chat_template, without mutating the stored wire-format string",
+    _tlora_converted[1]["tool_calls"][0]["function"]["arguments"] == {"distance_cm": 20, "speed_pct": 15}
+    and _tlora_original_messages[1]["tool_calls"][0]["function"]["arguments"]
+    == '{"distance_cm":20,"speed_pct":15}',
+)
+check(
+    "train_lora._template_ready_messages leaves non-tool-call messages untouched",
+    train_lora._template_ready_messages([{"role": "user", "content": "hi"}])
+    == [{"role": "user", "content": "hi"}],
 )
 
 print()
