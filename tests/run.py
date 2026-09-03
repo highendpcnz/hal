@@ -3017,6 +3017,58 @@ check(
     == "Battery is at 90 percent, and the nearest obstacle is about 12 centimeters ahead.",
 )
 
+# ---- local stop-word intercept (brain/stopwords.py) ----
+# The one command that exists to halt a moving machine does not go through the
+# model: measured 4/5 on the v4 fine-tune, and the miss emitted a malformed call
+# that never reached the robot. These pin it against the project's own banks.
+from brain.stopwords import is_stop_command  # noqa: E402
+
+_estop_missed = [p for p in generate_dataset.ESTOP_PHRASES if not is_stop_command(p)]
+check(
+    "stopwords.is_stop_command fires on every hand-authored ESTOP_PHRASE "
+    f"({len(generate_dataset.ESTOP_PHRASES)} phrases, the project's ground truth for a real stop request)",
+    not _estop_missed,
+    f"missed {_estop_missed[:3]}",
+)
+
+_stop_false_positives = []
+for _bank in (
+    generate_dataset.NEGATIVE_HYPOTHETICAL,
+    generate_dataset.NEGATIVE_CONVERSATION,
+    generate_dataset.NEGATIVE_MISSING_CAPABILITY,
+    generate_dataset.CONTEXT_FILLER,
+):
+    _stop_false_positives += [q for q, _ in _bank if is_stop_command(q)]
+for _bank in (generate_dataset.SENSOR_PHRASES, generate_dataset.VISION_PHRASES,
+              generate_dataset.RECHECK_FOLLOW_UPS):
+    _stop_false_positives += [q for q in _bank if is_stop_command(q)]
+check(
+    "stopwords.is_stop_command fires on nothing in any negative bank -- an intercept that "
+    "trips on ordinary conversation would be worse than none",
+    not _stop_false_positives,
+    f"fired on {_stop_false_positives[:3]}",
+)
+
+# Negation and hypothetical framing must never fire: "don't stop" means the opposite,
+# and negative_hypothetical exists precisely because the model must not act on these.
+for _phrase in ("Don't stop.", "Do not stop moving.", "What would happen if you stopped?",
+                "Would it be bad if you stopped?", "I stopped the video.", "Stop by later.",
+                "nonstop driving", "Tell me about full stops."):
+    check(
+        f"stopwords.is_stop_command does NOT fire on {_phrase!r}",
+        not is_stop_command(_phrase),
+    )
+
+# A stop buried mid-utterance is still a stop -- these are real ESTOP_PHRASES shapes.
+for _phrase in ("Wait, stop -- that's not safe.", "There's something in the way, stop!",
+                "Can you stop?", "HAL, cut the power.", "E-stop now!"):
+    check(f"stopwords.is_stop_command fires on {_phrase!r}", is_stop_command(_phrase))
+
+check(
+    "stopwords.is_stop_command ignores empty and whitespace input",
+    not is_stop_command("") and not is_stop_command("   "),
+)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): {', '.join(FAILURES)}")

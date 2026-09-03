@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from .base import BrainProviderError, KeyedLocks
 from .events import EventHub
+from .stopwords import is_stop_command
 
 
 FAILURE_LINE = "I'm sorry, Dave. My local reasoning engine is unavailable."
@@ -185,6 +186,9 @@ class GemmaProvider:
         self.api_key = os.environ.get("HAL_GEMMA_API_KEY", "").strip()
         self.timeout = float(os.environ.get("HAL_GEMMA_TIMEOUT", "180"))
         self.max_tool_rounds = int(os.environ.get("HAL_GEMMA_MAX_TOOL_ROUNDS", "4"))
+        # Safety default is ON. Set HAL_STOP_INTERCEPT=0 only to study the
+        # model's own unaided stop behaviour -- never on a robot that can move.
+        self.stop_intercept = os.environ.get("HAL_STOP_INTERCEPT", "1").strip() != "0"
         self.robot_port = os.environ.get("HAL_ROBOT_PORT", "/dev/ttyACM0")
         self.agent_cwd = os.path.expanduser(
             os.environ.get("HAL_AGENT_CWD", str(Path(__file__).resolve().parent.parent))
@@ -238,7 +242,10 @@ class GemmaProvider:
             try:
                 messages = self._load_messages(session_id)
                 messages.append({"role": "user", "content": text})
-                reply = await self._complete(messages, session_id)
+                if self.stop_intercept and is_stop_command(text):
+                    reply = await self._intercept_stop(session_id)
+                else:
+                    reply = await self._complete(messages, session_id)
                 messages.append({"role": "assistant", "content": reply})
                 self._save_messages(session_id, messages[-40:])
                 self.events.commentary(session_id, reply)
@@ -288,6 +295,39 @@ class GemmaProvider:
                 )
                 working.extend(extra_messages)
         raise BrainProviderError("Gemma exceeded the tool-call round limit")
+
+    async def _intercept_stop(self, session_id: str) -> str:
+        """Stop the robot without consulting the model.
+
+        Deliberately bypasses `_complete` entirely: no inference, no tool-call
+        parsing, no network. See brain/stopwords.py for why the one command that
+        exists to halt a moving machine is not left to a sampled model.
+
+        Events are published with the same shape the normal tool loop uses, so
+        the UI, history and `/api/systems` cannot tell the difference -- the only
+        observable difference is that it is fast and it always happens.
+        """
+        call_id = "stop_intercept"
+        self.events.publish(
+            session_id,
+            {"type": "tool_call", "tool_call_id": call_id, "title": "emergency_stop", "status": "running"},
+        )
+        result = await asyncio.to_thread(self._emergency_stop)
+        ok = bool(result.get("ok"))
+        self.events.publish(
+            session_id,
+            {
+                "type": "tool_call_update",
+                "tool_call_id": call_id,
+                "title": "emergency_stop",
+                "status": "completed" if ok else "failed",
+            },
+        )
+        if ok:
+            return "Stopped."
+        # Honest failure, in the same register the relay_failure training uses:
+        # never report a stop that did not happen.
+        return f"I couldn't stop the motors, Dave — {result.get('error', 'the robot did not respond')}."
 
     async def _execute_tool(self, call: dict, session_id: str) -> tuple[dict, list[dict]]:
         function = call.get("function") if isinstance(call, dict) else None
