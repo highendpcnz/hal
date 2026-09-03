@@ -82,14 +82,19 @@ copy-pasted, so it can't silently drift from production.
 | `negative_missing_capability` | 60 | Requests for things this robot can't do at all (open a door, navigate to a room) → an honest capability refusal, not a mismatched tool call. |
 | `relay_failure` | 90 | Tool call made, but the result is `{"ok": false, "error": ...}` (real error strings pulled from `CyberPiNotReadyError`/`SafetyError`/transport failures seen this session) → the reply must honestly report failure. This is the single most on-target category for the original bug: confidently claiming success that didn't happen. |
 | `relay_success` | 90 | Tool call succeeds → reply accurately reflects it, isolated from the drive/turn categories above (turn + estop specifically). |
-| `multi_turn_context` | 60 | Same core tool-call task, preceded by 1-3 turns of unrelated chit-chat, so reliability doesn't degrade as context grows (matches real session history usage). |
+| `multi_turn_context` | 60 | Same core tool-call task, preceded by 1-3 turns of unrelated chit-chat, so reliability doesn't degrade as context grows (matches real session history usage). Note what this does *not* cover: the filler is always chit-chat, never a previous reading — the gap that `stale_reading_recheck` exists to close. |
+| `stale_reading_recheck` | 90 | Ask for sensors, get a real reading, then ask again — the second turn must make a **fresh** `read_spatial_sensors` call rather than reciting the number already in context. Targets the measured production failure below. Three input shapes (immediate recheck, recheck after chit-chat, a different sensor question), and the two readings always differ (battery drains, distance moves) so an example cannot be satisfied by repeating the first answer. Reply wording is `_sensor_reply`, shared verbatim with `sensor_read_positive`, so input shape is the only thing that varies between them — the discipline the estop widening violated. |
 
-**Balance**: ~57% positive tool-calls (weighted toward drive/turn/estop,
-the safety-critical ones), ~14% tool-result relay (explicitly split
-success/failure), ~24% negatives (the guard against over-eager
-tool-calling), ~5% out-of-bounds edge cases. 1300 total, 85/15 train/eval
-split, stratified per category so eval isn't dominated by whichever
-category happens to be largest.
+**Balance**: ~60% positive tool-calls (weighted toward drive/turn/estop,
+the safety-critical ones, and now including the `stale_reading_recheck`
+follow-ups), ~13% tool-result relay (explicitly split success/failure),
+~22% negatives (the guard against over-eager tool-calling), ~4%
+out-of-bounds edge cases. 1390 total, 85/15 train/eval split, stratified
+per category so eval isn't dominated by whichever category happens to be
+largest. `stale_reading_recheck` carries two tool calls per example, so it
+contributes more scored turns than its example count suggests —
+`eval_harness.py` scores every assistant turn, which means the critical
+second call is measured without any harness change.
 
 **Confirmed live, first real fine-tune (before this estop widening)**:
 777/777 training steps, final train loss 0.01595, val loss 0.01647.
@@ -167,12 +172,25 @@ category precisely because it only ever tests the chit-chat shape, so the
 88.6% headline is blind to this failure — **the eval needs the new case as
 much as the dataset does.**
 
-Next iteration should add repeated-query examples (ask, answer from a real
-tool result, then ask the same or an adjacent sensor question again, with
-the second turn still requiring a fresh call) and a matching eval category,
-then re-measure this table before anything else. Note the lesson from the
-estop dead end above: change one thing, and keep the reply text fixed while
-varying the input shape.
+**Written, not yet trained or verified.** `stale_reading_recheck` (90
+examples) now targets exactly this: ask, answer from a real tool result,
+then ask again, with the second turn requiring a fresh call. Following the
+estop lesson, only the input shape varies — the reply wording is
+`_sensor_reply`, shared verbatim with `sensor_read_positive` — and the two
+readings always differ so an example cannot be satisfied by repeating the
+first answer. `eval_harness.py` needed no change: it scores every assistant
+turn, so the critical second call is measured automatically, and the
+category appears in eval via the stratified split.
+
+**Re-measure the depth table above before trusting anything else.** It is
+the cheap, decisive check — a minute against a running llama-server, five
+requests per depth, holding the prompt and tools fixed and varying only the
+number of prior turns. Overall eval score is *not* a substitute: 88.6% was
+recorded while this failure was already present and total, because
+`multi_turn_context` scores 100% on the chit-chat shape it does cover.
+Deliberately left for a future pass: `capture_visual_scene` has the same
+staleness exposure and is untested — it was kept out of this change to keep
+one variable moving.
 
 ## One open design decision -- flagging rather than deciding silently
 

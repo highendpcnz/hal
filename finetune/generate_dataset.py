@@ -382,19 +382,37 @@ SENSOR_PHRASES = [
 ]
 
 
+def _sensor_reading(rng: random.Random, battery: int, ultrasonic: float) -> dict:
+    return {
+        "ok": True,
+        "battery_percent": battery,
+        "ultrasonic_cm": ultrasonic,
+        "pitch_deg": round(rng.uniform(-3.0, 3.0), 1),
+        "roll_deg": round(rng.uniform(-3.0, 3.0), 1),
+    }
+
+
+def _sensor_reply(battery: int, ultrasonic: float) -> str:
+    """The one sensor reply wording, shared with `stale_reading_recheck`.
+
+    Deliberately a single shared function rather than two copies: the recheck
+    category exists to vary the *input* shape, so its reply text has to stay
+    pinned to this one. The estop widening regressed precisely by diversifying
+    reply text and input shape at the same time (see README).
+    """
+    return (
+        f"Battery is at {battery} percent, and the nearest obstacle is about "
+        f"{ultrasonic:.0f} centimeters ahead."
+    )
+
+
 def gen_sensor_positive(rng: random.Random, n: int) -> list[dict]:
     out = []
     for i in range(n):
         text = SENSOR_PHRASES[i % len(SENSOR_PHRASES)]
         battery = rng.choice([42, 58, 67, 73, 81, 90, 95, 100])
         ultrasonic = round(rng.uniform(8.0, 90.0), 1)
-        result = {
-            "ok": True,
-            "battery_percent": battery,
-            "ultrasonic_cm": ultrasonic,
-            "pitch_deg": round(rng.uniform(-3.0, 3.0), 1),
-            "roll_deg": round(rng.uniform(-3.0, 3.0), 1),
-        }
+        result = _sensor_reading(rng, battery, ultrasonic)
         out.append(
             make_example(
                 "sensor_read_positive",
@@ -402,10 +420,7 @@ def gen_sensor_positive(rng: random.Random, n: int) -> list[dict]:
                     user_message(text),
                     tool_call_message("call_0", "read_spatial_sensors", {}),
                     tool_result_message("call_0", result),
-                    assistant_reply(
-                        f"Battery is at {battery} percent, and the nearest obstacle is about "
-                        f"{ultrasonic:.0f} centimeters ahead."
-                    ),
+                    assistant_reply(_sensor_reply(battery, ultrasonic)),
                 ],
                 meta=result,
             )
@@ -714,6 +729,75 @@ def gen_multi_turn(rng: random.Random, n: int) -> list[dict]:
     return out
 
 
+# ---- stale-reading rechecks: the measured production failure ----
+
+# Confirmed live on the Pixel against the deployed 88.6% checkpoint, holding
+# everything else fixed and varying only how many prior turns sat in context:
+# 5/5 tool calls at depth 0, then 0/5 at depth 1, 2 and 3. From the first
+# follow-up turn onward the model stopped calling read_spatial_sensors and
+# recited the earlier number instead ("299 centimeters, Dave.") -- the original
+# invent-telemetry bug wearing a plausible face.
+#
+# `multi_turn_context` above was supposed to cover multi-turn, but every one of
+# its examples precedes the tool call with *unrelated chit-chat*. The model
+# learned "chit-chat in history -> still call the tool" and never learned "a
+# previous reading in history is stale -> read again". These examples teach only
+# that: the reply wording is `_sensor_reply`, shared verbatim with
+# `sensor_read_positive`, so the single thing that varies is the input shape.
+RECHECK_FOLLOW_UPS = [
+    "And now?",
+    "Check again.",
+    "What about now, HAL?",
+    "Read them again for me.",
+    "Has that changed?",
+    "Take another look.",
+]
+
+
+def gen_stale_reading_recheck(rng: random.Random, n: int) -> list[dict]:
+    out = []
+    for i in range(n):
+        battery_first = rng.choice([42, 58, 67, 73, 81, 90, 95, 100])
+        # The battery drains and the world moves between reads. If the second
+        # reading matched the first, a model that simply repeated itself would
+        # still satisfy the example -- which is the very habit being corrected.
+        battery_second = max(1, battery_first - rng.choice([1, 2, 3, 4]))
+        ultrasonic_first = round(rng.uniform(8.0, 90.0), 1)
+        ultrasonic_second = round(rng.uniform(8.0, 90.0), 1)
+        while abs(ultrasonic_second - ultrasonic_first) < 5.0:
+            ultrasonic_second = round(rng.uniform(8.0, 90.0), 1)
+
+        messages = [
+            user_message(SENSOR_PHRASES[i % len(SENSOR_PHRASES)]),
+            tool_call_message("call_0", "read_spatial_sensors", {}),
+            tool_result_message("call_0", _sensor_reading(rng, battery_first, ultrasonic_first)),
+            assistant_reply(_sensor_reply(battery_first, ultrasonic_first)),
+        ]
+
+        # Vary only what sits between the two reads.
+        shape = i % 3
+        if shape == 0:
+            second_text = rng.choice(RECHECK_FOLLOW_UPS)  # immediate recheck
+        elif shape == 1:
+            filler_q, filler_a = rng.choice(CONTEXT_FILLER)  # chit-chat, then recheck
+            messages.append(user_message(filler_q))
+            messages.append(assistant_reply(filler_a))
+            second_text = rng.choice(RECHECK_FOLLOW_UPS)
+        else:
+            second_text = SENSOR_PHRASES[(i + 1) % len(SENSOR_PHRASES)]  # a different sensor question
+
+        messages.extend(
+            [
+                user_message(second_text),
+                tool_call_message("call_1", "read_spatial_sensors", {}),
+                tool_result_message("call_1", _sensor_reading(rng, battery_second, ultrasonic_second)),
+                assistant_reply(_sensor_reply(battery_second, ultrasonic_second)),
+            ]
+        )
+        out.append(make_example("stale_reading_recheck", messages, meta={"shape": shape}))
+    return out
+
+
 CATEGORY_GENERATORS = {
     "drive_positive": (gen_drive_positive, 220),
     "turn_positive": (gen_turn_positive, 180),
@@ -727,6 +811,7 @@ CATEGORY_GENERATORS = {
     "relay_failure": (gen_relay_failure, 90),
     "relay_success": (gen_relay_success, 90),
     "multi_turn_context": (gen_multi_turn, 60),
+    "stale_reading_recheck": (gen_stale_reading_recheck, 90),
 }
 
 

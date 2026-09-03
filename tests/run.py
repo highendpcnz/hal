@@ -29,6 +29,7 @@ import hermes_bridge  # noqa: E402
 import mission_control  # noqa: E402
 from finetune import eval_harness  # noqa: E402
 from finetune import train_lora  # noqa: E402
+from finetune import generate_dataset  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -2924,6 +2925,43 @@ check(
     "gemma._sanitize_reply does not flag ordinary prose containing the word tool",
     gemma._sanitize_reply("That tool: the gripper, is not fitted, Dave.")
     == "That tool: the gripper, is not fitted, Dave.",
+)
+
+# stale_reading_recheck exists to teach that a reading already in context is stale.
+# Two properties carry that meaning and are easy to silently break: the follow-up
+# must be a *second* tool call, and the two readings must actually differ -- a
+# recheck that returned the same numbers could be satisfied by repeating.
+import random as _random  # noqa: E402
+
+_recheck = generate_dataset.gen_stale_reading_recheck(_random.Random(11), 30)
+_recheck_calls = [
+    [m for m in ex["messages"] if m["role"] == "assistant" and m.get("tool_calls")] for ex in _recheck
+]
+check(
+    "generate_dataset.gen_stale_reading_recheck always re-reads: every example makes a second "
+    "read_spatial_sensors call after a reading is already in context",
+    all(
+        len(calls) == 2 and all(c["tool_calls"][0]["function"]["name"] == "read_spatial_sensors" for c in calls)
+        for calls in _recheck_calls
+    ),
+)
+_recheck_readings = [
+    [json.loads(m["content"]) for m in ex["messages"] if m["role"] == "tool"] for ex in _recheck
+]
+check(
+    "generate_dataset.gen_stale_reading_recheck moves the world between reads, so an example "
+    "cannot be satisfied by repeating the first answer",
+    all(
+        r[0]["battery_percent"] != r[1]["battery_percent"]
+        and abs(r[0]["ultrasonic_cm"] - r[1]["ultrasonic_cm"]) >= 5.0
+        for r in _recheck_readings
+    ),
+)
+check(
+    "generate_dataset._sensor_reply is the single sensor wording both sensor_read_positive and "
+    "stale_reading_recheck use, so only the input shape varies between the two categories",
+    generate_dataset._sensor_reply(90, 12.4)
+    == "Battery is at 90 percent, and the nearest obstacle is about 12 centimeters ahead.",
 )
 
 print()
