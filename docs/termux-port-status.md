@@ -566,3 +566,23 @@ directly rather than trusting the reply alone.
   holds under real sustained load (STT + inference + serial I/O together) —
   everything tested this session was a short-lived foreground SSH session,
   not the kind of long unattended run that setting exists for.
+
+## Deployment drift: the Pixel checkout is not git-tracked
+
+`/data/data/com.termux/files/home/hal-mbot2/repo` on the Pixel is a plain file
+copy, not a git checkout — deploys land via `rsync`/manual copy from the dev
+Mac, not `git pull`. Nothing keeps the two in sync automatically, so a doc or
+code change committed on the Mac can simply never reach the Pixel, or a fix
+applied directly on the Pixel (as happened with the Termux USB handoff fix,
+2026-09-04 — see `docs/robot-control-contract.md`) can exist only there until
+someone notices and pushes it back.
+
+Found live 2026-09-04: `docs/robot-control-contract.md` on the Pixel was 266
+lines against 424 in the git repo, missing the entire "online-exec namespace,
+mapped" investigation and the online-mode resolution writeup — both already
+committed and pushed weeks of work earlier. Resynced by overwriting the
+Pixel's copy with the git-tracked file (`cat docs/... | ssh ... 'cat >
+...'`), verified byte-identical after. If something documented here or in
+`docs/robot-control-contract.md` doesn't match what the Pixel actually does,
+check for drift before assuming the doc is wrong — diff the Pixel's copy
+against git rather than trusting either side blind.
