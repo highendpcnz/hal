@@ -222,6 +222,51 @@ The CLI emits newline-delimited JSON and closes the serial port on success or
 failure. `pyserial` is imported only when hardware is opened, so model-free
 tests can use the deterministic fake transport without a connected robot.
 
+## Termux USB handoff (Android/Pixel deployment)
+
+The `--port /dev/cu.usbserial-110` examples above are the desktop (macOS/Linux)
+path pyserial opens directly. Android exposes no such device node for USB-serial
+adapters — `termux-usb` instead grants a raw, already-open file descriptor via
+a one-time permission dialog. `robot/android_usb.py`'s `Ch340UsbTransport`
+implements the same `SerialTransport` protocol against that fd directly,
+bypassing pyserial. `brain/gemma.py`'s `_open_telemetry_client` and
+`_open_robot_transport` check the `TERMUX_USB_FD` environment variable at
+runtime: if set, they build a `Ch340UsbTransport` from it; otherwise they fall
+back to the pyserial path above, which does not exist on Android and fails
+every telemetry/motion tool call with `[Errno 2] No such file or directory`.
+
+`TERMUX_USB_FD` is only set when the process is launched under:
+
+```sh
+termux-usb -r -E -e "<command>" <device-path>
+```
+
+(`-r` requests the permission dialog if needed; `-E` exports the fd as
+`TERMUX_USB_FD` instead of appending it as a CLI arg; `-e <command>` is the
+process to run.) The wrapped command must stay in the foreground of the whole
+process chain — if the script `termux-usb` launches backgrounds the real
+server and then exits, `termux-usb` reclaims the fd once its direct child
+exits, even though the actual server process is still running.
+
+Confirmed live 2026-09-04: an instance of `main.py` started via a plain
+`nohup ./run.sh` (no `termux-usb` wrapper) ran for roughly two hours with the
+CyberPi fully connected, enumerated, and powered on, and every
+`read_spatial_sensors` call failed with the pyserial fallback's "No such file"
+error — nothing in the server logs surfaced this beyond a generic tool-call
+failure event; it only showed up in the per-session transcript under
+`data/brain/gemma/<session>.json`. `~/launch_v4b.sh` now auto-discovers the
+device via `termux-usb -l` and wraps `run.sh` in `termux-usb -r -E -e ...` so
+`TERMUX_USB_FD` reaches `uvicorn`. Verify a live launch actually has the fd
+with:
+
+```sh
+cat /proc/<uvicorn-pid>/environ | tr '\0' '\n' | grep TERMUX_USB_FD
+```
+
+An empty result means the server is running without CyberPi access — every
+telemetry and motion tool call will fail until it is relaunched under the
+`termux-usb` wrapper.
+
 ## Stop (`robot/estop.py`)
 
 The bring-up order below calls for verifying stop before any movement. The
