@@ -2921,6 +2921,23 @@ check(
     "which would otherwise be read aloud verbatim",
     _sanitize_garbled is not None,
 )
+# The garbled emergency-stop forms seen live on the deployed model. A stop that
+# does not fire is the real defect (dataset coverage); this only keeps the wreckage
+# out of the spoken output.
+for _garbled in (
+    '<function_call:emergency_stop{description:<|"|',
+    '<tool:call:emergency_stop{description:<|"|>stop immediately',
+):
+    _caught = None
+    try:
+        gemma._sanitize_reply(_garbled)
+    except BrainProviderError as exc:
+        _caught = str(exc)
+    check(
+        f"gemma._sanitize_reply rejects the garbled estop marker {_garbled[:22]!r}...",
+        _caught is not None,
+    )
+
 check(
     "gemma._sanitize_reply does not flag ordinary prose containing the word tool",
     gemma._sanitize_reply("That tool: the gripper, is not fitted, Dave.")
@@ -2932,30 +2949,66 @@ check(
 # must be a *second* tool call, and the two readings must actually differ -- a
 # recheck that returned the same numbers could be satisfied by repeating.
 import random as _random  # noqa: E402
+import re as _re  # noqa: E402
 
 _recheck = generate_dataset.gen_stale_reading_recheck(_random.Random(11), 30)
-_recheck_calls = [
-    [m for m in ex["messages"] if m["role"] == "assistant" and m.get("tool_calls")] for ex in _recheck
-]
+
+
+def _first_tool_call_index(example):
+    msgs = example["messages"][1:]
+    return next(i for i, m in enumerate(msgs) if m["role"] == "assistant" and m.get("tool_calls"))
+
+
 check(
-    "generate_dataset.gen_stale_reading_recheck always re-reads: every example makes a second "
-    "read_spatial_sensors call after a reading is already in context",
+    "generate_dataset.gen_stale_reading_recheck keeps history TEXT-ONLY before the call, "
+    "matching what main.py actually replays -- v3 trained the structured shape, which "
+    "production never produces, and scored 0/5 live",
     all(
-        len(calls) == 2 and all(c["tool_calls"][0]["function"]["name"] == "read_spatial_sensors" for c in calls)
-        for calls in _recheck_calls
+        not any(
+            m["role"] == "tool" or m.get("tool_calls")
+            for m in ex["messages"][1:][: _first_tool_call_index(ex)]
+        )
+        for ex in _recheck
     ),
 )
-_recheck_readings = [
-    [json.loads(m["content"]) for m in ex["messages"] if m["role"] == "tool"] for ex in _recheck
-]
+check(
+    "generate_dataset.gen_stale_reading_recheck still re-reads: a read_spatial_sensors call "
+    "follows a reading that is already stated in context",
+    all(
+        [m for m in ex["messages"] if m["role"] == "assistant" and m.get("tool_calls")]
+        and all(
+            m["tool_calls"][0]["function"]["name"] == "read_spatial_sensors"
+            for m in ex["messages"]
+            if m["role"] == "assistant" and m.get("tool_calls")
+        )
+        for ex in _recheck
+    ),
+)
+_prior_batt = _re.compile(r"Battery is at (\d+) percent")
 check(
     "generate_dataset.gen_stale_reading_recheck moves the world between reads, so an example "
-    "cannot be satisfied by repeating the first answer",
+    "cannot be satisfied by repeating the reading already spoken in history",
     all(
-        r[0]["battery_percent"] != r[1]["battery_percent"]
-        and abs(r[0]["ultrasonic_cm"] - r[1]["ultrasonic_cm"]) >= 5.0
-        for r in _recheck_readings
+        int(_prior_batt.search(ex["messages"][2]["content"]).group(1))
+        != json.loads(
+            next(m for m in ex["messages"] if m["role"] == "tool")["content"]
+        )["battery_percent"]
+        for ex in _recheck
     ),
+)
+_mt = generate_dataset.gen_multi_turn(_random.Random(5), 60)
+_mt_tools = {
+    m["tool_calls"][0]["function"]["name"]
+    for ex in _mt
+    for m in ex["messages"]
+    if m["role"] == "assistant" and m.get("tool_calls")
+}
+check(
+    "generate_dataset.gen_multi_turn covers every tool after text history, not just "
+    "drive_straight -- per-tool coverage is what the live measurements showed matters",
+    _mt_tools
+    == {"drive_straight", "turn", "emergency_stop", "read_spatial_sensors", "capture_visual_scene"},
+    f"got {sorted(_mt_tools)}",
 )
 check(
     "generate_dataset._sensor_reply is the single sensor wording both sensor_read_positive and "

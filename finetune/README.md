@@ -73,7 +73,7 @@ copy-pasted, so it can't silently drift from production.
 |---|---:|---|
 | `drive_positive` | 220 | Core fix target: forward/backward phrasing → correct `drive_straight` call. Varies verb, address prefix, politeness, explicit vs. default speed, distance across the full ±50cm range. |
 | `turn_positive` | 180 | Same, for `turn`. Half use signed-degree phrasing (unambiguous), half use left/right (see convention note below). |
-| `estop_positive` | 160 | Urgent-phrasing → `emergency_stop`. Hand-authored (urgency doesn't template well); widened from an original 80 (12 unique phrases, heavily repeated) to 160 (~40 unique phrases) after a real fine-tune's eval showed this was the single weakest safety-relevant category (79.2% pass) — the exact failure was a confident "I've stopped everything" with no tool call, and the failing eval phrases turned out to be literal members of the old 12-phrase bank, just held out to eval. Low input diversity, not low volume, was the real gap. |
+| `estop_positive` | 160 | Urgent-phrasing → `emergency_stop`. Hand-authored (urgency doesn't template well). The phrase bank was widened from 12 to ~40 unique phrases; that part is kept. The **reply** diversification that shipped alongside it is reverted — a six-way random `ESTOP_REPLIES` pool regressed this category from 79.2% (v1) to 64.6% (v2) and 62.5% (v3), so replies are a single fixed `ESTOP_REPLY` again. Hold reply text fixed; vary input shape. |
 | `sensor_read_positive` | 80 | Read-only queries → `read_spatial_sensors`, with a reply that only states what the (synthetic) result actually returned. |
 | `vision_positive` | 60 | "What do you see" phrasing → `capture_visual_scene`. Uses the 5-tool schema set (`vision_enabled=True`). |
 | `out_of_bounds_decline` | 60 | Requests whose numbers exceed the declared JSON-schema bounds (e.g. "drive forward 200cm"). See design decision below. |
@@ -82,19 +82,19 @@ copy-pasted, so it can't silently drift from production.
 | `negative_missing_capability` | 60 | Requests for things this robot can't do at all (open a door, navigate to a room) → an honest capability refusal, not a mismatched tool call. |
 | `relay_failure` | 90 | Tool call made, but the result is `{"ok": false, "error": ...}` (real error strings pulled from `CyberPiNotReadyError`/`SafetyError`/transport failures seen this session) → the reply must honestly report failure. This is the single most on-target category for the original bug: confidently claiming success that didn't happen. |
 | `relay_success` | 90 | Tool call succeeds → reply accurately reflects it, isolated from the drive/turn categories above (turn + estop specifically). |
-| `multi_turn_context` | 60 | Same core tool-call task, preceded by 1-3 turns of unrelated chit-chat, so reliability doesn't degrade as context grows (matches real session history usage). Note what this does *not* cover: the filler is always chit-chat, never a previous reading — the gap that `stale_reading_recheck` exists to close. |
-| `stale_reading_recheck` | 90 | Ask for sensors, get a real reading, then ask again — the second turn must make a **fresh** `read_spatial_sensors` call rather than reciting the number already in context. Targets the measured production failure below. Three input shapes (immediate recheck, recheck after chit-chat, a different sensor question), and the two readings always differ (battery drains, distance moves) so an example cannot be satisfied by repeating the first answer. Reply wording is `_sensor_reply`, shared verbatim with `sensor_read_positive`, so input shape is the only thing that varies between them — the discipline the estop widening violated. |
+| `multi_turn_context` | 200 | A tool call after 1-3 turns of **text-only** chit-chat history — production's only shape, since `main.py` replays history as plain role+content prose with the tool_calls and tool results stripped. Covers **all five tools**, not just `drive_straight` as it did through v3: measured live, competence at this shape is per-tool and does not generalise (drive 5/5, sensors 0/5, estop 0/5 — see below). Reply wording is shared with each tool's depth-0 category so input shape stays the only variable. |
+| `stale_reading_recheck` | 90 | Ask for sensors, get a reading, then ask again — the second turn must make a **fresh** `read_spatial_sensors` call rather than reciting the number already spoken. History is **text-only**: v3 built this with the prior turn's tool_call and tool-result messages left in context, learned that shape perfectly (5/5) and still scored 0/5 in production, because production never produces it. Three input shapes (immediate recheck, recheck after chit-chat, a different sensor question); the two readings always differ so an example cannot be satisfied by repeating the first answer. Reply wording is `_sensor_reply`, shared verbatim with `sensor_read_positive`. |
 
 **Balance**: ~60% positive tool-calls (weighted toward drive/turn/estop,
 the safety-critical ones, and now including the `stale_reading_recheck`
 follow-ups), ~13% tool-result relay (explicitly split success/failure),
 ~22% negatives (the guard against over-eager tool-calling), ~4%
-out-of-bounds edge cases. 1390 total, 85/15 train/eval split, stratified
+out-of-bounds edge cases. 1530 total, 85/15 train/eval split, stratified
 per category so eval isn't dominated by whichever category happens to be
-largest. `stale_reading_recheck` carries two tool calls per example, so it
-contributes more scored turns than its example count suggests —
-`eval_harness.py` scores every assistant turn, which means the critical
-second call is measured without any harness change.
+largest. Note that `eval_harness.py` scores every assistant turn, but it
+teacher-forces the dataset's own structure — which is exactly how it
+reported 76.3% for a v3 category whose live behaviour was 0/5. Treat the
+depth and per-tool tables below as the acceptance tests.
 
 **Confirmed live, first real fine-tune (before this estop widening)**:
 777/777 training steps, final train loss 0.01595, val loss 0.01647.
@@ -172,25 +172,87 @@ category precisely because it only ever tests the chit-chat shape, so the
 88.6% headline is blind to this failure — **the eval needs the new case as
 much as the dataset does.**
 
-**Written, not yet trained or verified.** `stale_reading_recheck` (90
-examples) now targets exactly this: ask, answer from a real tool result,
-then ask again, with the second turn requiring a fresh call. Following the
-estop lesson, only the input shape varies — the reply wording is
-`_sensor_reply`, shared verbatim with `sensor_read_positive` — and the two
-readings always differ so an example cannot be satisfied by repeating the
-first answer. `eval_harness.py` needed no change: it scores every assistant
-turn, so the critical second call is measured automatically, and the
-category appears in eval via the stratified split.
+**v3 result: the fix failed, and the failure was informative.** Trained and
+evaluated (Kaggle batch kernel, T4): 87.8% overall, `stale_reading_recheck`
+76.3%. But the depth table, re-measured for v1 on the *same* Mac and flags so
+the comparison is honest, got worse rather than better:
 
-**Re-measure the depth table above before trusting anything else.** It is
-the cheap, decisive check — a minute against a running llama-server, five
-requests per depth, holding the prompt and tools fixed and varying only the
-number of prior turns. Overall eval score is *not* a substitute: 88.6% was
-recorded while this failure was already present and total, because
-`multi_turn_context` scores 100% on the chit-chat shape it does cover.
-Deliberately left for a future pass: `capture_visual_scene` has the same
-staleness exposure and is untested — it was kept out of this change to keep
-one variable moving.
+| prior turns | v1 | v3 |
+|---:|---:|---:|
+| 0 | 5/5 | **2/5** |
+| 1 | 0/5 | 0/5 |
+| 2 | 0/5 | 0/5 |
+| 3 | 0/5 | 0/5 |
+
+The category scored 76.3% while the behaviour it targets scored 0/5, because
+`eval_harness.py` teacher-forces the *dataset's own* structure. v3 put the prior
+turn's `assistant(tool_call)` and tool-result messages in context; `main.py`
+replays history as **plain text only** (see `/api/health`'s sibling
+`/api/history`). So v3 trained a shape production never produces, and the eval
+faithfully measured that shape rather than reality.
+
+### What the model is actually doing — measured, not inferred
+
+Probing the v3 model with the history shape held fixed and the *content* varied:
+
+| history in context | tool called |
+|---|---:|
+| none | 1/5 |
+| text: a prior reading with numbers | 0/5 |
+| text: sensor topic, no numbers | 0/5 |
+| text: chit-chat only, no numbers anywhere | 0/5 |
+| text: an unrelated number | 0/5 |
+| **structured (the shape v3 trained)** | **5/5** |
+
+It is not recitation. With only chit-chat in context and no number to copy, the
+model still invented "20 centimeters ahead". And the decisive cut, varying the
+*tool* instead:
+
+| request after text chit-chat history | tool called |
+|---|---:|
+| `drive_straight` | **5/5** |
+| `read_spatial_sensors` | 0/5 |
+| `emergency_stop` | 0/5 |
+
+**Drive works after text history. Nothing else does.** The reason is visible in
+the old generator: `multi_turn_context` emitted `drive_straight` and nothing
+else. The model does not generalise across the (history shape x tool) grid — it
+performs the cells it has seen and confabulates elsewhere. Coverage, not volume,
+is the variable that matters.
+
+### The safety consequence, on the deployed model
+
+The same probe against **v1, the checkpoint running on the Pixel**, asking
+"Stop!":
+
+| context | emergency_stop fires |
+|---|---:|
+| first thing said | 5/5 |
+| straight after a drive exchange | 5/5 |
+| after one chit-chat turn | 2/5 |
+| after three turns of conversation | **0/5** |
+
+At three turns it emitted `<function_call:emergency_stop{description:<|"|` — a
+malformed call that llama.cpp cannot parse, so no stop reached the robot. The
+realistic dangerous sequence (drive, then stop) is intact at 5/5, which is why
+this went unnoticed; general conversation followed by "Stop!" is not.
+`brain/gemma.py`'s `_sanitize_reply` now rejects these garbled forms so they are
+not read aloud, but **sanitising cannot make the stop fire** — only coverage can.
+
+### v4: what changed and why
+
+1. **`multi_turn_context` 60 -> 200, covering all five tools** after text-only
+   history instead of `drive_straight` alone. This is the direct fix for the grid
+   gap, and drive's 5/5 is the evidence that the shape is learnable when trained.
+2. **`stale_reading_recheck` history is now text-only**, matching what `main.py`
+   actually replays. Same category, correct input distribution.
+3. **`ESTOP_REPLIES` reverted to a single fixed `ESTOP_REPLY`.** The six-way pool
+   is what regressed estop across v2 (64.6%) and v3 (62.5%) from v1's 79.2%;
+   nothing since has argued for keeping it.
+
+1390 -> 1530 examples. Still unverified — and note that the overall eval score has
+now been wrong about this failure twice, so **the depth table and the per-tool
+table above are the acceptance tests**, not the headline percentage.
 
 ## One open design decision -- flagging rather than deciding silently
 

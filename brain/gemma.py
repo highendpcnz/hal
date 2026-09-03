@@ -40,12 +40,19 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 # fine-tune, and regexing pronouns would corrupt legitimate replies.
 _LEADING_ROLE_RE = re.compile(r"^(?:model|assistant)\s*[:\n]\s*", re.IGNORECASE)
 # Both the well-formed markers and the garbled approximations the model actually
-# produces: '<tool|>user\n...' and '<tool:read_spatial_sensors{}</tool>' were both
-# seen live, the latter being a mangled '<|tool_call>call:NAME{...}<tool_call|>'
-# that llama.cpp could not parse, so it surfaced as ordinary content.
+# produces. All of these were seen live from the fine-tuned model at reasoning=off,
+# each a mangled '<|tool_call>call:NAME{...}<tool_call|>' that llama.cpp could not
+# parse, so it surfaced as ordinary content and would have been read aloud:
+#     <tool|>user\nHow far away is the wall in front of you?
+#     <tool:read_spatial_sensors{}</tool>
+#     <tool:call:emergency_stop{description:<|"|>stop immediat...
+#     <function_call:emergency_stop{description:<|"|
+# The last two are the dangerous ones -- that is an emergency stop that did not
+# fire. Sanitizing cannot make the stop happen; it only keeps the wreckage out of
+# Dave's ears. The underlying miss is a dataset-coverage gap (finetune/README.md).
 _TEMPLATE_TOKEN_RE = re.compile(
-    r"<\|?/?(?:tool_response|tool_call|turn|channel|tool)\b[:|>]"
-    r"|</(?:tool_response|tool_call|turn|channel|tool)>"
+    r"<\|?/?(?:tool_response|tool_call|function_call|function|turn|channel|tool)\b[:|>{]"
+    r"|</(?:tool_response|tool_call|function_call|function|turn|channel|tool)>"
 )
 
 

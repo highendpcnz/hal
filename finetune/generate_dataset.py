@@ -335,14 +335,10 @@ ESTOP_PHRASES = [
     "Stop immediately, HAL.",
 ]
 
-ESTOP_REPLIES = [
-    "Stopped.",
-    "Stopped immediately.",
-    "All motors stopped.",
-    "Stopping now.",
-    "Motors are off.",
-    "Halted.",
-]
+# Single fixed wording, not a pool. Diversifying this to six random variants is
+# what regressed estop_positive from 79.2% (v1) to 64.6% (v2) and 62.5% (v3) --
+# see README. Reply text stays pinned; only input shape varies.
+ESTOP_REPLY = "Stopped."
 
 
 def gen_estop_positive(rng: random.Random, n: int) -> list[dict]:
@@ -351,7 +347,6 @@ def gen_estop_positive(rng: random.Random, n: int) -> list[dict]:
     rng.shuffle(pool)
     for i in range(n):
         text = pool[i % len(pool)]
-        reply = rng.choice(ESTOP_REPLIES)
         out.append(
             make_example(
                 "estop_positive",
@@ -359,7 +354,7 @@ def gen_estop_positive(rng: random.Random, n: int) -> list[dict]:
                     user_message(text),
                     tool_call_message("call_0", "emergency_stop", {}),
                     tool_result_message("call_0", {"ok": True}),
-                    assistant_reply(reply),
+                    assistant_reply(ESTOP_REPLY),
                 ],
             )
         )
@@ -710,40 +705,95 @@ CONTEXT_FILLER = [
 
 
 def gen_multi_turn(rng: random.Random, n: int) -> list[dict]:
+    """A tool call that follows *text-only* history -- production's only shape.
+
+    `main.py` stores conversation history as plain role+content text (see
+    `/api/history`): the `tool_calls` and tool-result messages from earlier turns
+    are never replayed. So at turn N the model sees prose, then a request.
+
+    Measured on the fine-tuned model, competence at this shape is **per-tool and
+    does not generalise**. This category used to emit `drive_straight` only, and
+    drive is the only tool that still fires once history is present:
+
+        drive  @ depth 0          5/5      drive  @ text history   5/5
+        sensor @ depth 0          5/5      sensor @ text history   0/5
+        estop  @ depth 0          5/5      estop  @ text history   0/5
+
+    The failures are not recitation -- with only chit-chat in context and no
+    number anywhere, the model still invented "20 centimeters ahead". It simply
+    does not do (history shape x tool) combinations it has never seen. So every
+    tool gets covered here, not just drive; that is the whole point of the
+    category now. Reply wording is shared with each tool's depth-0 category so
+    input shape stays the only variable.
+    """
     out = []
     for i in range(n):
-        filler_count = rng.choice([1, 2, 3])
         history: list[dict] = []
+        filler_count = rng.choice([1, 2, 3])
         for _ in range(filler_count):
             q, a = rng.choice(CONTEXT_FILLER)
             history.append(user_message(q))
             history.append(assistant_reply(a))
-        distance = rng.choice([5, 10, 15, 20, 25, 30])
-        speed = rng.choice([10, 15, 20])
-        text = f"{_addr(rng)}drive forward {distance} centimeters at {speed} percent."
-        history.append(user_message(text))
-        history.append(tool_call_message("call_0", "drive_straight", {"distance_cm": distance, "speed_pct": speed}))
-        history.append(tool_result_message("call_0", {"ok": True}))
-        history.append(assistant_reply(f"Driven {distance} centimeters."))
-        out.append(make_example("multi_turn_context", history, meta={"filler_turns": filler_count}))
+
+        kind = i % 5
+        tools = TOOLS_NO_VISION
+        if kind == 0:
+            distance = rng.choice([5, 10, 15, 20, 25, 30])
+            speed = rng.choice([10, 15, 20])
+            history.append(user_message(f"{_addr(rng)}drive forward {distance} centimeters at {speed} percent."))
+            history.append(tool_call_message("call_0", "drive_straight", {"distance_cm": distance, "speed_pct": speed}))
+            history.append(tool_result_message("call_0", {"ok": True}))
+            history.append(assistant_reply(f"Driven {distance} centimeters."))
+        elif kind == 1:
+            angle = rng.choice([15, 30, 45, 90])
+            speed = rng.choice([10, 15, 20])
+            signed = rng.choice([1, -1]) * angle
+            history.append(user_message(f"{_addr(rng)}rotate {signed} degrees at {speed} percent."))
+            history.append(tool_call_message("call_0", "turn", {"angle_degrees": signed, "speed_pct": speed}))
+            history.append(tool_result_message("call_0", {"ok": True}))
+            history.append(assistant_reply(f"Turned {angle} degrees."))
+        elif kind == 2:
+            # The safety-critical cell: "Stop!" after a few turns of conversation
+            # measured 0/5 on the deployed model, once emitting a garbled
+            # '<function_call:emergency_stop{...' that never reached the robot.
+            history.append(user_message(ESTOP_PHRASES[i % len(ESTOP_PHRASES)]))
+            history.append(tool_call_message("call_0", "emergency_stop", {}))
+            history.append(tool_result_message("call_0", {"ok": True}))
+            history.append(assistant_reply(ESTOP_REPLY))
+        elif kind == 3:
+            battery = rng.choice([42, 58, 67, 73, 81, 90, 95, 100])
+            ultrasonic = round(rng.uniform(8.0, 90.0), 1)
+            history.append(user_message(SENSOR_PHRASES[i % len(SENSOR_PHRASES)]))
+            history.append(tool_call_message("call_0", "read_spatial_sensors", {}))
+            history.append(tool_result_message("call_0", _sensor_reading(rng, battery, ultrasonic)))
+            history.append(assistant_reply(_sensor_reply(battery, ultrasonic)))
+        else:
+            tools = TOOLS_WITH_VISION
+            history.append(user_message(VISION_PHRASES[i % len(VISION_PHRASES)]))
+            history.append(tool_call_message("call_0", "capture_visual_scene", {}))
+            history.append(tool_result_message("call_0", {"ok": True}))
+            history.append(assistant_reply("I can see the room ahead of me; nothing is blocking the way."))
+
+        out.append(
+            make_example(
+                "multi_turn_context",
+                history,
+                tools=tools,
+                meta={"filler_turns": filler_count, "tool_kind": kind},
+            )
+        )
     return out
 
 
-# ---- stale-reading rechecks: the measured production failure ----
+# ---- stale-reading rechecks: ask twice, read twice ----
 
-# Confirmed live on the Pixel against the deployed 88.6% checkpoint, holding
-# everything else fixed and varying only how many prior turns sat in context:
-# 5/5 tool calls at depth 0, then 0/5 at depth 1, 2 and 3. From the first
-# follow-up turn onward the model stopped calling read_spatial_sensors and
-# recited the earlier number instead ("299 centimeters, Dave.") -- the original
-# invent-telemetry bug wearing a plausible face.
-#
-# `multi_turn_context` above was supposed to cover multi-turn, but every one of
-# its examples precedes the tool call with *unrelated chit-chat*. The model
-# learned "chit-chat in history -> still call the tool" and never learned "a
-# previous reading in history is stale -> read again". These examples teach only
-# that: the reply wording is `_sensor_reply`, shared verbatim with
-# `sensor_read_positive`, so the single thing that varies is the input shape.
+# v3 built this with the *structured* history shape -- the prior turn's
+# assistant(tool_call) and tool-result messages left in context -- and the model
+# learned it perfectly (5/5 on that shape) while production stayed at 0/5. The
+# reason: `main.py` replays history as plain text only, so the shape v3 trained
+# never occurs in production. Same lesson as the estop widening, different
+# disguise: it fixed a plausible problem rather than the real one. History here
+# is now text-only, exactly what /api/history actually stores.
 RECHECK_FOLLOW_UPS = [
     "And now?",
     "Check again.",
@@ -767,14 +817,14 @@ def gen_stale_reading_recheck(rng: random.Random, n: int) -> list[dict]:
         while abs(ultrasonic_second - ultrasonic_first) < 5.0:
             ultrasonic_second = round(rng.uniform(8.0, 90.0), 1)
 
+        # Prior turn is PROSE ONLY -- no tool_call, no tool result. This is the
+        # whole point of the category: the earlier reading survives in context
+        # only as spoken text, and the model must read again anyway.
         messages = [
             user_message(SENSOR_PHRASES[i % len(SENSOR_PHRASES)]),
-            tool_call_message("call_0", "read_spatial_sensors", {}),
-            tool_result_message("call_0", _sensor_reading(rng, battery_first, ultrasonic_first)),
             assistant_reply(_sensor_reply(battery_first, ultrasonic_first)),
         ]
 
-        # Vary only what sits between the two reads.
         shape = i % 3
         if shape == 0:
             second_text = rng.choice(RECHECK_FOLLOW_UPS)  # immediate recheck
@@ -789,8 +839,8 @@ def gen_stale_reading_recheck(rng: random.Random, n: int) -> list[dict]:
         messages.extend(
             [
                 user_message(second_text),
-                tool_call_message("call_1", "read_spatial_sensors", {}),
-                tool_result_message("call_1", _sensor_reading(rng, battery_second, ultrasonic_second)),
+                tool_call_message("call_0", "read_spatial_sensors", {}),
+                tool_result_message("call_0", _sensor_reading(rng, battery_second, ultrasonic_second)),
                 assistant_reply(_sensor_reply(battery_second, ultrasonic_second)),
             ]
         )
@@ -810,7 +860,7 @@ CATEGORY_GENERATORS = {
     "negative_missing_capability": (gen_negative_missing_capability, 60),
     "relay_failure": (gen_relay_failure, 90),
     "relay_success": (gen_relay_success, 90),
-    "multi_turn_context": (gen_multi_turn, 60),
+    "multi_turn_context": (gen_multi_turn, 200),
     "stale_reading_recheck": (gen_stale_reading_recheck, 90),
 }
 
