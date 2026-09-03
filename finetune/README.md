@@ -128,6 +128,52 @@ production model stayed on the pre-widening checkpoint (88.6%/79.2%
 above); this widened dataset is committed (`451799e`) but was never
 deployed.
 
+**The real next target, measured on hardware: tool-calling collapses once
+the conversation has any history.** Found on the Pixel after deploying the
+88.6% checkpoint, by holding everything else fixed and varying only the
+number of prior turns in context (5 identical requests per depth, the
+production system prompt, all five tools, `reasoning=off`):
+
+| prior turns in context | `read_spatial_sensors` called |
+|---:|---:|
+| 0 | **5/5** |
+| 1 | **0/5** |
+| 2 | **0/5** |
+| 3 | **0/5** |
+
+At depth 0 it is perfect. From the very first follow-up turn onward it
+stops calling the tool entirely and instead *recites the number from
+earlier in the conversation* — "299 centimeters, Dave." — which is the
+original invent-telemetry bug wearing a plausible face, and a direct
+violation of the system prompt's "Never invent telemetry". It is not
+flaky: 0/5, reproducible on demand.
+
+The cause is a dataset gap, not a template or serving problem. Ruled out
+empirically, in this order: llama.cpp's tool parsing (6/6 clean when the
+same request is sent with no history), the payload shape (20/20 across 1,
+4 and 5 tools with the real system prompt), `--jinja` (on by default in
+this build), and `enable_thinking` (0/5 with thinking forced on as well).
+A system-prompt rule spelling out "readings earlier in this conversation
+are stale, always call the tool again" also does nothing (0/5) — the
+fine-tune's learned pattern overrides prompt instruction, which is itself
+worth remembering.
+
+`multi_turn_context` (60 examples) is the category meant to cover this,
+but every one of its examples precedes the tool call with *unrelated
+chit-chat*. The model therefore learned "history of chit-chat → still call
+the tool" and never learned "history containing a previous reading → the
+reading is stale, call it again". `eval_harness.py` scores 100% on that
+category precisely because it only ever tests the chit-chat shape, so the
+88.6% headline is blind to this failure — **the eval needs the new case as
+much as the dataset does.**
+
+Next iteration should add repeated-query examples (ask, answer from a real
+tool result, then ask the same or an adjacent sensor question again, with
+the second turn still requiring a fresh call) and a matching eval category,
+then re-measure this table before anything else. Note the lesson from the
+estop dead end above: change one thing, and keep the reply text fixed while
+varying the input shape.
+
 ## One open design decision -- flagging rather than deciding silently
 
 **Left/right turn convention: now hardware-confirmed.** A raw `turn(90, 8)`

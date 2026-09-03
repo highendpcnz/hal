@@ -39,7 +39,14 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 # is deliberately NOT rewritten here -- that is a model-quality gap for the next
 # fine-tune, and regexing pronouns would corrupt legitimate replies.
 _LEADING_ROLE_RE = re.compile(r"^(?:model|assistant)\s*[:\n]\s*", re.IGNORECASE)
-_TEMPLATE_TOKEN_RE = re.compile(r"<\|?(?:tool_response|tool_call|turn|channel|tool)\|?>")
+# Both the well-formed markers and the garbled approximations the model actually
+# produces: '<tool|>user\n...' and '<tool:read_spatial_sensors{}</tool>' were both
+# seen live, the latter being a mangled '<|tool_call>call:NAME{...}<tool_call|>'
+# that llama.cpp could not parse, so it surfaced as ordinary content.
+_TEMPLATE_TOKEN_RE = re.compile(
+    r"<\|?/?(?:tool_response|tool_call|turn|channel|tool)\b[:|>]"
+    r"|</(?:tool_response|tool_call|turn|channel|tool)>"
+)
 
 
 def _sanitize_reply(content: str) -> str:

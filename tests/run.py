@@ -2910,6 +2910,21 @@ check(
     "question back at him",
     _sanitize_leaked is not None and "template" in _sanitize_leaked,
 )
+_sanitize_garbled = None
+try:
+    gemma._sanitize_reply("<tool:read_spatial_sensors{}</tool>")
+except BrainProviderError as exc:
+    _sanitize_garbled = str(exc)
+check(
+    "gemma._sanitize_reply rejects a garbled tool-call marker llama.cpp could not parse, "
+    "which would otherwise be read aloud verbatim",
+    _sanitize_garbled is not None,
+)
+check(
+    "gemma._sanitize_reply does not flag ordinary prose containing the word tool",
+    gemma._sanitize_reply("That tool: the gripper, is not fitted, Dave.")
+    == "That tool: the gripper, is not fitted, Dave.",
+)
 
 print()
 if FAILURES:
