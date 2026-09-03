@@ -104,6 +104,30 @@ category's widening targets the second, more safety-critical pattern
 directly; a real re-run and re-eval is needed to confirm it actually
 helped rather than just adding volume.
 
+**Dead end, confirmed live: the estop widening regressed, don't repeat
+this shape of change.** Re-run and re-eval (retrained from this widened
+1300-example set, same procedure) came back *worse*, not better: 83.8%
+overall (300/358) and **64.6%** on `estop_positive` itself, down from
+79.2%. The failure mode also spread to other tool-calling categories that
+share the same `tool_call → tool_result → assistant reply` shape
+(`sensor_read_positive` 62.5%, `vision_positive` 55.6%, `relay_success`
+71.4%) — the model started outputting a confident confirmation ("Halted.",
+"All motors stopped.", "I'm not tilted, Dave.") *instead of* the tool
+call, i.e. a worse version of the exact bug this was meant to fix. The
+widening bundled two changes: more unique trigger phrases (`ESTOP_PHRASES`
+12→~40, the intended fix) and, new in this pass, a 6-way randomized
+`ESTOP_REPLIES` pool for the post-tool-call confirmation text (previously
+effectively fixed). The leading hypothesis is the reply diversification,
+not the phrase widening — six replies randomly paired across ~40 phrases
+may have taught the model that varied natural-language confirmation is
+itself an acceptable output, bleeding into other categories with the same
+structural shape. **Not yet isolated or retested**: a future attempt
+should revert `ESTOP_REPLIES` to a single fixed string, keep the phrase
+widening, and re-run in isolation before touching anything else. The
+production model stayed on the pre-widening checkpoint (88.6%/79.2%
+above); this widened dataset is committed (`451799e`) but was never
+deployed.
+
 ## One open design decision -- flagging rather than deciding silently
 
 **Left/right turn convention: now hardware-confirmed.** A raw `turn(90, 8)`

@@ -244,6 +244,23 @@ def main() -> None:
     model.save_pretrained(str(LORA_ADAPTER_DIR))
     tokenizer.save_pretrained(str(LORA_ADAPTER_DIR))
 
+    # Confirmed live on Kaggle: the merge step below ran the output disk
+    # (19.5GB quota) out of space and silently corrupted a shard mid-write --
+    # unsloth caches the ~9.5GB base-model download *inside* the working
+    # filesystem (not just ~/.cache), and that plus the ~10GB fp16 merge
+    # output exceeds the quota exactly. Nothing past this point needs the
+    # base model's cached files or the training checkpoints (the adapter
+    # above is already saved), so clear them first to guarantee headroom.
+    import shutil
+    for cache_dir in (
+        Path.home() / ".cache" / "huggingface",
+        Path(os.environ.get("HF_HOME", "")) if os.environ.get("HF_HOME") else None,
+        Path(os.environ.get("TRANSFORMERS_CACHE", "")) if os.environ.get("TRANSFORMERS_CACHE") else None,
+    ):
+        if cache_dir and cache_dir.is_dir():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+    shutil.rmtree(OUTPUT_DIR / "checkpoints", ignore_errors=True)
+
     print(f"merging to fp16 and saving to {MERGED_DIR}")
     model.save_pretrained_merged(str(MERGED_DIR), tokenizer, save_method="merged_16bit")
 
