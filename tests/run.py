@@ -2437,6 +2437,8 @@ check(
 import robot.android_usb as _android_usb_mod  # noqa: E402
 from brain.events import EventHub  # noqa: E402
 from brain.gemma import GemmaProvider  # noqa: E402
+from brain import gemma  # noqa: E402
+from brain.base import BrainProviderError  # noqa: E402
 
 _gemma_provider = GemmaProvider(EventHub())
 _gemma_provider.robot_port = "/dev/fake-cyberpi-test-port"
@@ -2876,6 +2878,37 @@ check(
     "train_lora._template_ready_messages leaves non-tool-call messages untouched",
     train_lora._template_ready_messages([{"role": "user", "content": "hi"}])
     == [{"role": "user", "content": "hi"}],
+)
+
+# Post-tool-response replies carry no '<|turn>model' header (the tool call already
+# opened the turn), so the model improvises the boundary -- confirmed live on the
+# Pixel at reasoning=off. See brain/gemma.py's _sanitize_reply comment.
+check(
+    "gemma._sanitize_reply strips a leaked 'model' speaker label the template did not emit",
+    gemma._sanitize_reply("model\nI can see 299 centimeters ahead.")
+    == "I can see 299 centimeters ahead.",
+)
+check(
+    "gemma._sanitize_reply leaves an ordinary reply untouched",
+    gemma._sanitize_reply("  The wall is 299 centimeters ahead, Dave.  ")
+    == "The wall is 299 centimeters ahead, Dave.",
+)
+check(
+    "gemma._sanitize_reply does not eat a legitimate sentence merely starting with 'model'",
+    gemma._sanitize_reply("Model railways are outside my remit, Dave.")
+    == "Model railways are outside my remit, Dave.",
+)
+_sanitize_leaked = None
+try:
+    gemma._sanitize_reply(
+        'HAL read_spatial_sensors: {"ultrasonic_cm":299}<tool|>user\nHow far away is the wall?'
+    )
+except BrainProviderError as exc:
+    _sanitize_leaked = str(exc)
+check(
+    "gemma._sanitize_reply rejects leaked template structure rather than speaking Dave's own "
+    "question back at him",
+    _sanitize_leaked is not None and "template" in _sanitize_leaked,
 )
 
 print()

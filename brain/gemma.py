@@ -21,6 +21,37 @@ from .events import EventHub
 
 FAILURE_LINE = "I'm sorry, Dave. My local reasoning engine is unavailable."
 _SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+# Gemma 4's chat template deliberately opens no new '<|turn>model' header for an
+# assistant reply that *follows a tool response* -- that reply continues the model
+# turn the tool call already opened (finetune/chat_template.jinja's
+# `continue_same_model_turn`), and the generation-prompt branch mirrors it. Training
+# and inference agree, so this is not a template mismatch -- but with no header to
+# anchor it, the model has to produce the turn boundary itself, and confirmed live
+# on the Pixel (fine-tuned model, reasoning=off) it sometimes gets it wrong: three
+# identical requests returned "model\nI can see...", "HAL measured. The wall is...",
+# and once the raw template continuation
+# '...{"ultrasonic_cm":299}<tool|>user\nHow far away is the wall in front of you?'
+# -- Dave's own question, which would then be spoken back at him.
+#
+# Strip the benign speaker label; treat leaked template structure as a failed
+# generation rather than reading it aloud. Third-person narration ("HAL measured")
+# is deliberately NOT rewritten here -- that is a model-quality gap for the next
+# fine-tune, and regexing pronouns would corrupt legitimate replies.
+_LEADING_ROLE_RE = re.compile(r"^(?:model|assistant)\s*[:\n]\s*", re.IGNORECASE)
+_TEMPLATE_TOKEN_RE = re.compile(r"<\|?(?:tool_response|tool_call|turn|channel|tool)\|?>")
+
+
+def _sanitize_reply(content: str) -> str:
+    """Drop turn-marker artifacts; reject replies that leaked template structure."""
+    text = _LEADING_ROLE_RE.sub("", content.strip(), count=1).strip()
+    if _TEMPLATE_TOKEN_RE.search(text):
+        raise BrainProviderError("Gemma leaked chat-template structure into its reply")
+    if not text:
+        raise BrainProviderError("Gemma returned an empty response")
+    return text
+
+
 _READ_SPATIAL_SENSORS = {
     "type": "function",
     "function": {
@@ -230,7 +261,7 @@ class GemmaProvider:
                 content = message.get("content")
                 if not isinstance(content, str) or not content.strip():
                     raise BrainProviderError("Gemma returned an empty response")
-                return content.strip()
+                return _sanitize_reply(content)
             working.append(message)
             for call in tool_calls:
                 result, extra_messages = await self._execute_tool(call, session_id)
