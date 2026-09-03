@@ -77,6 +77,7 @@ def capture_frame_termux(
     timeout: float = 8.0,
     termux_camera_bin: str = "termux-camera-photo",
     ffmpeg_bin: str = "ffmpeg",
+    rotate: int = 2,
 ) -> tuple[bytes, int, int]:
     """Grab one JPEG frame from the Pixel's own camera via Termux:API.
 
@@ -92,6 +93,18 @@ def capture_frame_termux(
     a real capture from ~2.2MB to ~3KB. Raises `CameraCaptureError` on any
     failure — missing binary, no camera permission, or timeout — so callers
     can surface a clean tool-result error instead of crashing the turn.
+
+    `termux-camera-photo` writes no EXIF orientation tag at all (confirmed
+    via `ffprobe` on a live capture — the tag is simply absent, not just
+    unread), so the raw buffer comes out in the sensor's native landscape
+    layout regardless of how the phone is physically mounted on the chassis.
+    `rotate` is an `ffmpeg` `transpose` value (0-3) applied before the
+    resize/scale step to correct this. `2` (90° counter-clockwise) is
+    confirmed live 2026-09-04 as correct for this chassis's actual camera
+    mount — verified by capturing the same raw frame through all four
+    transpose values and checking which one puts the floor at the bottom
+    with objects resting on it under gravity, not the ceiling. Re-verify and
+    override via `HAL_CAMERA_ROTATE` if the phone is ever remounted.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_path = Path(tmpdir) / "raw.jpg"
@@ -112,6 +125,11 @@ def capture_frame_termux(
         if raw_size == 0:
             raise CameraCaptureError("termux-camera-photo produced an empty file")
 
+        if rotate not in (0, 1, 2, 3):
+            raise CameraCaptureError(f"invalid rotate value: {rotate} (must be 0-3)")
+        video_filter = f"scale={width}:{height}"
+        if rotate:
+            video_filter = f"transpose={rotate},{video_filter}"
         resize_command = [
             ffmpeg_bin,
             "-hide_banner",
@@ -120,7 +138,7 @@ def capture_frame_termux(
             "-i",
             str(raw_path),
             "-vf",
-            f"scale={width}:{height}",
+            video_filter,
             "-q:v",
             "3",
             "-f",
@@ -151,6 +169,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     parser.add_argument("--termux-camera-bin", default="termux-camera-photo")
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=2,
+        choices=(0, 1, 2, 3),
+        help="termux backend: ffmpeg transpose value to correct the chassis camera mount (default 2, confirmed live for the current mount)",
+    )
     parser.add_argument("--out", type=Path, default=Path("capture.jpg"))
     args = parser.parse_args(argv)
 
@@ -163,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=args.timeout,
                 termux_camera_bin=args.termux_camera_bin,
                 ffmpeg_bin=args.ffmpeg_bin,
+                rotate=args.rotate,
             )
         else:
             image_bytes, width, height = capture_frame(

@@ -201,6 +201,7 @@ class GemmaProvider:
         self.camera_width = int(os.environ.get("HAL_CAMERA_WIDTH", "640"))
         self.camera_height = int(os.environ.get("HAL_CAMERA_HEIGHT", "480"))
         self.camera_timeout = float(os.environ.get("HAL_CAMERA_TIMEOUT", "5"))
+        self.camera_rotate = int(os.environ.get("HAL_CAMERA_ROTATE", "2"))
         self.ffmpeg_bin = os.environ.get("HAL_FFMPEG_BIN", "ffmpeg")
         self.termux_camera_bin = os.environ.get("HAL_TERMUX_CAMERA_BIN", "termux-camera-photo")
         self._request_json = request_json or self._post_json
@@ -517,6 +518,7 @@ class GemmaProvider:
             timeout=self.camera_timeout,
             termux_camera_bin=self.termux_camera_bin,
             ffmpeg_bin=self.ffmpeg_bin,
+            rotate=self.camera_rotate,
         )
 
     def _capture_frame_ffmpeg(self) -> tuple[bytes, int, int]:
