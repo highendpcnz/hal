@@ -415,12 +415,67 @@ played it through the phone's speaker via `termux-media-player play
 ## On-device listen/speak loop (`termux_voice.py`) — verified end to end
 
 `HAL_TERMUX_LISTEN=1` starts a background loop (wired into `main.py`'s
-`lifespan`, alongside the existing `viewscreen_task`) that is a genuinely
-separate path from the Mac's browser-audio endpoints, not an engine swap —
-see the module's own docstring for why `termux-speech-to-text` can't slot
-into `transcribe(audio_bytes)`. It calls `run_turn()` directly (the same
-function `/api/say` uses), so it gets the full existing brain/history/TTS
-pipeline for free.
+`lifespan`, alongside the existing `viewscreen_task`). It calls `run_turn()`
+directly (the same function `/api/say` uses), so it gets the full existing
+brain/history/TTS pipeline for free.
+
+**Superseded 2026-09-05 — the loop now defaults to whisper.cpp, not Android
+STT.** The paragraph that used to sit here said `termux-speech-to-text`
+could not slot into `transcribe(audio_bytes)` and that this was therefore
+"a genuinely separate path, not an engine swap". The first half is still
+true of *that command* — it returns text, never audio, so there is nothing
+to hand to `transcribe()`. The conclusion drawn from it was wrong: the
+answer was not to keep a separate text-only path, but to stop using that
+command. `termux-microphone-record` **does** return audio, and those bytes
+go straight into the existing `transcribe()`, whisper.cpp and all. It is an
+engine swap after all, just not the one that was ruled out.
+
+What forced it: on the Pixel under test (Android SDK 37),
+`termux-speech-to-text` **hangs forever and returns nothing at all** — no
+transcript, no error, no timeout of its own. Confirmed 2026-09-05 with HAL
+fully stopped, no competing or orphaned processes, run foregrounded in
+Termux itself, screen on and unlocked, microphone permission granted to
+both Termux:API *and* the Google app, a default assistant set, and working
+internet. Raw `termux-microphone-record` captured a clean 5.2s clip
+throughout, so the microphone was never the problem; Android's recognizer
+service is. Note also that an interrupted call leaves an orphaned
+`termux-speech-to-text` process reparented to init, which then holds the
+recognizer indefinitely — these accumulate silently across restarts.
+
+Selected by `HAL_TERMUX_STT_BACKEND` (`whispercpp` default, `android` still
+available). Measured live on the Pixel: STT 1.5s, full turn ~10s — far
+better than the 30–60s this document warns about elsewhere for a local
+Gemma turn.
+
+Two failure modes had to be solved together, and neither is optional:
+
+1. **base.en does not hear the name.** A spoken "HAL, open the pod bay
+   doors, HAL... hey HAL" came back as `"How? Open the pod bay doors, huh?
+   Hey, how?"` — so the wake gate never fired and the loop looked deaf.
+   Fixed at source with an STT bias prompt (`HAL_STT_PROMPT`), chosen
+   against that real recording. Beware the obvious trap here: a prompt
+   containing the test phrase gets parroted back and proves nothing. The
+   shipped prompt deliberately contains none of it, and still recovers
+   "HAL" at both ends of the utterance. Bare repetition
+   (`"HAL. HAL. HAL 9000."`) is actively harmful — it collapsed the whole
+   transcript to a single word.
+2. **Whisper invents speech from silence.** An empty room produced
+   `"That's why you didn't harm me, look. You should work there."`, and
+   live ambient noise produced `"No. Shuma. Come on."` and
+   `"Cold-blooded mutter."`. A hallucination can contain a wake word, so an
+   ungated loop can wake *itself*. Clips whose peak is below
+   `HAL_TERMUX_SILENCE_DBFS` never reach whisper. A bias prompt increases
+   hallucination on quiet input, so (1) makes this gate more necessary, not
+   less — they ship together.
+
+Residual mishearings are recovered positionally in `_heard_wake_word`:
+`hall` matches anywhere, while `hell`/`howl`/`how`/`huh` count only as an
+address — leading or trailing, followed by punctuation. `main.py`'s browser
+gate had already rejected "how" on the grounds it "would wake on ordinary
+ambient questions", which is correct for a match-anywhere rule; the
+positional restriction keeps that property while still waking on the real
+misheard transcript. `"How? Open the pod bay doors, huh?"` wakes;
+`"How are you feeling today?"` and `"I don't know how"` do not.
 
 Also required a real fix to `main.py` itself: `_load_stt()`'s failure
 (`ctranslate2.models` missing `Whisper`, see above) previously crashed the
