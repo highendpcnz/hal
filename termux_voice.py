@@ -85,9 +85,41 @@ SILENCE_PEAK_DBFS = float(os.environ.get("HAL_TERMUX_SILENCE_DBFS", "-45"))
 _WAKE_STRONG_VARIANTS = ("hall",)
 _WAKE_ADDRESS_VARIANTS = ("hell", "howl", "how", "huh")
 
+# Require an attention word ("hey HAL") rather than the bare name.
+#
+# A bare name cannot be made safe against a television. Confirmed live
+# 2026-09-05: a film playing in the room produced the transcript "HAL, the
+# real value of a conflict, the true value, is in the dead." — a textbook
+# address, at the start of the utterance, indistinguishable from a real one
+# by any text rule. HAL answered it. Given enough hours of dialogue, some
+# line will always transcribe as the name.
+#
+# "hey <name>" is what every commercial assistant requires, for exactly this
+# reason: two ordered tokens are vanishingly rare in ambient speech, while a
+# common single word is not. It also *relaxes* the homophone problem — "hey
+# how" is unmistakably an address, so the variants no longer need the
+# positional restrictions a bare name did, which improves recall and
+# precision at once.
+#
+# The cost is real and worth stating: "Open the pod bay doors, HAL" no longer
+# wakes anything. Set HAL_WAKE_REQUIRE_ATTENTION=0 to take the bare name back,
+# along with the televisions that come with it.
+WAKE_REQUIRE_ATTENTION = os.environ.get(
+    "HAL_WAKE_REQUIRE_ATTENTION", "1"
+).strip().lower() not in {"0", "false", "no"}
+_ATTENTION_WORDS = ("hey", "hi", "ok", "okay", "hello")
+
 
 def _address_variant_pattern() -> str:
     return "|".join(re.escape(variant) for variant in _WAKE_ADDRESS_VARIANTS)
+
+
+def _attention_pattern(wake_word: str) -> str:
+    attention = "|".join(_ATTENTION_WORDS)
+    names = [re.escape(wake_word)]
+    if wake_word.lower() == "hal":
+        names += [re.escape(v) for v in _WAKE_STRONG_VARIANTS + _WAKE_ADDRESS_VARIANTS]
+    return rf"\b(?:{attention})\b[\s,]*\b(?:{'|'.join(names)})\b"
 
 
 def _heard_wake_word(text: str, wake_word: str = WAKE_WORD) -> bool:
@@ -103,6 +135,12 @@ def _heard_wake_word(text: str, wake_word: str = WAKE_WORD) -> bool:
 
     if not wake_word:
         return True
+
+    if WAKE_REQUIRE_ATTENTION:
+        # "hey HAL" and its homophones, nothing else. No positional rules are
+        # needed: the attention word is what makes it an address.
+        return re.search(_attention_pattern(wake_word), text, re.IGNORECASE) is not None
+
     if re.search(rf"\b{re.escape(wake_word)}\b", text, re.IGNORECASE) is not None:
         return True
     if wake_word.lower() != "hal":
@@ -292,8 +330,12 @@ async def listen_loop(
     print(f"[termux-voice] stt backend: {'whisper.cpp' if use_whisper else 'android'}")
     if use_whisper:
         print(f"[termux-voice] clip {CLIP_SECONDS}s, silence gate {SILENCE_PEAK_DBFS} dBFS")
-    if WAKE_WORD:
-        print(f"[termux-voice] wake word required: {WAKE_WORD!r}")
+    if WAKE_WORD and WAKE_REQUIRE_ATTENTION:
+        print(f"[termux-voice] wake phrase required: 'hey {WAKE_WORD}' "
+              f"(attention word: {'/'.join(_ATTENTION_WORDS)})")
+    elif WAKE_WORD:
+        print(f"[termux-voice] wake word required: {WAKE_WORD!r} (bare name — "
+              "will false-wake on televised dialogue)")
     else:
         print("[termux-voice] no wake word set — answering everything heard nearby")
     while True:

@@ -2548,12 +2548,65 @@ check(
 
 import termux_voice  # noqa: E402
 
+import contextlib  # noqa: E402
+
+
+@contextlib.contextmanager
+def _bare_name_wake():
+    """The pre-2026-09-05 behaviour: the bare name wakes, no "hey" needed.
+    Still supported via HAL_WAKE_REQUIRE_ATTENTION=0, so it stays tested."""
+    original = termux_voice.WAKE_REQUIRE_ATTENTION
+    termux_voice.WAKE_REQUIRE_ATTENTION = False
+    try:
+        yield
+    finally:
+        termux_voice.WAKE_REQUIRE_ATTENTION = original
+
+
+# ---- default: an attention word is required ("hey HAL") ----
+# A bare name cannot be made safe against a television: a film in the room
+# produced "HAL, the real value of a conflict..." — a perfect address by any
+# text rule — and HAL answered it (confirmed live 2026-09-05).
 check(
-    "wake word matches as a whole word, case-insensitively",
-    termux_voice._heard_wake_word("Hal, drive forward", "hal")
+    "attention wake phrase matches, case-insensitively",
+    termux_voice._heard_wake_word("Hey HAL, drive forward", "hal")
     and termux_voice._heard_wake_word("hey HAL what do you see", "hal")
-    and termux_voice._heard_wake_word("HAL", "hal"),
+    and termux_voice._heard_wake_word("Hello HAL", "hal")
+    and termux_voice._heard_wake_word("OK Hal, stop", "hal"),
 )
+check(
+    "attention wake tolerates the homophones whisper produces for the name",
+    termux_voice._heard_wake_word("Hey, how?", "hal")
+    and termux_voice._heard_wake_word("hey hell, what do you see", "hal")
+    and termux_voice._heard_wake_word("Hey huh, are you there", "hal")
+    and termux_voice._heard_wake_word("hey hall stop", "hal"),
+)
+check(
+    "the real televised false wake is now rejected",
+    not termux_voice._heard_wake_word(
+        "HAL, the real value of a conflict, the true value, is in the dead.", "hal"
+    ),
+)
+check(
+    "a bare name no longer wakes when attention is required",
+    not termux_voice._heard_wake_word("HAL, are you there?", "hal")
+    and not termux_voice._heard_wake_word("Open the pod bay doors, HAL", "hal")
+    and not termux_voice._heard_wake_word("How's it going, Hal?", "hal"),
+)
+check(
+    "an attention word alone does not wake",
+    not termux_voice._heard_wake_word("hey, are you there", "hal")
+    and not termux_voice._heard_wake_word("okay then, let's go", "hal")
+    and not termux_voice._heard_wake_word("hello there", "hal"),
+)
+
+with _bare_name_wake():
+    check(
+        "wake word matches as a whole word, case-insensitively",
+        termux_voice._heard_wake_word("Hal, drive forward", "hal")
+        and termux_voice._heard_wake_word("hey HAL what do you see", "hal")
+        and termux_voice._heard_wake_word("HAL", "hal"),
+    )
 check(
     "wake word does not match inside another word",
     not termux_voice._heard_wake_word("please halt", "hal")
@@ -2575,18 +2628,19 @@ check(
     "the real misheard 'HAL' transcript wakes the loop",
     termux_voice._heard_wake_word("How? Open the pod bay doors, huh? Hey, how?", "hal"),
 )
-check(
-    "leading misheard address variants wake",
-    termux_voice._heard_wake_word("How? Open the doors", "hal")
-    and termux_voice._heard_wake_word("Hell, drive forward", "hal")
-    and termux_voice._heard_wake_word("Howl, what do you see?", "hal")
-    and termux_voice._heard_wake_word("Hey, how, stop now", "hal"),
-)
-check(
-    "trailing misheard address variants wake",
-    termux_voice._heard_wake_word("Open the pod bay doors, huh?", "hal")
-    and termux_voice._heard_wake_word("Hey, how?", "hal"),
-)
+with _bare_name_wake():
+    check(
+        "leading misheard address variants wake",
+        termux_voice._heard_wake_word("How? Open the doors", "hal")
+        and termux_voice._heard_wake_word("Hell, drive forward", "hal")
+        and termux_voice._heard_wake_word("Howl, what do you see?", "hal")
+        and termux_voice._heard_wake_word("Hey, how, stop now", "hal"),
+    )
+    check(
+        "trailing misheard address variants wake",
+        termux_voice._heard_wake_word("Open the pod bay doors, huh?", "hal")
+        and termux_voice._heard_wake_word("Hey, how?", "hal"),
+    )
 # The whole reason main.py's browser gate refused "how": it is an ordinary
 # English word. Recovery is therefore positional — a bare question opening
 # with "how" is not an address and must stay silent, or an always-listening
@@ -2603,10 +2657,16 @@ check(
     and not termux_voice._heard_wake_word("that is how it works", "hal")
     and not termux_voice._heard_wake_word("what the hell is that noise", "hal"),
 )
+with _bare_name_wake():
+    check(
+        "homophone recovery is specific to the name 'hal'",
+        not termux_voice._heard_wake_word("How? Open the doors", "computer")
+        and termux_voice._heard_wake_word("Computer, open the doors", "computer"),
+    )
 check(
-    "homophone recovery is specific to the name 'hal'",
-    not termux_voice._heard_wake_word("How? Open the doors", "computer")
-    and termux_voice._heard_wake_word("Computer, open the doors", "computer"),
+    "a different wake word still works with an attention prefix",
+    termux_voice._heard_wake_word("Hey computer, open the doors", "computer")
+    and not termux_voice._heard_wake_word("Hey how, open the doors", "computer"),
 )
 check(
     "silence gate rejects a quiet clip before it reaches whisper",
@@ -2667,7 +2727,7 @@ async def _exercise_wake_word_gate() -> tuple[list[tuple[str, str]], list[bytes]
     utterances = iter(
         [
             "just some unrelated ambient conversation",
-            "HAL, please respond",
+            "Hey HAL, please respond",
             None,
         ]
     )
@@ -2703,7 +2763,7 @@ async def _exercise_wake_word_gate() -> tuple[list[tuple[str, str]], list[bytes]
 _wake_gate_calls, _wake_gate_spoken = asyncio.run(_exercise_wake_word_gate())
 check(
     "listen_loop ignores an utterance without the wake word and answers one with it",
-    _wake_gate_calls == [(termux_voice.SESSION_ID, "HAL, please respond")]
+    _wake_gate_calls == [(termux_voice.SESSION_ID, "Hey HAL, please respond")]
     and _wake_gate_spoken == [b"wav-bytes"],
 )
 
