@@ -336,7 +336,7 @@ async def lifespan(_app: FastAPI):
         import termux_voice
 
         termux_listen_task = asyncio.create_task(
-            termux_voice.listen_loop(run_turn), name="termux-listen"
+            termux_voice.listen_loop(run_turn, transcribe), name="termux-listen"
         )
     if BOOT_RITUAL:
         _pending_announcements.append(_boot_ritual_line())

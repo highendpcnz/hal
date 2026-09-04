@@ -2567,6 +2567,51 @@ check(
     "empty wake word disables the gate",
     termux_voice._heard_wake_word("anything at all", ""),
 )
+# The exact transcript whisper.cpp base.en returned for a spoken "HAL, open the
+# pod bay doors, HAL... hey HAL" on this hardware (2026-09-05). Before the
+# homophone recovery below this woke nothing at all, which is what made the
+# on-device loop look completely deaf.
+check(
+    "the real misheard 'HAL' transcript wakes the loop",
+    termux_voice._heard_wake_word("How? Open the pod bay doors, huh? Hey, how?", "hal"),
+)
+check(
+    "leading misheard address variants wake",
+    termux_voice._heard_wake_word("How? Open the doors", "hal")
+    and termux_voice._heard_wake_word("Hell, drive forward", "hal")
+    and termux_voice._heard_wake_word("Howl, what do you see?", "hal")
+    and termux_voice._heard_wake_word("Hey, how, stop now", "hal"),
+)
+check(
+    "trailing misheard address variants wake",
+    termux_voice._heard_wake_word("Open the pod bay doors, huh?", "hal")
+    and termux_voice._heard_wake_word("Hey, how?", "hal"),
+)
+# The whole reason main.py's browser gate refused "how": it is an ordinary
+# English word. Recovery is therefore positional — a bare question opening
+# with "how" is not an address and must stay silent, or an always-listening
+# robot wakes on half the conversation in the room.
+check(
+    "ordinary questions opening with a variant do NOT wake",
+    not termux_voice._heard_wake_word("How are you feeling today?", "hal")
+    and not termux_voice._heard_wake_word("How do I get to the shops", "hal")
+    and not termux_voice._heard_wake_word("Howl at the moon they said", "hal"),
+)
+check(
+    "a variant buried mid-sentence does NOT wake",
+    not termux_voice._heard_wake_word("I don't know how", "hal")
+    and not termux_voice._heard_wake_word("that is how it works", "hal")
+    and not termux_voice._heard_wake_word("what the hell is that noise", "hal"),
+)
+check(
+    "homophone recovery is specific to the name 'hal'",
+    not termux_voice._heard_wake_word("How? Open the doors", "computer")
+    and termux_voice._heard_wake_word("Computer, open the doors", "computer"),
+)
+check(
+    "silence gate rejects a quiet clip before it reaches whisper",
+    termux_voice.SILENCE_PEAK_DBFS > -999.0,
+)
 
 
 async def _exercise_wake_word_gate() -> tuple[list[tuple[str, str]], list[bytes]]:

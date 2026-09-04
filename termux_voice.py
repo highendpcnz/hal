@@ -18,6 +18,21 @@ answers *anything* it hears near the phone with no addressing at all, which
 during bring-up genuinely picked up unrelated real conversation nearby and
 answered it. Set HAL_WAKE_WORD="" to disable the gate and go back to that
 always-answering behavior.
+
+Two STT backends, selected by HAL_TERMUX_STT_BACKEND:
+
+  "whispercpp" (default) — record a bounded clip with `termux-microphone-record`,
+      hand the bytes to the caller-supplied transcribe(), which is main.py's
+      whisper.cpp-backed one. Chosen as the default because the "android"
+      backend below is hardware-confirmed broken on this phone.
+  "android" — the original `termux-speech-to-text` path. On this Pixel
+      (Android SDK 37) that command hangs forever and returns nothing at all:
+      confirmed 2026-09-05 with HAL stopped, no competing processes, run
+      foregrounded, screen unlocked, mic permission granted to both Termux:API
+      and the Google app, assistant set, and working internet. Raw
+      `termux-microphone-record` captured fine throughout, so the microphone
+      is not the problem — Android's recognizer service is. Kept because it
+      needs no whisper build and may work on other devices/versions.
 """
 
 from __future__ import annotations
@@ -29,7 +44,7 @@ import re
 import subprocess
 import tempfile
 import wave
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 SESSION_ID = "termux-onboard"
 LISTEN_TIMEOUT_SECONDS = 30.0
@@ -39,16 +54,75 @@ LISTEN_TIMEOUT_SECONDS = 30.0
 PLAYBACK_SETTLE_SECONDS = 0.4
 WAKE_WORD = os.environ.get("HAL_WAKE_WORD", "hal").strip()
 
+STT_BACKEND = os.environ.get("HAL_TERMUX_STT_BACKEND", "whispercpp").strip().lower()
+# One bounded capture per loop iteration. `termux-microphone-record` needs an
+# explicit length; there is no streaming/VAD source to end a clip on silence.
+CLIP_SECONDS = float(os.environ.get("HAL_TERMUX_CLIP_SECONDS", "6"))
+# The recorder returns as soon as capture *starts* (it backgrounds an Android
+# MediaRecorder), and the file is not complete the instant the duration
+# elapses — read too early and you transcribe a truncated clip.
+RECORD_FINALISE_SECONDS = 1.5
+# whisper invents fluent speech from near-silence: a genuinely silent room
+# produced "That's why you didn't harm me, look. You should work there."
+# (measured 2026-09-04). A hallucination can contain a wake word, so an
+# unmetered loop would wake itself on silence. Clips whose peak is below this
+# never reach whisper at all. Raising HAL_STT_PROMPT's specificity makes this
+# gate more important, not less — the bias prompt increases hallucination on
+# quiet input.
+SILENCE_PEAK_DBFS = float(os.environ.get("HAL_TERMUX_SILENCE_DBFS", "-45"))
+
+# How base.en actually renders the spoken name "HAL" — measured on this
+# hardware, not guessed. "HAL, open the pod bay doors, HAL... hey HAL" came
+# back as "How? Open the pod bay doors, huh? Hey, how?" (2026-09-05).
+# `main.py`'s browser-side gate accepts hal/hall/hell and explicitly rejected
+# "how" because it "would wake on ordinary ambient questions" — which is
+# correct for a match-anywhere rule. These looser variants are therefore only
+# honoured in an *addressing position*: leading or trailing, and followed by
+# punctuation. "How? Open the doors" and "Hey, how?" wake; "How are you" and
+# "I don't know how" do not.
+_WAKE_STRONG_VARIANTS = ("hall",)
+_WAKE_ADDRESS_VARIANTS = ("hell", "howl", "how", "huh")
+
+
+def _address_variant_pattern() -> str:
+    return "|".join(re.escape(variant) for variant in _WAKE_ADDRESS_VARIANTS)
+
 
 def _heard_wake_word(text: str, wake_word: str = WAKE_WORD) -> bool:
     """Whole-word, case-insensitive match — "hal" must not match inside
     "halt" or "shall". An empty wake_word disables the gate entirely (every
     utterance passes), matching how other HAL_* flags in this project treat
-    an empty string as "off"."""
+    an empty string as "off".
+
+    When the wake word is the default "hal", also recover the homophones
+    whisper actually produces for it (see the variant tables above). Any
+    other configured wake word is matched literally only — the variants are
+    specific to how "HAL" is misheard and mean nothing for another name."""
 
     if not wake_word:
         return True
-    return re.search(rf"\b{re.escape(wake_word)}\b", text, re.IGNORECASE) is not None
+    if re.search(rf"\b{re.escape(wake_word)}\b", text, re.IGNORECASE) is not None:
+        return True
+    if wake_word.lower() != "hal":
+        return False
+
+    for variant in _WAKE_STRONG_VARIANTS:
+        if re.search(rf"\b{re.escape(variant)}\b", text, re.IGNORECASE):
+            return True
+
+    loose = _address_variant_pattern()
+    # Leading address: "How? Open the pod bay doors" / "Hey, how, drive forward".
+    # The trailing punctuation is what separates an address from a question
+    # that merely opens with the same word ("How are you?").
+    if re.search(rf"^\s*(?:hey|ok|okay)?[,\s]*(?:{loose})\s*[,.!?:]", text, re.IGNORECASE):
+        return True
+    # Trailing address: "..., huh?" / "Hey, how?". The comma (or a "hey")
+    # is doing the work — "I don't know how" has neither and must not wake.
+    if re.search(
+        rf"(?:^|,)\s*(?:hey\s*,?\s*)?(?:{loose})\s*[,.!?:]*\s*$", text, re.IGNORECASE
+    ):
+        return True
+    return False
 
 
 async def listen_once(timeout: float = LISTEN_TIMEOUT_SECONDS) -> str:
@@ -70,6 +144,92 @@ async def listen_once(timeout: float = LISTEN_TIMEOUT_SECONDS) -> str:
         print(f"[termux-voice] termux-speech-to-text exited {completed.returncode}")
         return ""
     return completed.stdout.strip()
+
+
+def _peak_dbfs(path: Path, ffmpeg_bin: str = "ffmpeg") -> float:
+    """Peak level of a recorded clip, via ffmpeg's volumedetect. Returns
+    -inf-ish (-999.0) when the level cannot be read, so an unreadable clip
+    is treated as silence and skipped rather than sent to whisper."""
+
+    try:
+        completed = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"[termux-voice] level probe failed: {error!r}")
+        return -999.0
+    match = re.search(r"max_volume:\s*(-?[\d.]+) dB", completed.stderr)
+    return float(match.group(1)) if match else -999.0
+
+
+def record_clip(
+    path: Path,
+    seconds: float = CLIP_SECONDS,
+    recorder_bin: str = "termux-microphone-record",
+) -> bool:
+    """Capture one bounded clip from the phone mic. True when a non-empty
+    file was written.
+
+    `-l <seconds>` makes Android's MediaRecorder stop itself, but the command
+    returns immediately either way, so the wait here is what actually bounds
+    the clip. A stray recording from a previous, interrupted iteration would
+    make this call fail, so stop one defensively first (`-q` on an idle
+    recorder is a harmless "No recording to stop")."""
+
+    subprocess.run([recorder_bin, "-q"], capture_output=True, timeout=20, check=False)
+    try:
+        started = subprocess.run(
+            [recorder_bin, "-f", str(path), "-e", "aac", "-r", "16000", "-c", "1",
+             "-l", str(int(seconds))],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"[termux-voice] recorder failed to start: {error!r}")
+        return False
+    if started.returncode != 0:
+        print(f"[termux-voice] recorder error: {started.stderr.strip() or started.stdout.strip()}")
+        return False
+    return True
+
+
+async def listen_once_whisper(
+    transcribe: Callable[[bytes], str],
+    seconds: float = CLIP_SECONDS,
+) -> str:
+    """Record one clip and transcribe it with the caller's whisper-backed
+    transcribe(). Returns '' on silence, capture failure, or a decode error —
+    never raises, matching listen_once() above."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clip = Path(tmpdir) / "clip.m4a"
+        if not await asyncio.to_thread(record_clip, clip, seconds):
+            return ""
+        await asyncio.sleep(seconds + RECORD_FINALISE_SECONDS)
+        if not clip.exists() or clip.stat().st_size == 0:
+            print("[termux-voice] recorder produced no audio")
+            return ""
+
+        peak = await asyncio.to_thread(_peak_dbfs, clip)
+        if peak < SILENCE_PEAK_DBFS:
+            print(f"[termux-voice] silence ({peak:.1f} dBFS < {SILENCE_PEAK_DBFS}) — not decoding")
+            return ""
+
+        audio_bytes = clip.read_bytes()
+
+    try:
+        # transcribe() takes the encoded bytes as-is; its whisper.cpp wrapper
+        # normalises them through ffmpeg, so no second conversion here.
+        return (await asyncio.to_thread(transcribe, audio_bytes)).strip()
+    except Exception as error:  # noqa: BLE001 - a bad decode must not kill the loop
+        print(f"[termux-voice] transcribe failed: {error!r}")
+        return ""
 
 
 def _wav_duration_seconds(wav_bytes: bytes) -> float:
@@ -107,19 +267,38 @@ async def speak(wav_bytes: bytes) -> None:
 RunTurn = Callable[..., Awaitable[tuple[str, bytes, dict]]]
 
 
-async def listen_loop(run_turn: RunTurn) -> None:
+async def listen_loop(
+    run_turn: RunTurn,
+    transcribe: Optional[Callable[[bytes], str]] = None,
+) -> None:
     """Forever: listen with the phone's mic, answer via run_turn(), speak
     the reply. Runs as a background task started from main.py's lifespan;
-    a stray exception from one turn must not end the loop."""
+    a stray exception from one turn must not end the loop.
+
+    `transcribe` is main.py's whisper.cpp-backed transcriber. It is injected
+    rather than imported so this module stays free of a main.py import cycle,
+    the same way `run_turn` already is. Without it the whisper backend cannot
+    run and the loop falls back to the Android recognizer."""
+
+    use_whisper = STT_BACKEND == "whispercpp" and transcribe is not None
+    if STT_BACKEND == "whispercpp" and transcribe is None:
+        print("[termux-voice] whispercpp backend requested but no transcribe() given — "
+              "falling back to the Android recognizer")
 
     print("[termux-voice] on-device listen loop starting")
+    print(f"[termux-voice] stt backend: {'whisper.cpp' if use_whisper else 'android'}")
+    if use_whisper:
+        print(f"[termux-voice] clip {CLIP_SECONDS}s, silence gate {SILENCE_PEAK_DBFS} dBFS")
     if WAKE_WORD:
         print(f"[termux-voice] wake word required: {WAKE_WORD!r}")
     else:
         print("[termux-voice] no wake word set — answering everything heard nearby")
     while True:
         try:
-            user_text = await listen_once()
+            if use_whisper:
+                user_text = await listen_once_whisper(transcribe)
+            else:
+                user_text = await listen_once()
             if not user_text:
                 continue
             if not _heard_wake_word(user_text):
