@@ -2613,6 +2613,53 @@ check(
     termux_voice.SILENCE_PEAK_DBFS > -999.0,
 )
 
+from brain import farewell, stopwords  # noqa: E402
+
+_FAREWELLS = [
+    "that's all, HAL", "That'll be all.", "Goodbye, HAL", "Good night, HAL",
+    "OK HAL, that's all for now", "Thank you HAL, that will be all",
+    "we're done", "I'm done", "dismissed", "over and out",
+    "nothing else, HAL", "see you later", "HAL, stand down", "that's it, thanks",
+    # the wake word's homophones are stripped like the name itself
+    "that's all, how?", "that's all, huh",
+]
+check(
+    "every sign-off phrase ends the conversation",
+    all(farewell.is_farewell(text) for text in _FAREWELLS),
+    next((t for t in _FAREWELLS if not farewell.is_farewell(t)), ""),
+)
+# A false fire here deletes conversation history, so the negative bank is the
+# important half — unlike stopwords.py, this matcher must lean toward silence.
+_NOT_FAREWELLS = [
+    "that's all the power we have left",
+    "that's all the sensors can see",
+    "is that all you can do?",
+    "don't say goodbye",
+    "what does dismissed mean",
+    "how do you say goodbye in French",
+    "say goodbye to the pod bay doors",
+    "tell me about the end of the mission",
+    "we're done with the first waypoint, now drive to the second",
+    "I'm done waiting, open the doors",
+    "good night vision is what I need",
+    "HAL, are you there?",
+    "HAL, drive forward",
+    "How's it going, Hal?",
+    "",
+    "   ",
+]
+check(
+    "ordinary conversation never ends the session",
+    not any(farewell.is_farewell(text) for text in _NOT_FAREWELLS),
+    next((t for t in _NOT_FAREWELLS if farewell.is_farewell(t)), ""),
+)
+check(
+    "a sign-off is not mistaken for a stop command, or vice versa",
+    not stopwords.is_stop_command("that's all, HAL")
+    and not farewell.is_farewell("stop!")
+    and not farewell.is_farewell("HAL, cut the power."),
+)
+
 
 async def _exercise_wake_word_gate() -> tuple[list[tuple[str, str]], list[bytes]]:
     calls: list[tuple[str, str]] = []

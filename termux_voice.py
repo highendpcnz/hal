@@ -46,6 +46,8 @@ import tempfile
 import wave
 from typing import Awaitable, Callable, Optional
 
+from brain import farewell
+
 SESSION_ID = "termux-onboard"
 LISTEN_TIMEOUT_SECONDS = 30.0
 # termux-media-player's `play` returns as soon as playback *starts*, not when
@@ -270,6 +272,7 @@ RunTurn = Callable[..., Awaitable[tuple[str, bytes, dict]]]
 async def listen_loop(
     run_turn: RunTurn,
     transcribe: Optional[Callable[[bytes], str]] = None,
+    clear_session: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Forever: listen with the phone's mic, answer via run_turn(), speak
     the reply. Runs as a background task started from main.py's lifespan;
@@ -305,9 +308,17 @@ async def listen_loop(
                 print(f"[termux-voice] ignored (no wake word): {user_text!r}")
                 continue
             print(f"[termux-voice] heard: {user_text!r}")
+            # Checked before the turn, acted on after it: the sign-off still
+            # goes to the model, so HAL answers it in his own voice rather
+            # than with a canned line, and only then is the session dropped.
+            # Clearing first would delete the history the reply is drawn from.
+            ending = clear_session is not None and farewell.is_farewell(user_text)
             hal_text, wav, _timings = await run_turn(SESSION_ID, user_text)
             print(f"[termux-voice] replying: {hal_text!r}")
             await speak(wav)
+            if ending:
+                clear_session(SESSION_ID)
+                print("[termux-voice] farewell — session cleared, next wake starts fresh")
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - a bad turn must not kill the loop

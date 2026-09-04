@@ -336,7 +336,8 @@ async def lifespan(_app: FastAPI):
         import termux_voice
 
         termux_listen_task = asyncio.create_task(
-            termux_voice.listen_loop(run_turn, transcribe), name="termux-listen"
+            termux_voice.listen_loop(run_turn, transcribe, clear_session),
+            name="termux-listen",
         )
     if BOOT_RITUAL:
         _pending_announcements.append(_boot_ritual_line())
@@ -1927,17 +1928,28 @@ async def proposal_decision(request_id: str, body: ProposalDecision, request: Re
     return JSONResponse({"ok": True})
 
 
+def clear_session(session_id: str) -> None:
+    """Drop everything that makes a session a conversation — provider state,
+    transcript, events, pending notes, chess game — while keeping the id.
+
+    Split out of the endpoint below because the on-device voice loop
+    (`termux_voice.py`) ends conversations too, and it has no cookie to
+    reissue: it runs against one fixed session id, so for it "reset" means
+    clearing in place rather than swapping to a new id."""
+    brain_runtime.drop_session(session_id)
+    session_file(session_id).unlink(missing_ok=True)
+    events_file(session_id).unlink(missing_ok=True)
+    mission_control.manager.drain_notes(session_id)
+    chess_control.manager.drop(session_id)
+
+
 @app.post("/api/session/reset")
 def reset_session(request: Request):
     """Start fresh: drop provider session state and transcript history,
     then hand the browser a new cookie."""
     old_id = _valid_session_id(request.cookies.get("hal_session"))
     if old_id is not None:
-        brain_runtime.drop_session(old_id)
-        session_file(old_id).unlink(missing_ok=True)
-        events_file(old_id).unlink(missing_ok=True)
-        mission_control.manager.drain_notes(old_id)
-        chess_control.manager.drop(old_id)
+        clear_session(old_id)
     new_id = str(uuid.uuid4())
     resp = JSONResponse({"session_id": new_id})
     _set_session_cookie(resp, new_id)
